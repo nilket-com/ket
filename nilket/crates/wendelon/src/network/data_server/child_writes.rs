@@ -1446,6 +1446,8 @@ pub(crate) struct DecisionPeer {
 	/// rebuilt and matched, with its proofs (0: none). Activating any other
 	/// candidate does not inherit this start's validation.
 	pub(crate) built_gid: Arc<std::sync::atomic::AtomicU64>,
+	/// Wendelon ADR 0123 (L2/L3): this store's certification work in this process.
+	pub(crate) certification_work: Arc<super::certification::CertificationWork>,
 	/// ADR 0699 S5b: the last sealed slab a cleanup step visited, and the
 	/// debt sweep's position.
 	pub(crate) cleanup_cursor: Arc<std::sync::atomic::AtomicU64>,
@@ -1687,6 +1689,7 @@ impl Default for DecisionPeer {
 			proposals: None,
 			maintenance_stop: Arc::new(tokio::sync::watch::channel(false).0),
 			built_gid: Default::default(),
+			certification_work: Default::default(),
 			cleanup_cursor: Default::default(),
 			debt_free: Default::default(),
 			debt_cursor: Default::default(),
@@ -1889,6 +1892,49 @@ impl WendelonDataServer {
 				.ctas_maintenance_paused
 				.store(paused, std::sync::atomic::Ordering::Release);
 		}
+	}
+
+	/// Test-only (wendelon ADR 0123 L2/L3): this store's certification work: (builds,
+	/// base entries loaded, staged rows, activations, activation rows).
+	#[cfg(test)]
+	pub(crate) fn certification_work_for_test(&self) -> [u64; 5] {
+		self.decisions.certification_work.snapshot()
+	}
+
+	/// Test-only (wendelon ADR 0123): this node's recent proposals (gid, target digest,
+	/// reason).
+	#[cfg(test)]
+	pub(crate) fn proposed_trace_for_test(
+		&self,
+	) -> Vec<(
+		u64,
+		[u8; 32],
+		crate::consensus::decisions::generations::TargetReason,
+	)> {
+		self.decisions
+			.proposals
+			.as_ref()
+			.map(|proposals| proposals.proposed_trace())
+			.unwrap_or_default()
+	}
+
+	/// Test-only (wendelon ADR 0123 L2): this node's proposals as leader, by reason.
+	#[cfg(test)]
+	pub(crate) fn proposed_counts_for_test(&self) -> std::collections::BTreeMap<&'static str, u64> {
+		self.decisions
+			.proposals
+			.as_ref()
+			.map(|proposals| proposals.proposed_counts())
+			.unwrap_or_default()
+	}
+
+	/// Test-only (wendelon ADR 0123 D7): the reason this node proposed target `gid` with.
+	#[cfg(test)]
+	pub(crate) fn proposed_reason_for_test(
+		&self,
+		gid: u64,
+	) -> Option<crate::consensus::decisions::generations::TargetReason> {
+		self.decisions.proposals.as_ref()?.proposed_reason(gid)
 	}
 
 	/// Test-only (wendelon ADR 0122): pauses or resumes this node's generation steps

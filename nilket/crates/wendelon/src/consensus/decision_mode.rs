@@ -27,7 +27,7 @@ use crate::schema::{
 /// older binaries do not read it, and for them that record is the boundary.
 const MODE_MARKER: &str = "PARENT_DECISIONS";
 const MODE_MARKER_TMP: &str = ".PARENT_DECISIONS.tmp";
-const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v25\n";
+const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v26\n";
 /// S1's development marker. Its stores hold format-9 records, whose bodies were
 /// today's; no conversion exists, so both authorities refuse it as malformed.
 #[cfg(test)]
@@ -147,6 +147,11 @@ const RETIRED_MARKER_BYTES_V23: &[u8] = b"parent-decisions-v23\n";
 /// Refused whole; readable by its own binary.
 #[cfg(test)]
 const RETIRED_MARKER_BYTES_V24: &[u8] = b"parent-decisions-v24\n";
+/// Wendelon ADR 0122's marker, for stores holding format-35 records, whose
+/// retry keys hold no settled receipts (wendelon ADR 0123 adds them). Refused
+/// whole; readable by its own binary.
+#[cfg(test)]
+const RETIRED_MARKER_BYTES_V25: &[u8] = b"parent-decisions-v25\n";
 
 /// The envelope version of Raft frames between Today nodes. ADR 0726: 13, its
 /// own, because tenant creation and tenant KEK install carry a root check id
@@ -222,7 +227,12 @@ pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 15;
 ///
 /// Wendelon ADR 0122: 28. Generation targets carry the signed aged survivor
 /// policies (3 and 4).
-pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 28;
+///
+/// Wendelon ADR 0123: 29. A retry key may hold a settled receipt and, on a
+/// positive window, a cut covers records whose keys are live; the decision
+/// lookup and its answer (which may be `Lookup::Settled`) join this envelope, so
+/// a version-28 peer's lookup is refused before decode.
+pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 29;
 
 /// ADR 0721: the frames that may carry the `ParentDecisions` envelope: the Raft
 /// frames and a forwarded decision proposal with its answer. This classifies an
@@ -274,6 +284,10 @@ pub(crate) fn carries_decision_envelope(msg_type: u8) -> bool {
 		// response travel in this envelope and their handlers require it.
 		|| msg_type == MsgType::LEASES_REQ.0
 		|| msg_type == MsgType::LEASES_RESP.0
+		// Wendelon ADR 0123 D6: the decision lookup and its answer, whose body may be a
+		// settled receipt, are fenced at this version before decode, both ways.
+		|| msg_type == MsgType::DECISION_LOOKUP_REQ.0
+		|| msg_type == MsgType::DECISION_LOOKUP_RESP.0
 		|| is_peer_exchange_frame(msg_type)
 }
 
@@ -595,16 +609,16 @@ mod tests {
 		assert!(mode.wal_format() > WAL_FORMAT_VERSION);
 		assert_eq!(
 			(mode.wal_format(), mode.snapshot_format()),
-			(35, 35),
+			(36, 36),
 			"S1's 9, S2's 10, S3's 11, S4b's 12, S5a to ADR 0700's 13, ADR 0701 to ADR \
 			 0703's 14, ADR 0704 to ADR 0719's 16, ADR 0720 to ADR 0724's 17 and ADR \
 			 0725's 18 and ADR 0726 to ADR 0727's 20, ADR 0728's 22, ADR 0729 to \
 			 ADR 0735's 23, ADR 0736 to wendelon ADR 0103's 24, wendelon ADR 0104's 25, \
 			 wendelon ADR 0105's 26, wendelon ADR 0106's 27 and wendelon ADR 0108 to ADR \
-			 0111's 28 and wendelon ADR 0112's 29 and wendelon ADR 0113 to ADR 0117's 30 and wendelon ADR 0118's 31 and wendelon ADR 0119's 32 and wendelon ADR 0120's 33 and wendelon ADR 0121's 34 are retired; 15 and 19 \
+			 0111's 28 and wendelon ADR 0112's 29 and wendelon ADR 0113 to ADR 0117's 30 and wendelon ADR 0118's 31 and wendelon ADR 0119's 32 and wendelon ADR 0120's 33 and wendelon ADR 0121's 34 and wendelon ADR 0122's 35 are retired; 15 and 19 \
 			 were Today's and 21 is"
 		);
-		assert_eq!(mode.raft_frame_version(), 28);
+		assert_eq!(mode.raft_frame_version(), 29);
 		assert!(mode.snapshot_format() > SNAPSHOT_FORMAT_VERSION);
 		assert_ne!(mode.raft_frame_version(), 1);
 		assert!(mode.refuses_service());
@@ -614,7 +628,9 @@ mod tests {
 	fn a_frame_or_joiner_from_the_other_authority_is_refused_both_ways() {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		today.check_raft_frame(15).unwrap();
-		new.check_raft_frame(28).unwrap();
+		new.check_raft_frame(29).unwrap();
+		// Wendelon ADR 0123: a version-28 peer's frames are refused before decode.
+		assert!(new.check_raft_frame(28).is_err());
 		// Wendelon ADR 0122: a version-27 peer's frames are refused before decode.
 		assert!(new.check_raft_frame(27).is_err());
 		// Wendelon ADR 0121: a version-26 peer's frames are refused before decode.
@@ -635,7 +651,7 @@ mod tests {
 		assert!(new.check_raft_frame(16).is_err());
 		// ADR 0729: an ADR 0728 peer's version-14 frames are refused before decode.
 		assert!(new.check_raft_frame(14).is_err());
-		assert!(today.check_raft_frame(28).is_err());
+		assert!(today.check_raft_frame(29).is_err());
 		// ADR 0728: an ADR 0726 to ADR 0727 peer of either mode decides a tier
 		// publication naming an absent tenant KEK differently; its frames are
 		// refused before decode.
@@ -667,11 +683,11 @@ mod tests {
 				"S1's and S2's envelopes"
 			);
 		}
-		for other in (1..=28).filter(|other| *other != 15) {
+		for other in (1..=29).filter(|other| *other != 15) {
 			assert!(today.check_raft_frame(other).is_err(), "{other}");
 		}
 		assert_eq!(
-			today.check_raft_frame(28).unwrap_err().kind(),
+			today.check_raft_frame(29).unwrap_err().kind(),
 			ErrorKind::PermissionDenied
 		);
 		assert_eq!(
@@ -726,25 +742,30 @@ mod tests {
 		] {
 			assert!(validate_frame_version(15, other.0).is_err());
 		}
-		validate_frame_version(28, MsgType::VOTE_REQ.0).unwrap();
-		validate_frame_version(28, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
+		validate_frame_version(29, MsgType::VOTE_REQ.0).unwrap();
+		validate_frame_version(29, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
 		// ADR 0721: a forwarded decision proposal and its answer carry it too.
-		validate_frame_version(28, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
-		validate_frame_version(28, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
-		assert!(validate_frame_version(28, MsgType::READ_RESP.0).is_err());
-		assert!(validate_frame_version(28, MsgType::TABLE_WRITE_REQ.0).is_err());
+		validate_frame_version(29, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
+		validate_frame_version(29, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
+		assert!(validate_frame_version(29, MsgType::READ_RESP.0).is_err());
+		assert!(validate_frame_version(29, MsgType::TABLE_WRITE_REQ.0).is_err());
 		// ADR 0729: the lease batch travels in this envelope, both ways; the
 		// generic reader also admits envelope 1 for it, which its handlers refuse.
-		validate_frame_version(28, MsgType::LEASES_REQ.0).unwrap();
-		validate_frame_version(28, MsgType::LEASES_RESP.0).unwrap();
+		validate_frame_version(29, MsgType::LEASES_REQ.0).unwrap();
+		validate_frame_version(29, MsgType::LEASES_RESP.0).unwrap();
 		validate_frame_version(1, MsgType::LEASES_REQ.0).unwrap();
 		assert!(carries_decision_envelope(MsgType::LEASES_REQ.0));
 		assert!(carries_decision_envelope(MsgType::LEASES_RESP.0));
+		// Wendelon ADR 0123 D6: the lookup and its answer travel in this envelope too; the
+		// generic reader still admits envelope 1 for them, which the handler and the
+		// client refuse before decode. The cut, unchanged in its contract, does not.
+		validate_frame_version(29, MsgType::DECISION_LOOKUP_REQ.0).unwrap();
+		validate_frame_version(29, MsgType::DECISION_LOOKUP_RESP.0).unwrap();
 		assert!(validate_frame_version(28, MsgType::DECISION_LOOKUP_REQ.0).is_err());
-		assert!(validate_frame_version(28, MsgType::DECISION_CUT_REQ.0).is_err());
+		assert!(validate_frame_version(29, MsgType::DECISION_CUT_REQ.0).is_err());
 		for retired in [
 			2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-			27,
+			27, 28,
 		] {
 			assert!(
 				validate_frame_version(retired, MsgType::DECISION_PROPOSE_REQ.0).is_err(),
@@ -755,11 +776,13 @@ mod tests {
 				"retired envelope {retired}"
 			);
 		}
-		assert!(validate_frame_version(29, MsgType::VOTE_REQ.0).is_err());
+		assert!(validate_frame_version(30, MsgType::VOTE_REQ.0).is_err());
 		// The classifier is an envelope family, not Raft dispatch.
 		assert!(!is_raft_frame(MsgType::DECISION_PROPOSE_REQ.0));
 		assert!(carries_decision_envelope(MsgType::DECISION_PROPOSE_REQ.0));
-		assert!(!carries_decision_envelope(MsgType::DECISION_LOOKUP_REQ.0));
+		assert!(carries_decision_envelope(MsgType::DECISION_LOOKUP_REQ.0));
+		assert!(carries_decision_envelope(MsgType::DECISION_LOOKUP_RESP.0));
+		assert!(!carries_decision_envelope(MsgType::DECISION_CUT_REQ.0));
 	}
 
 	#[test]
@@ -771,7 +794,8 @@ mod tests {
 		assert!(today.check_raft_response(1, vote, vote).is_err());
 		assert!(today.check_raft_response(13, vote, vote).is_err());
 		assert!(new.check_raft_response(15, vote, vote).is_err());
-		new.check_raft_response(28, vote, vote).unwrap();
+		new.check_raft_response(29, vote, vote).unwrap();
+		assert!(new.check_raft_response(28, vote, vote).is_err());
 		assert!(new.check_raft_response(27, vote, vote).is_err());
 		assert!(new.check_raft_response(26, vote, vote).is_err());
 		assert!(new.check_raft_response(25, vote, vote).is_err());
@@ -793,7 +817,7 @@ mod tests {
 			assert!(new.check_raft_response(retired, vote, vote).is_err());
 		}
 		assert!(
-			new.check_raft_response(28, MsgType::APPEND_ENTRIES_RESP.0, vote)
+			new.check_raft_response(29, MsgType::APPEND_ENTRIES_RESP.0, vote)
 				.is_err()
 		);
 	}
@@ -879,6 +903,7 @@ mod tests {
 			("wendelon0119-v22", 25),
 			("wendelon0120-v23", 26),
 			("wendelon0121-v24", 27),
+			("wendelon0122-v25", 28),
 			("directory", 2),
 			("symlink", 3),
 		] {
@@ -886,7 +911,7 @@ mod tests {
 			let marker = dir.join(MODE_MARKER);
 			match make {
 				0 => fs::write(&marker, b"").unwrap(),
-				1 => fs::write(&marker, b"parent-decisions-v26\n").unwrap(),
+				1 => fs::write(&marker, b"parent-decisions-v27\n").unwrap(),
 				4 => fs::write(&marker, RETIRED_MARKER_BYTES_S1).unwrap(),
 				5 => fs::write(&marker, RETIRED_MARKER_BYTES_V2).unwrap(),
 				6 => fs::write(&marker, RETIRED_MARKER_BYTES_V3).unwrap(),
@@ -911,6 +936,7 @@ mod tests {
 				25 => fs::write(&marker, RETIRED_MARKER_BYTES_V22).unwrap(),
 				26 => fs::write(&marker, RETIRED_MARKER_BYTES_V23).unwrap(),
 				27 => fs::write(&marker, RETIRED_MARKER_BYTES_V24).unwrap(),
+				28 => fs::write(&marker, RETIRED_MARKER_BYTES_V25).unwrap(),
 				2 => fs::create_dir(&marker).unwrap(),
 				_ => {
 					fs::write(dir.join("target"), MODE_MARKER_BYTES).unwrap();
@@ -932,14 +958,14 @@ mod tests {
 		}
 	}
 
-	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6, ADR 0120 D9 and ADR 0121 D1: a
-	/// store of the previous ParentDecisions format (the v24 marker, with control-log bytes
+	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6, ADR 0120 D9, ADR 0121 D1 and ADR 0123 D6:
+	/// a store of the previous ParentDecisions format (the v25 marker, with control-log bytes
 	/// beside it) is refused by both modes, and
 	/// every byte under its directory is unchanged by the refused open.
 	#[test]
 	fn a_previous_format_parent_decisions_store_refuses_without_mutation() {
 		let dir = fresh_dir("adr0118-previous-format");
-		fs::write(dir.join(MODE_MARKER), RETIRED_MARKER_BYTES_V24).unwrap();
+		fs::write(dir.join(MODE_MARKER), RETIRED_MARKER_BYTES_V25).unwrap();
 		fs::write(
 			dir.join("control.wal.00000000000000000000.seg"),
 			[0x5a_u8; 4096],
@@ -971,35 +997,36 @@ mod tests {
 		assert_eq!(snapshot(), before, "no byte changed");
 	}
 
-	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6 and ADR 0120 D9, ADR 0121 D1 and ADR 0122 D2, the reverse direction, BY
-	/// SOURCE INFERENCE (not an execution of the old binary): the previous build
-	/// (a9d411d4f) checks a received frame with this same `check_frame_version`, at
-	/// its constant 27. With that constant, a version-28 frame of this build is
-	/// refused, and its own 27 is accepted.
+	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6 and ADR 0120 D9, ADR 0121 D1, ADR 0122 D2 and ADR 0123 D6, the reverse
+	/// direction, BY SOURCE INFERENCE (the executed check is the mixed-binary
+	/// control): the previous build (aa5a159a5) checks a received frame with this same
+	/// `check_frame_version`, at its constant 28. With that constant, a version-29
+	/// frame of this build is refused, and its own 28 is accepted.
 	#[test]
 	fn the_previous_builds_receiver_rule_refuses_this_builds_frames() {
-		const PREVIOUS: u8 = 27;
+		const PREVIOUS: u8 = 28;
 		assert!(check_frame_version(PREVIOUS, RAFT_FRAME_VERSION_PARENT_DECISIONS).is_err());
 		assert!(check_frame_version(PREVIOUS, PREVIOUS).is_ok());
-		assert_eq!(RAFT_FRAME_VERSION_PARENT_DECISIONS, 28);
+		assert_eq!(RAFT_FRAME_VERSION_PARENT_DECISIONS, 29);
 	}
 
 	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6: across the version fence,
 	/// every frame on the ParentDecisions envelope (Raft append, vote and
-	/// install-snapshot, a forwarded decision proposal with its answer) is refused
-	/// before decode at the previous version 27 and at 29, and accepted at 28. The
-	/// rule is equality, so a version-27 node refuses version-28 frames by the same
+	/// install-snapshot, a forwarded decision proposal with its answer, and (wendelon
+	/// ADR 0123) the decision lookup with its answer) is refused before decode at
+	/// the previous version 28 and at 30, and accepted at 29. The rule is equality,
+	/// so a version-28 node refuses version-29 frames by the same
 	/// check.
 	#[test]
 	fn every_parent_decisions_frame_is_refused_across_the_version_fence() {
 		use crate::network::wire::validate_frame_version;
 		use crate::schema::MsgType;
 		let mode = DecisionMode::ParentDecisions;
-		assert_eq!(mode.raft_frame_version(), 28);
-		for version in [27_u8, 29] {
+		assert_eq!(mode.raft_frame_version(), 29);
+		for version in [28_u8, 30] {
 			assert!(mode.check_raft_frame(version).is_err(), "version {version}");
 		}
-		mode.check_raft_frame(28).unwrap();
+		mode.check_raft_frame(29).unwrap();
 		for frame in [
 			MsgType::APPEND_ENTRIES_REQ,
 			MsgType::APPEND_ENTRIES_RESP,
@@ -1009,11 +1036,13 @@ mod tests {
 			MsgType::VOTE_RESP,
 			MsgType::DECISION_PROPOSE_REQ,
 			MsgType::DECISION_PROPOSE_RESP,
+			MsgType::DECISION_LOOKUP_REQ,
+			MsgType::DECISION_LOOKUP_RESP,
 		] {
-			validate_frame_version(28, frame.0).unwrap();
+			validate_frame_version(29, frame.0).unwrap();
 			assert!(
-				validate_frame_version(29, frame.0).is_err(),
-				"{frame:?} at 29"
+				validate_frame_version(30, frame.0).is_err(),
+				"{frame:?} at 30"
 			);
 		}
 		// Today's Raft version is unchanged.
@@ -1023,7 +1052,7 @@ mod tests {
 	/// Wendelon ADR 0119 D6: every peer exchange (child write, replicate and
 	/// fetch, base fetch; request and response) travels in the decision envelope,
 	/// and each boundary admits exactly this build's version: not the previous
-	/// build's 27, not 29, and not the v1 the generic reader admits.
+	/// build's 28, not 30, and not the v1 the generic reader admits.
 	#[test]
 	fn every_peer_exchange_is_fenced_at_its_exact_envelope_version() {
 		use crate::network::wire::validate_frame_version;
@@ -1040,10 +1069,10 @@ mod tests {
 		] {
 			assert!(is_peer_exchange_frame(frame.0), "{frame:?}");
 			assert!(carries_decision_envelope(frame.0), "{frame:?}");
-			validate_frame_version(28, frame.0).unwrap();
+			validate_frame_version(29, frame.0).unwrap();
 		}
-		check_peer_exchange_version(28).unwrap();
-		for version in [1_u8, 27, 29] {
+		check_peer_exchange_version(29).unwrap();
+		for version in [1_u8, 28, 30] {
 			assert!(
 				check_peer_exchange_version(version).is_err(),
 				"version {version}"

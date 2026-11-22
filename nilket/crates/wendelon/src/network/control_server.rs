@@ -5669,6 +5669,10 @@ impl WendelonControlServer {
 		use crate::network::decision_proposals::{
 			LookupRequest, LookupResponse, ProposalRefusal, decode_bounded,
 		};
+		// Wendelon ADR 0123 D6: as a forwarded proposal, the lookup's version is judged
+		// against this node's mode before its body is decoded; an earlier peer's
+		// version-1 lookup is refused here, never read.
+		self.decision_mode.check_raft_frame(frame.header.version)?;
 		let response = match &self.decision_proposals {
 			None => LookupResponse::Refused(ProposalRefusal::ModeToday),
 			Some(proposals) => match decode_bounded::<LookupRequest>(frame.meta.as_ref()) {
@@ -5685,7 +5689,7 @@ impl WendelonControlServer {
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				version: self.decision_mode.raft_frame_version(),
 				msg_type: MsgType::DECISION_LOOKUP_RESP.0,
 				flags: 0,
 				stream_id: frame.header.stream_id,

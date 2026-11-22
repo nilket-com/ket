@@ -166,6 +166,11 @@ pub struct Generations {
 	pub pending: Option<Pending>,
 	/// The next gid a Target may take; never reused.
 	pub next_gid: u64,
+	/// Wendelon ADR 0123 D7: the settlement watermark, monotone: the largest
+	/// retention stamp of any committed SAMPLED target (0 at genesis). An unsampled
+	/// commit and a replaced target leave it. Replicated, so a restart, a replay, an
+	/// install and a leader change all read the same value.
+	pub settled_ms: u64,
 }
 
 impl Default for Generations {
@@ -174,6 +179,7 @@ impl Default for Generations {
 			current: None,
 			pending: None,
 			next_gid: 1,
+			settled_ms: 0,
 		}
 	}
 }
@@ -224,8 +230,16 @@ pub(crate) fn current_members(state: &SmState) -> Option<Vec<Signer>> {
 	Some(members)
 }
 
+/// Wendelon ADR 0123 D2: whether a live retry key keeps its record from being
+/// covered. On a positive-window store it does not (the key keeps a settled
+/// receipt); at window 0 it does, as before.
+pub(crate) fn live_key_blocks(decisions: &DecisionState, key: &ParentKey) -> bool {
+	decisions.retention_window_ms() == 0 && decisions.keys.contains_key(key)
+}
+
 /// The closed set `T` covers: bodies and noops, each terminal at or before
-/// `T` and with its retry key already retired. `None` when `T` is not closed.
+/// `T`, and (at window 0) with its retry key already retired. `None` when `T`
+/// is not closed.
 pub(crate) fn covered(decisions: &DecisionState, t: u64) -> Option<(Vec<u64>, Vec<u64>)> {
 	let mut bodies = Vec::new();
 	for (rsv, body) in decisions.bodies.range(..=t) {
@@ -233,14 +247,14 @@ pub(crate) fn covered(decisions: &DecisionState, t: u64) -> Option<(Vec<u64>, Ve
 			Some(dec) if dec <= t && body.status.is_terminal() => {}
 			_ => return None,
 		}
-		if decisions.keys.contains_key(&body.claim.key) {
+		if live_key_blocks(decisions, &body.claim.key) {
 			return None;
 		}
 		bodies.push(*rsv);
 	}
 	let mut noops = Vec::new();
 	for (dec, noop) in decisions.noops.range(..=t) {
-		if decisions.keys.contains_key(&noop.body.key) {
+		if live_key_blocks(decisions, &noop.body.key) {
 			return None;
 		}
 		noops.push(*dec);
@@ -395,14 +409,35 @@ pub(super) fn commit_generation(
 		.retained_claim_bytes
 		.checked_sub(freed)
 		.ok_or(CounterOverflow)?;
-	// Every check passed: commit.
+	// Every check passed: commit. Wendelon ADR 0123 D1: as each covered record is
+	// removed, a key still naming it (only on a positive-window store) keeps its
+	// terminal outcome in place, in this same apply; a key that retired gets no
+	// receipt. The key's charge was taken at admission: nothing is allocated here.
 	for rsv in bodies {
-		decisions.bodies.remove(&rsv);
+		let body = decisions.bodies.remove(&rsv).expect("a covered body");
+		if let Some(entry) = decisions.keys.get_mut(&body.claim.key)
+			&& entry.record == RecordKind::Body
+			&& entry.reservation == rsv
+			&& let Some(settlement) = Settlement::of_body(&body)
+		{
+			entry.record = RecordKind::Settled(settlement);
+		}
 	}
 	for dec in noops {
-		decisions.noops.remove(&dec);
+		let noop = decisions.noops.remove(&dec).expect("a covered noop");
+		if let Some(entry) = decisions.keys.get_mut(&noop.body.key)
+			&& entry.record == RecordKind::Noop
+			&& entry.reservation == dec
+		{
+			entry.record = RecordKind::Settled(Settlement::of_noop(&noop));
+		}
 	}
 	decisions.retained_claim_bytes = retained;
+	// Wendelon ADR 0123 D7: a sampled commit advances the settlement watermark.
+	let stamp_ms = certificate.retention.stamp_ms;
+	if stamp_ms > 0 {
+		decisions.generations.settled_ms = decisions.generations.settled_ms.max(stamp_ms);
+	}
 	decisions.generations.current = Some(certificate);
 	decisions.generations.pending = None;
 	Ok(DecisionResult::GenerationCommitted { gid })
@@ -410,17 +445,23 @@ pub(super) fn commit_generation(
 
 /// The highest record at or below `t` that keeps `t` from being closed: a body
 /// not terminal by `t` or whose key is not retired, or a noop whose key is not.
+/// Test-only (Codex 01a20253): the blocking point below cut `t`, as `next_target` reads it.
+#[cfg(test)]
+pub(crate) fn blocking_point_for_test(state: &SmState, t: u64) -> Option<u64> {
+	blocking_point(state.decisions.as_ref()?, t)
+}
+
 fn blocking_point(decisions: &DecisionState, t: u64) -> Option<u64> {
 	let bodies = decisions.bodies.range(..=t).filter_map(|(rsv, body)| {
 		let closed = body.status.is_terminal()
 			&& body.status.dec().is_some_and(|dec| dec <= t)
-			&& !decisions.keys.contains_key(&body.claim.key);
+			&& !live_key_blocks(decisions, &body.claim.key);
 		(!closed).then_some(*rsv)
 	});
 	let noops = decisions
 		.noops
 		.range(..=t)
-		.filter_map(|(dec, noop)| decisions.keys.contains_key(&noop.body.key).then_some(*dec));
+		.filter_map(|(dec, noop)| live_key_blocks(decisions, &noop.body.key).then_some(*dec));
 	bodies.chain(noops).max()
 }
 
@@ -441,6 +482,18 @@ fn erases_something(state: &SmState, decisions: &DecisionState, t: u64) -> bool 
 		|| decisions.noops.range(..=t).next().is_some()
 		|| state.finalized_drop_in(generations.fr(), t)
 		|| decisions.ctas.retired_in(generations.fr(), t)
+}
+
+/// Wendelon ADR 0123 D7 (T0): whether a record at or below `t` has a retired key.
+fn retired_key_erasure(decisions: &DecisionState, t: u64) -> bool {
+	decisions
+		.bodies
+		.range(..=t)
+		.any(|(_, body)| !decisions.keys.contains_key(&body.claim.key))
+		|| decisions
+			.noops
+			.range(..=t)
+			.any(|(_, noop)| !decisions.keys.contains_key(&noop.body.key))
 }
 
 /// Wendelon ADR 0121 D2, D3: whether `target`'s retention cut may be recorded
@@ -547,6 +600,126 @@ fn age_due(decisions: &DecisionState, now_ms: u64) -> bool {
 /// clock, or `None` when it has no fresh sample: an ordinary target never
 /// needs one.
 pub(crate) fn next_target(state: &SmState, applied: u64, now_ms: Option<u64>) -> Option<Target> {
+	next_target_with_reason(state, applied, now_ms).map(|(target, _)| target)
+}
+
+/// Wendelon ADR 0123 D7: why the proposer proposed a target, named once even
+/// when several reasons hold, in this order. Proposer policy only: a target does
+/// not carry it, and apply enforces none of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TargetReason {
+	/// T1: a finalized drop or a retired CTAS object no certificate excludes yet.
+	Structure,
+	/// T2: a positive window's floor due by age.
+	Age,
+	/// T3: retained claim bytes at the pressure mark, with enough to release.
+	Pressure,
+	/// T4: a live key's record old enough to settle, the watermark an interval old.
+	Settlement,
+	/// T0: a covered record whose key has retired (today's ordinary trigger).
+	RetiredKey,
+}
+
+impl TargetReason {
+	pub(crate) fn label(self) -> &'static str {
+		match self {
+			Self::Structure => "structure",
+			Self::Age => "age",
+			Self::Pressure => "pressure",
+			Self::Settlement => "settlement",
+			Self::RetiredKey => "retired_key",
+		}
+	}
+}
+
+/// Wendelon ADR 0123 D7: the settlement interval S, provisional (a hypothesis the
+/// controls measure; no cadence is claimed from it).
+pub(crate) const SETTLE_INTERVAL_MS: u64 = 60_000;
+
+/// Wendelon ADR 0123 D7: the claim-pressure mark P and the least release R that
+/// makes a pressure target worth its rebuild, provisional.
+pub(crate) const PRESSURE_MARK_BYTES: u64 = super::MAX_RETAINED_CLAIM_BYTES / 2;
+pub(crate) const PRESSURE_RELEASE_BYTES: u64 = super::MAX_RETAINED_CLAIM_BYTES / 8;
+
+/// Wendelon ADR 0123 D7 (T3): pressure is due when the retained claim bytes reach
+/// the mark and the cut would release at least the least release; a tiny
+/// releasable prefix never proposes, so pressure held by records no generation
+/// can release is left to admission's `RetainedFull`.
+pub(crate) fn pressure_due(retained: u64, releasable: u64) -> bool {
+	retained >= PRESSURE_MARK_BYTES && releasable >= PRESSURE_RELEASE_BYTES
+}
+
+/// P: the production mark, or (test-only, wendelon ADR 0123 L3) the fixture's, set
+/// on every voter.
+pub(crate) fn pressure_mark_bytes(decisions: &DecisionState) -> u64 {
+	#[cfg(test)]
+	if let Some((_, mark, _)) = decisions.pressure_fixture {
+		return mark;
+	}
+	let _ = decisions;
+	PRESSURE_MARK_BYTES
+}
+
+/// R: the production least release, or (test-only) the fixture's.
+pub(crate) fn pressure_release_bytes(decisions: &DecisionState) -> u64 {
+	#[cfg(test)]
+	if let Some((_, _, release)) = decisions.pressure_fixture {
+		return release;
+	}
+	let _ = decisions;
+	PRESSURE_RELEASE_BYTES
+}
+
+/// Wendelon ADR 0123 D7 (T4): a settlement is due at `now` when the watermark is
+/// an interval old and some record at or below `t` keeps a live key issued at
+/// least an interval before `now`.
+fn settlement_due(decisions: &DecisionState, t: u64, now: u64) -> bool {
+	let Some(old_enough) = now.checked_sub(SETTLE_INTERVAL_MS) else {
+		return false;
+	};
+	if decisions
+		.generations
+		.settled_ms
+		.saturating_add(SETTLE_INTERVAL_MS)
+		> now
+	{
+		return false;
+	}
+	let live_old = |key: &ParentKey| {
+		decisions.keys.contains_key(key)
+			&& key.issued_ms().is_some_and(|issued| issued <= old_enough)
+	};
+	decisions
+		.bodies
+		.range(..=t)
+		.any(|(_, body)| live_old(&body.claim.key))
+		|| decisions
+			.noops
+			.range(..=t)
+			.any(|(_, noop)| live_old(&noop.body.key))
+}
+
+/// Whether the records at or below `t` hold at least `least` claim bytes; the walk
+/// stops as soon as they do.
+fn releases_at_least(decisions: &DecisionState, t: u64, least: u64) -> bool {
+	let mut sum = 0u64;
+	decisions
+		.bodies
+		.range(..=t)
+		.map(|(_, body)| body.claim_bytes)
+		.chain(decisions.noops.range(..=t).map(|(_, noop)| noop.bytes))
+		.any(|bytes| {
+			sum = sum.saturating_add(bytes);
+			sum >= least
+		})
+}
+
+/// [`next_target`] with the reason the proposer names it by.
+pub(crate) fn next_target_with_reason(
+	state: &SmState,
+	applied: u64,
+	now_ms: Option<u64>,
+) -> Option<(Target, TargetReason)> {
 	let decisions = state.decisions.as_ref()?;
 	let generations = &decisions.generations;
 	if generations
@@ -569,17 +742,51 @@ pub(crate) fn next_target(state: &SmState, applied: u64, now_ms: Option<u64>) ->
 	// Something to erase, or (ADR 0115) a finalized drop no certificate excludes yet. (Wendelon ADR
 	// 0120: or a retired CTAS object.) Wendelon ADR 0121 D3: or a floor due by age, which the
 	// target's own stamp advances, so an idle store needs no write.
-	let erases = erases_something(state, decisions, t);
+	// Wendelon ADR 0123 D7: what the cut may cover (D2) is separate from what starts
+	// a generation. T0, a covered record whose key has retired (at window 0 that is
+	// every covered record, as before), or T1, structure. A fresh terminal record
+	// whose key is live starts nothing; a target started for another reason still
+	// covers and settles it.
+	let generations = &decisions.generations;
+	let structure = state.finalized_drop_in(generations.fr(), t)
+		|| decisions.ctas.retired_in(generations.fr(), t);
+	let retired = retired_key_erasure(decisions, t);
+	let erases = retired || structure;
 	let due = now_ms.is_some_and(|now| age_due(decisions, now));
-	if !erases && !due {
+	// Wendelon ADR 0123 D7: T3 and T4 only on a positive window and only with a fresh
+	// sample (with none, T0 and T1 continue unsampled, as today).
+	let positive = decisions.retention_window_ms() > 0;
+	// The cheap retained-byte mark first; only past it are the covered records walked,
+	// and only until the least release is reached.
+	let pressure = positive
+		&& now_ms.is_some()
+		&& decisions.retained_claim_bytes >= pressure_mark_bytes(decisions)
+		&& releases_at_least(decisions, t, pressure_release_bytes(decisions));
+	let settlement = positive && now_ms.is_some_and(|now| settlement_due(decisions, t, now));
+	let reason = if structure {
+		TargetReason::Structure
+	} else if due {
+		TargetReason::Age
+	} else if pressure {
+		TargetReason::Pressure
+	} else if settlement {
+		TargetReason::Settlement
+	} else if retired {
+		TargetReason::RetiredKey
+	} else {
 		return None;
-	}
+	};
 	// A target that erases something raises the floor too whenever a sample lets it advance by
 	// a step: it commits anyway, so visibility follows the window at no extra generation. With
-	// no sample it keeps the certificate's floor and carries no stamp.
-	let raise = due || (erases && now_ms.is_some_and(|now| step_reached(decisions, now)));
+	// no sample it keeps the certificate's floor and carries no stamp. Wendelon ADR 0123 D7: a
+	// pressure or settlement target always carries its fresh sample, even when the age step is
+	// not due, so its commit advances the settlement watermark.
+	let raise = due
+		|| pressure
+		|| settlement
+		|| (erases && now_ms.is_some_and(|now| step_reached(decisions, now)));
 	let retention = retention_cut_for(decisions, if raise { now_ms } else { None })?;
-	Some(Target {
+	let target = Target {
 		gid: generations.next_gid,
 		t,
 		predecessor_gid: generations.current_gid(),
@@ -591,7 +798,8 @@ pub(crate) fn next_target(state: &SmState, applied: u64, now_ms: Option<u64>) ->
 			retention.floor_ms,
 		),
 		retention,
-	})
+	};
+	Some((target, reason))
 }
 
 /// The leader's Commit, once every member of a current pending target

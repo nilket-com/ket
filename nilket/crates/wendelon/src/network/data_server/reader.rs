@@ -171,6 +171,12 @@ impl std::fmt::Display for AuthorityRefusal {
 
 /// DC-281: the generation half of a read authority, from the committed generation
 /// read first and the locally active one read after it.
+/// Test-only (wendelon ADR 0123 M1): every read-authority refusal's (node, read cut,
+/// reason), in order.
+#[cfg(test)]
+pub(crate) static READ_REFUSALS: std::sync::Mutex<Vec<(u32, u64, String)>> =
+	std::sync::Mutex::new(Vec::new());
+
 pub(crate) fn generation_authority(committed: u64, active: u64) -> Result<(), AuthorityRefusal> {
 	match active.cmp(&committed) {
 		std::cmp::Ordering::Equal => Ok(()),
@@ -298,6 +304,20 @@ impl ReadAuthority {
 	/// the certified boundary, validation, then the generation (committed read in
 	/// the state above, the locally active one after it).
 	async fn check_typed(&self) -> Result<(), AuthorityRefusal> {
+		let result = self.check_typed_inner().await;
+		// Test-only (wendelon ADR 0123 M1): each refusal's reason, by node and read cut,
+		// which the public answer (`BACKPRESSURED`) does not carry.
+		#[cfg(test)]
+		if let Err(AuthorityRefusal::Refused(reason)) = &result {
+			READ_REFUSALS
+				.lock()
+				.unwrap()
+				.push((self.signer.node, self.k, reason.clone()));
+		}
+		result
+	}
+
+	async fn check_typed_inner(&self) -> Result<(), AuthorityRefusal> {
 		use std::sync::atomic::Ordering::Acquire;
 		// Test-only (DC-281): a held check stalls here, as a slow state or base read.
 		#[cfg(test)]

@@ -118,15 +118,15 @@ fn a_new_mode_snapshot_is_refused_by_today_before_its_body_is_trusted() {
 	assert!(error.contains("newer than this build accepts"), "{error}");
 }
 
-/// Wendelon ADR 0119 D6, then ADR 0120 D9, ADR 0121 D1 and ADR 0122 D2: a ParentDecisions build
-/// refuses a ParentDecisions snapshot of the previous format (34, ADR 0121's) and of a later one before
+/// Wendelon ADR 0119 D6, then ADR 0120 D9, ADR 0121 D1, ADR 0122 D2 and ADR 0123 D6: a ParentDecisions build
+/// refuses a ParentDecisions snapshot of the previous format (35, ADR 0122's) and of a later one before
 /// its body is trusted; snapshot install decodes through this same reader
 /// (`decode_snapshot_file`), so an install of either is refused before anything
 /// is published.
 #[test]
 fn a_parent_decisions_snapshot_of_another_format_is_refused_before_its_body_is_trusted() {
 	let new = DecisionMode::ParentDecisions;
-	assert_eq!(new.snapshot_format(), 35);
+	assert_eq!(new.snapshot_format(), 36);
 	let state = SmState {
 		decisions: Some(Default::default()),
 		..SmState::default()
@@ -247,6 +247,11 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V36_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v36.txt");
+/// Wendelon ADR 0122's format-35 bodies, retained. Wendelon ADR 0123 moved only the
+/// decision state (its retained key charge, after the claim bytes: one zero byte in
+/// the Disabled-window golden history) and added the settled receipts' shapes.
 const PARENT_DECISIONS_V35_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v35.txt");
 /// Wendelon ADR 0121's format-34 bodies, retained. Wendelon ADR 0122 moved none and
@@ -343,7 +348,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V35_MANIFEST)
+	parse(PARENT_DECISIONS_V36_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -512,7 +517,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_35_bodies_match_their_goldens_and_round_trip() {
+fn the_format_36_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -766,6 +771,11 @@ fn the_format_35_bodies_match_their_goldens_and_round_trip() {
 	for (name, bytes) in golden_retention_shapes() {
 		actual.push((name.to_owned(), hex(&bytes)));
 	}
+	// Wendelon ADR 0123: settled receipts of each kind on their key entries, and the
+	// lookup answer that carries one.
+	for (name, bytes) in golden_settled_shapes() {
+		actual.push((name.to_owned(), hex(&bytes)));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -773,7 +783,7 @@ fn the_format_35_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-35 bodies moved or are missing; expected lines:\n{}",
+		"format-36 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -800,16 +810,60 @@ fn the_format_35_bodies_match_their_goldens_and_round_trip() {
 		"report_retention",
 		"certificate_retention",
 	];
+	// Wendelon ADR 0123: against the format-35 corpus only the decision state moved, by
+	// exactly two inserted zero bytes (its key charge, 0 at the Disabled window, and its
+	// generations' settlement watermark, 0 with no sampled commit); the settled shapes
+	// were added.
+	const ADDED_0123: [&str; 4] = [
+		"key_entry_settled_accepted_delete",
+		"key_entry_settled_refused",
+		"key_entry_settled_noop",
+		"lookup_settled",
+	];
+	let retained_v35 = parse(PARENT_DECISIONS_V35_MANIFEST);
+	assert_eq!(stored.len(), retained_v35.len() + ADDED_0123.len());
+	for (name, hex) in &retained_v35 {
+		if name == "decisions_golden_history" {
+			let bytes = |hex: &str| {
+				(0..hex.len())
+					.step_by(2)
+					.map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+					.collect::<Vec<u8>>()
+			};
+			let (before, now) = (bytes(hex), bytes(&stored[name]));
+			assert_eq!(now.len(), before.len() + 2, "two bytes inserted");
+			// `before` is `now` with exactly two zero bytes removed (a greedy match: every
+			// unmatched byte of `now` is a zero).
+			let mut rest = before.iter().peekable();
+			let mut extra = Vec::new();
+			for byte in &now {
+				if rest.peek() == Some(&byte) {
+					rest.next();
+				} else {
+					extra.push(*byte);
+				}
+			}
+			assert!(
+				rest.next().is_none() && extra == [0, 0],
+				"exactly two inserted zero bytes: {extra:?}"
+			);
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
+	for name in ADDED_0123 {
+		assert!(stored.contains_key(name), "{name}");
+	}
 	// Wendelon ADR 0122: against the format-34 corpus no body moved; a target carrying
 	// the aged survivor policy was added.
 	const ADDED_0122: [&str; 1] = ["propose_target_aged"];
 	let retained_v34 = parse(PARENT_DECISIONS_V34_MANIFEST);
-	assert_eq!(stored.len(), retained_v34.len() + ADDED_0122.len());
+	assert_eq!(retained_v35.len(), retained_v34.len() + ADDED_0122.len());
 	for (name, hex) in &retained_v34 {
-		assert_eq!(stored.get(name), Some(hex), "{name}");
+		assert_eq!(retained_v35.get(name), Some(hex), "{name}");
 	}
 	for name in ADDED_0122 {
-		assert!(stored.contains_key(name), "{name}");
+		assert!(retained_v35.contains_key(name), "{name}");
 	}
 	let retained_v33 = parse(PARENT_DECISIONS_V33_MANIFEST);
 	assert_eq!(retained_v34.len(), retained_v33.len() + ADDED_0121.len());
@@ -3061,5 +3115,60 @@ fn golden_ctas_commands() -> Vec<(&'static str, crate::consensus::decisions::Dec
 			},
 		),
 		("ctas_prune", DecisionCommand::CtasPrune { tenant, op }),
+	]
+}
+
+/// Wendelon ADR 0123: a settled receipt of each kind on its key entry (an Accepted
+/// delete with its counts, a refusal, a noop), and the lookup answer carrying one.
+fn golden_settled_shapes() -> Vec<(&'static str, Vec<u8>)> {
+	use crate::consensus::decisions::{
+		AcceptedEffect, KeyEntry, Lookup, OperationKind, RecordKind, RefusalCause, Settlement,
+	};
+	let hlc = crate::schema::HybridTimestamp {
+		physical_ms: 0x0123_0123,
+		logical: 3,
+		node_id: 2,
+	};
+	let accepted = Settlement::Accepted {
+		dec: 0x0124,
+		claim_digest: [0x23; 32],
+		commit_hlc: hlc,
+		effect: AcceptedEffect::Delete([2, 1, 0]),
+	};
+	let entry = |reservation: u64, settlement: Settlement| KeyEntry {
+		reservation,
+		request_digest: [0x13; 32],
+		record: RecordKind::Settled(settlement),
+	};
+	vec![
+		(
+			"key_entry_settled_accepted_delete",
+			postcard::to_stdvec(&entry(0x0123, accepted)).unwrap(),
+		),
+		(
+			"key_entry_settled_refused",
+			postcard::to_stdvec(&entry(
+				0x0125,
+				Settlement::Refused {
+					dec: 0x0126,
+					claim_digest: [0x24; 32],
+					cause: RefusalCause::Aborted,
+					kind: OperationKind::Write,
+				},
+			))
+			.unwrap(),
+		),
+		(
+			"key_entry_settled_noop",
+			postcard::to_stdvec(&entry(0x0127, Settlement::Noop { counts: [0, 0, 2] })).unwrap(),
+		),
+		(
+			"lookup_settled",
+			postcard::to_stdvec(&Lookup::Settled {
+				reservation: 0x0123,
+				settlement: accepted,
+			})
+			.unwrap(),
+		),
 	]
 }

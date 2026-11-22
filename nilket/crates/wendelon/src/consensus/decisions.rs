@@ -1219,12 +1219,125 @@ pub struct KeyEntry {
 	pub record: RecordKind,
 }
 
-/// Which map a retry key's record is in.
+/// Which map a retry key's record is in, or (wendelon ADR 0123 D1) the
+/// terminal outcome the key keeps after a generation erased its record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecordKind {
 	Body,
 	Noop,
+	/// Wendelon ADR 0123 D1: the record was erased by a generation that
+	/// covered it while its key was live; the key answers from this.
+	Settled(Settlement),
 }
+
+/// Wendelon ADR 0123 D1: a settled receipt, the compact terminal outcome a
+/// live key keeps once a generation erased its body or noop. A Reserved record
+/// has no settled form; a noop carries no claim and no commit HLC; counts exist
+/// only on an Accepted delete or a noop; a refusal carries none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Settlement {
+	Accepted {
+		dec: u64,
+		claim_digest: [u8; 32],
+		commit_hlc: HybridTimestamp,
+		effect: AcceptedEffect,
+	},
+	Refused {
+		dec: u64,
+		claim_digest: [u8; 32],
+		cause: RefusalCause,
+		kind: OperationKind,
+	},
+	/// Its `dec` is the key's `reservation`.
+	Noop { counts: [u32; 3] },
+}
+
+/// Wendelon ADR 0123 D1: what an Accepted parent did; exact counts only for a
+/// delete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcceptedEffect {
+	Write,
+	Delete([u32; 3]),
+	Kv,
+}
+
+/// Wendelon ADR 0123 D1: what a refused parent was; a refusal has no counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationKind {
+	Write,
+	Delete,
+	Kv,
+}
+
+impl Settlement {
+	/// The settled form of a terminal body; `None` for a Reserved one.
+	pub fn of_body(body: &ParentRecord) -> Option<Self> {
+		let kind = match (&body.claim.operation, body.claim.key.namespace) {
+			(Operation::Delete { .. }, _) => OperationKind::Delete,
+			(Operation::Write, ParentNamespace::Kv) => OperationKind::Kv,
+			(Operation::Write, ParentNamespace::Table(_)) => OperationKind::Write,
+		};
+		match body.status {
+			ParentStatus::Accepted { dec } => Some(Self::Accepted {
+				dec,
+				claim_digest: body.claim_digest,
+				commit_hlc: body.claim.commit_hlc,
+				effect: match (&body.claim.operation, kind) {
+					(Operation::Delete { selection, .. }, _) => {
+						AcceptedEffect::Delete(selection.counts())
+					}
+					(_, OperationKind::Kv) => AcceptedEffect::Kv,
+					_ => AcceptedEffect::Write,
+				},
+			}),
+			ParentStatus::Refused { cause, dec } => Some(Self::Refused {
+				dec,
+				claim_digest: body.claim_digest,
+				cause,
+				kind,
+			}),
+			ParentStatus::Reserved | ParentStatus::Noop { .. } => None,
+		}
+	}
+
+	/// The settled form of a recorded noop.
+	pub fn of_noop(noop: &NoopRecord) -> Self {
+		Self::Noop {
+			counts: noop.body.selection.counts(),
+		}
+	}
+
+	/// The terminal status this receipt answers with; `reservation` is the
+	/// key's (a noop's own `dec`).
+	pub fn status(self, reservation: u64) -> ParentStatus {
+		match self {
+			Self::Accepted { dec, .. } => ParentStatus::Accepted { dec },
+			Self::Refused { dec, cause, .. } => ParentStatus::Refused { cause, dec },
+			Self::Noop { .. } => ParentStatus::Noop { dec: reservation },
+		}
+	}
+
+	/// The claim digest of a body origin; a noop has none.
+	pub fn claim_digest(self) -> Option<[u8; 32]> {
+		match self {
+			Self::Accepted { claim_digest, .. } | Self::Refused { claim_digest, .. } => {
+				Some(claim_digest)
+			}
+			Self::Noop { .. } => None,
+		}
+	}
+}
+
+/// Wendelon ADR 0123 D5: the provisional cap on the retained key charge, an
+/// admission bound only (not a resident-memory claim).
+pub const MAX_RETAINED_KEY_BYTES: u64 = 32 << 20;
+
+/// Wendelon ADR 0123 D5: the fixed charge of one live key on a positive-window
+/// store: a conservative, representation-level bound on the postcard length of
+/// `(ParentKey, KeyEntry)` over every record kind, every field at its type's
+/// maximum (tight there), so at least every legal key's encoding
+/// (`a_key_record_charge_bounds_every_encoding`).
+pub const KEY_RECORD_CHARGE: u64 = 175;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionState {
@@ -1237,6 +1350,10 @@ pub struct DecisionState {
 	clock_ms: u64,
 	live: u32,
 	retained_claim_bytes: u64,
+	/// Wendelon ADR 0123 D5: the fixed charge of every live key on a positive-window
+	/// store ([`KEY_RECORD_CHARGE`] each), held from first admission until the key
+	/// retires; 0 at window 0.
+	retained_key_bytes: u64,
 	/// Each store incarnation's decision-signing key. Immutable once bound and
 	/// never pruned here, so retained evidence keeps verifying on replay; current
 	/// authority is checked separately against the incarnation registry.
@@ -1275,6 +1392,11 @@ pub struct DecisionState {
 	/// bucket is removed, so its size is bounded by the live parents.
 	#[serde(skip)]
 	live_by_table: BTreeMap<(TenantId, crate::schema::TableObjectId), BTreeSet<u64>>,
+	/// Test-only (wendelon ADR 0123 L3): a fixture-local scaled claim cap and pressure
+	/// thresholds (cap, P, R), set on every voter by the fixture. Never serialized.
+	#[cfg(test)]
+	#[serde(skip)]
+	pub(crate) pressure_fixture: Option<(u64, u64, u64)>,
 }
 
 impl Default for DecisionState {
@@ -1288,6 +1410,7 @@ impl Default for DecisionState {
 			clock_ms: 0,
 			live: 0,
 			retained_claim_bytes: 0,
+			retained_key_bytes: 0,
 			signers: BTreeMap::new(),
 			noops: BTreeMap::new(),
 			generations: Generations::default(),
@@ -1299,6 +1422,8 @@ impl Default for DecisionState {
 			retention: None,
 			table_operations: BTreeMap::new(),
 			live_by_table: BTreeMap::new(),
+			#[cfg(test)]
+			pressure_fixture: None,
 		}
 	}
 }
@@ -1318,6 +1443,41 @@ impl DecisionState {
 	/// Disabled.
 	pub fn retention_window_ms(&self) -> u64 {
 		self.retention.map_or(0, |binding| binding.window_ms)
+	}
+
+	/// Wendelon ADR 0123 D5: one key's charge on this store: [`KEY_RECORD_CHARGE`]
+	/// under a positive bound window, 0 otherwise (the zero-window admission
+	/// contract is unchanged).
+	pub fn key_charge(&self) -> u64 {
+		if self.retention_window_ms() > 0 {
+			KEY_RECORD_CHARGE
+		} else {
+			0
+		}
+	}
+
+	/// The claim-byte admission cap: [`MAX_RETAINED_CLAIM_BYTES`], or (test-only,
+	/// wendelon ADR 0123 L3) the fixture's scaled cap.
+	pub fn claim_cap(&self) -> u64 {
+		#[cfg(test)]
+		if let Some((cap, _, _)) = self.pressure_fixture {
+			return cap;
+		}
+		MAX_RETAINED_CLAIM_BYTES
+	}
+
+	/// Wendelon ADR 0123 D5: the retained key charge.
+	pub fn retained_key_bytes(&self) -> u64 {
+		self.retained_key_bytes
+	}
+
+	/// Wendelon ADR 0123 D4: whether a live key holds a settled KV receipt (its
+	/// body erased, its data now in the certified base): the backup roster's
+	/// `KvDataPresent` holds for it as for a retained KV body.
+	pub fn settled_kv_key_present(&self) -> bool {
+		self.keys.iter().any(|(key, entry)| {
+			key.namespace == ParentNamespace::Kv && matches!(entry.record, RecordKind::Settled(_))
+		})
 	}
 
 	/// ADR 0736: the backup hold's token, if one is held.
@@ -1362,6 +1522,20 @@ impl DecisionState {
 	pub fn lineages(&self) -> &BTreeMap<u64, Lineage> {
 		&self.lineages
 	}
+	/// Test-only (Codex 01a20253): whether `key` still has its entry: the live write key that keeps
+	/// its body blocking a generation cut until the decision floor passes its issuance.
+	#[cfg(test)]
+	pub(crate) fn key_is_live_for_test(&self, key: &ParentKey) -> bool {
+		self.keys.contains_key(key)
+	}
+
+	/// Test-only (wendelon ADR 0123): a live key's entry: its reservation (a noop's
+	/// own `dec`) and its record kind, a settled receipt included.
+	#[cfg(test)]
+	pub(crate) fn key_entry_for_test(&self, key: &ParentKey) -> Option<KeyEntry> {
+		self.keys.get(key).copied()
+	}
+
 	pub fn bodies(&self) -> &BTreeMap<u64, ParentRecord> {
 		&self.bodies
 	}
@@ -1512,6 +1686,29 @@ impl DecisionState {
 	/// row is at or above the certified floor.
 	fn validate_retention(&self) -> Result<(), String> {
 		let generations = &self.generations;
+		// Wendelon ADR 0123 D7: the settlement watermark's reconstructible facts. It is a
+		// committed sampled stamp, so: 0 before any commit; never ahead of the replicated
+		// clock (a proposal raises the clock to its stamp); never below the current
+		// certificate's stamp when that certificate was sampled. At an unsampled
+		// certificate it carries an earlier sampled commit's stamp.
+		let settled = generations.settled_ms;
+		if generations.current.is_none() && settled != 0 {
+			return Err("decisions: a settlement watermark with no committed generation".into());
+		}
+		if settled > self.clock_ms {
+			return Err(format!(
+				"decisions: the settlement watermark {settled} is ahead of the clock {}",
+				self.clock_ms
+			));
+		}
+		if let Some(cert) = &generations.current
+			&& cert.retention.stamp_ms > settled
+		{
+			return Err(format!(
+				"decisions: the settlement watermark {settled} is below its certificate's stamp {}",
+				cert.retention.stamp_ms
+			));
+		}
 		let cuts = generations.current.iter().map(|cert| cert.retention).chain(
 			generations
 				.pending
@@ -1610,7 +1807,37 @@ impl DecisionState {
 		if bytes != Some(self.retained_claim_bytes) {
 			return Err("decisions: retained bytes do not match the bodies and noops".into());
 		}
+		// Wendelon ADR 0123 D5: every check here is reconstructible from this state
+		// alone. A settled key is witnessed by the current certificate's cut and the
+		// absence of its record; which generation converted it is not recorded.
+		let fr = self.generations.fr();
+		// Every key and noop is admitted under a known binding (U1), and the charge
+		// never exceeds the admission cap.
+		if self.retention.is_none() && (!self.keys.is_empty() || !self.noops.is_empty()) {
+			return Err(
+				"decisions: retry keys or noops are retained and no window is bound".into(),
+			);
+		}
+		if self.retained_key_bytes > MAX_RETAINED_KEY_BYTES {
+			return Err("decisions: the retained key charge exceeds its cap".into());
+		}
+		let mut reservations = std::collections::BTreeSet::new();
 		for (key, entry) in &self.keys {
+			if !reservations.insert(entry.reservation) {
+				return Err("decisions: two retry keys name one reservation".into());
+			}
+			// A recorded key is a UUIDv7 (`fresh_clock`); its retirement relies on it.
+			if key.issued_ms().is_none() {
+				return Err("decisions: a retry key is not a UUIDv7".into());
+			}
+			if let RecordKind::Settled(settlement) = entry.record
+				&& !settlement_is_legal(key, settlement)
+			{
+				return Err(
+					"decisions: a settled receipt is impossible for its key's namespace or counts"
+						.into(),
+				);
+			}
 			let names = match entry.record {
 				RecordKind::Body => self
 					.bodies
@@ -1620,10 +1847,43 @@ impl DecisionState {
 					.noops
 					.get(&entry.reservation)
 					.map(|noop| (noop.body.key, noop.body.request_digest)),
+				RecordKind::Settled(settlement) => {
+					let body_origin_ordered = match settlement {
+						Settlement::Accepted { dec, .. } | Settlement::Refused { dec, .. } => {
+							entry.reservation < dec && dec <= fr
+						}
+						Settlement::Noop { .. } => true,
+					};
+					if self.retention_window_ms() == 0
+						|| self.generations.current.is_none()
+						|| entry.reservation > fr
+						|| !body_origin_ordered
+						|| self.bodies.contains_key(&entry.reservation)
+						|| self.noops.contains_key(&entry.reservation)
+					{
+						return Err(
+							"decisions: a settled key is not covered by the current certificate \
+							 or its record is still retained"
+								.into(),
+						);
+					}
+					Some((*key, entry.request_digest))
+				}
 			};
 			if names != Some((*key, entry.request_digest)) {
 				return Err("decisions: a retry key names no record of that key and digest".into());
 			}
+		}
+		let charged = self
+			.key_charge()
+			.checked_mul(self.keys.len() as u64)
+			.ok_or("decisions: the key charge overflows")?;
+		if charged != self.retained_key_bytes {
+			return Err(format!(
+				"decisions: retained key bytes {} but {} live keys charged {charged}",
+				self.retained_key_bytes,
+				self.keys.len()
+			));
 		}
 		let mut noop_keys = std::collections::BTreeSet::new();
 		for (dec, noop) in &self.noops {
@@ -2996,6 +3256,8 @@ fn lookup(
 		RecordKind::Noop => ParentStatus::Noop {
 			dec: entry.reservation,
 		},
+		// Wendelon ADR 0123 D3: an erased record's key answers from its receipt.
+		RecordKind::Settled(settlement) => settlement.status(entry.reservation),
 	};
 	Ok(Some((entry.reservation, status)))
 }
@@ -3071,7 +3333,7 @@ fn reserve(
 	let retained = decisions
 		.retained_claim_bytes
 		.checked_add(claim_bytes)
-		.filter(|total| *total <= MAX_RETAINED_CLAIM_BYTES)
+		.filter(|total| *total <= decisions.claim_cap())
 		.ok_or(DecisionRefusal::RetainedFull)?;
 	// The reservation is the Reserve entry's own log index, never a counter.
 	let reservation = log_index;
@@ -3083,6 +3345,9 @@ fn reserve(
 	if decisions.retention.is_none() {
 		return Err(DecisionRefusal::FormationIncomplete);
 	}
+	// Wendelon ADR 0123 D5: a new key's fixed charge on a positive-window store,
+	// held until the key retires, so its later settlement allocates nothing.
+	let key_bytes = admit_key_charge(decisions)?;
 	// ADR 0720: the last check, so a claim refused for any other reason never
 	// seals. The first admitted write fixes the membership it was admitted
 	// under; every later one is admitted only under that membership.
@@ -3100,6 +3365,7 @@ fn reserve(
 	decisions.clock_ms = clock_ms;
 	decisions.retained_claim_bytes = retained;
 	decisions.live += 1;
+	decisions.retained_key_bytes = key_bytes;
 	decisions.keys.insert(
 		claim.key,
 		KeyEntry {
@@ -3121,6 +3387,80 @@ fn reserve(
 	);
 	decisions.note_live(&claim.key, reservation);
 	Ok(DecisionResult::Reserved { reservation })
+}
+
+/// Wendelon ADR 0123 D5: whether a settled receipt is a possible answer for its
+/// key, from facts still recoverable after its record's erasure: a KV key settles
+/// only as a KV write; a table key as a write, a delete or a noop (noops are table
+/// deletes); delete counts cover 1 to [`MAX_DELETE_ROWS`] rows; an Accepted delete
+/// deleted at least one row and a noop none.
+fn settlement_is_legal(key: &ParentKey, settlement: Settlement) -> bool {
+	let counts_legal = |counts: [u32; 3], noop: bool| {
+		let rows: u64 = counts.iter().map(|count| u64::from(*count)).sum();
+		// A matched delete deleted at least one winner (`validate_claim`); one that
+		// matched nothing is recorded as a noop, which deleted none.
+		(1..=MAX_DELETE_ROWS as u64).contains(&rows) && (counts[0] == 0) == noop
+	};
+	match (key.namespace, settlement) {
+		(
+			ParentNamespace::Kv,
+			Settlement::Accepted {
+				effect: AcceptedEffect::Kv,
+				..
+			}
+			| Settlement::Refused {
+				kind: OperationKind::Kv,
+				..
+			},
+		) => true,
+		(ParentNamespace::Kv, _) => false,
+		(
+			ParentNamespace::Table(_),
+			Settlement::Accepted {
+				effect: AcceptedEffect::Write,
+				..
+			}
+			| Settlement::Refused {
+				kind: OperationKind::Write | OperationKind::Delete,
+				..
+			},
+		) => true,
+		(
+			ParentNamespace::Table(_),
+			Settlement::Accepted {
+				effect: AcceptedEffect::Delete(counts),
+				..
+			},
+		) => counts_legal(counts, false),
+		(ParentNamespace::Table(_), Settlement::Noop { counts }) => counts_legal(counts, true),
+		(
+			ParentNamespace::Table(_),
+			Settlement::Accepted {
+				effect: AcceptedEffect::Kv,
+				..
+			}
+			| Settlement::Refused {
+				kind: OperationKind::Kv,
+				..
+			},
+		) => false,
+	}
+}
+
+/// Wendelon ADR 0123 D5: the retained key bytes after admitting one new key:
+/// its fixed charge on a positive-window store (0 at window 0), refused
+/// `RetainedFull` past [`MAX_RETAINED_KEY_BYTES`]. A replay never reaches here:
+/// its lookup answers first.
+fn admit_key_charge(decisions: &DecisionState) -> Result<u64, DecisionRefusal> {
+	let charge = decisions.key_charge();
+	if charge == 0 {
+		return Ok(decisions.retained_key_bytes);
+	}
+	decisions
+		.retained_key_bytes
+		.checked_add(charge)
+		.filter(|total| *total <= MAX_RETAINED_KEY_BYTES)
+		.ok_or(DecisionRefusal::RetainedFull)
 }
 
 /// ADR 0700: a new claim's commit HLC leads the replicated leader stamp by at
@@ -3259,13 +3599,20 @@ fn record_noop(
 	let retained = decisions
 		.retained_claim_bytes
 		.checked_add(bytes)
-		.filter(|total| *total <= MAX_RETAINED_CLAIM_BYTES)
+		.filter(|total| *total <= decisions.claim_cap())
 		.ok_or(RetainedFull)?;
 	if decisions.bodies.contains_key(&log_index) || decisions.noops.contains_key(&log_index) {
 		return Err(LogIndexOutOfOrder);
 	}
+	// Wendelon ADR 0123 D5 (U1): as a Reserve, no noop is recorded before the store's
+	// retention window is bound, so every key is admitted under one known binding.
+	if decisions.retention.is_none() {
+		return Err(FormationIncomplete);
+	}
+	let key_bytes = admit_key_charge(decisions)?;
 	decisions.clock_ms = clock_ms;
 	decisions.retained_claim_bytes = retained;
+	decisions.retained_key_bytes = key_bytes;
 	decisions.keys.insert(
 		noop.key,
 		KeyEntry {
@@ -3642,8 +3989,21 @@ fn abort_parent(
 	};
 	// DC-284: the record kind first, before any body is read. A Noop names no parent claim,
 	// so there is nothing to abort: the key names a different request, refused with no effect.
-	if entry.record != RecordKind::Body {
-		return Err(DecisionRefusal::Conflict);
+	// Wendelon ADR 0123 D3: a settled key keeps Abort's answer by its origin: a body
+	// origin with the same claim answers its terminal outcome, another claim conflicts;
+	// a noop origin conflicts.
+	match entry.record {
+		RecordKind::Body => {}
+		RecordKind::Noop => return Err(DecisionRefusal::Conflict),
+		RecordKind::Settled(settlement) => {
+			return match settlement.claim_digest() {
+				Some(digest) if digest == signed.body.claim_digest => Ok(existing_result(
+					entry.reservation,
+					settlement.status(entry.reservation),
+				)),
+				_ => Err(DecisionRefusal::Conflict),
+			};
+		}
 	}
 	// A Body key names its body (`DecisionState::validate`).
 	let body = &decisions.bodies[&entry.reservation];
@@ -3770,6 +4130,16 @@ fn advance_floor(
 	if floor_ms > limit {
 		return Err(DecisionRefusal::FloorTooRecent);
 	}
+	// Wendelon ADR 0123 D5: the charge of every live key is held, so releasing any
+	// subset cannot underflow. Checked once, before anything changes (O(1); 0 at
+	// window 0); the release after the retain below is then exact and infallible.
+	let charge = decisions.key_charge();
+	if charge
+		.checked_mul(decisions.keys.len() as u64)
+		.is_none_or(|held| held > decisions.retained_key_bytes)
+	{
+		return Err(DecisionRefusal::CounterOverflow);
+	}
 	decisions.clock_ms = clock_ms;
 	decisions.floor_ms = floor_ms;
 	let bodies = &decisions.bodies;
@@ -3779,10 +4149,12 @@ fn advance_floor(
 		let issued = key.issued_ms().expect("a recorded key is a UUIDv7");
 		let terminal = match entry.record {
 			RecordKind::Body => bodies[&entry.reservation].status.is_terminal(),
-			RecordKind::Noop => true,
+			// Wendelon ADR 0123: a settled key is terminal by construction.
+			RecordKind::Noop | RecordKind::Settled(_) => true,
 		};
 		!(terminal && issued <= floor_ms)
 	});
+	decisions.retained_key_bytes -= charge * (before - decisions.keys.len()) as u64;
 	// Wendelon ADR 0113: the index follows the keys it is derived from.
 	let keys = &decisions.keys;
 	decisions.table_operations.retain(|operation, table| {
@@ -3817,6 +4189,12 @@ pub enum Lookup {
 	Noop {
 		record: NoopRecord,
 	},
+	/// Wendelon ADR 0123 D3: a live key whose record a generation erased: its
+	/// terminal outcome, never a synthesized record. Appended.
+	Settled {
+		reservation: u64,
+		settlement: Settlement,
+	},
 }
 
 /// The authoritative lookup over applied state: no clock and no current
@@ -3829,11 +4207,18 @@ pub fn lookup_parent(
 ) -> Lookup {
 	match lookup(decisions, key, request_digest) {
 		Err(_) => Lookup::Conflict,
-		Ok(Some((dec, ParentStatus::Noop { .. }))) => Lookup::Noop {
-			record: decisions.noops[&dec].clone(),
-		},
-		Ok(Some((reservation, _))) => Lookup::Recorded {
-			record: decisions.bodies[&reservation].clone(),
+		// Wendelon ADR 0123 D3: the record kind decides, before any map is indexed.
+		Ok(Some((reservation, _))) => match decisions.keys[key].record {
+			RecordKind::Settled(settlement) => Lookup::Settled {
+				reservation,
+				settlement,
+			},
+			RecordKind::Noop => Lookup::Noop {
+				record: decisions.noops[&reservation].clone(),
+			},
+			RecordKind::Body => Lookup::Recorded {
+				record: decisions.bodies[&reservation].clone(),
+			},
 		},
 		Ok(None) => match unrecorded(decisions, key) {
 			DecisionRefusal::InvalidIdentity => Lookup::InvalidIdentity,
@@ -3931,6 +4316,31 @@ pub fn resolve_table_operation(
 		};
 		let entry = decisions.keys[&key];
 		match entry.record {
+			// Wendelon ADR 0123 D3: the same answers from a settled receipt.
+			RecordKind::Settled(settlement) => {
+				return match settlement {
+					Settlement::Accepted {
+						dec,
+						commit_hlc,
+						effect,
+						..
+					} => TableResolution::Accepted {
+						dec,
+						commit_hlc,
+						delete_counts: match effect {
+							AcceptedEffect::Delete(counts) => Some(counts),
+							AcceptedEffect::Write | AcceptedEffect::Kv => None,
+						},
+					},
+					Settlement::Refused { kind, .. } => TableResolution::Refused {
+						delete: kind == OperationKind::Delete,
+					},
+					Settlement::Noop { counts } => TableResolution::Noop {
+						dec: entry.reservation,
+						counts,
+					},
+				};
+			}
 			RecordKind::Noop => {
 				return TableResolution::Noop {
 					dec: entry.reservation,

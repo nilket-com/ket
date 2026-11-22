@@ -12,7 +12,7 @@ use crate::schema::{
 
 /// A MUTATION_OUTCOME_REQ through the data-frame handler of `node`, from a
 /// data-node identity: what a public client's resolve gets from that node.
-async fn resolve_at(
+pub(super) async fn resolve_at(
 	cluster: &Cluster,
 	node: u32,
 	id: ClientWriteId,

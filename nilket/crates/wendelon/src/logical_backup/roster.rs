@@ -101,6 +101,11 @@ pub(crate) fn roster_at(
 			reserved += 1;
 		}
 	}
+	// Wendelon ADR 0123 D4: a live KV key whose body was erased into the certified
+	// base keeps the same answer for the key's whole life.
+	if decisions.settled_kv_key_present() {
+		return Err(RosterRefusal::KvDataPresent);
+	}
 
 	// Lifecycles the hold or this mode keeps from completing: refused now.
 	let mut tenants = Vec::new();

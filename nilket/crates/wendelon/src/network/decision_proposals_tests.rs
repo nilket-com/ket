@@ -801,7 +801,86 @@ fn an_answer_is_judged_by_type_and_frame_version_before_its_body() {
 	assert!(check_response_frame(&header(propose, 9), propose, envelope).is_err());
 	assert!(check_response_frame(&header(propose, 1), propose, envelope).is_err());
 	assert!(check_response_frame(&header(lookup, envelope), propose, envelope).is_err());
-	// Lookups keep the one HRFT version in both directions.
-	check_response_frame(&header(lookup, 1), lookup, 1).unwrap();
-	assert!(check_response_frame(&header(lookup, envelope), lookup, 1).is_err());
+	// Wendelon ADR 0123 D6: lookups travel in the decision envelope in both directions;
+	// the previous build's version-1 answer is refused before its body.
+	check_response_frame(&header(lookup, envelope), lookup, envelope).unwrap();
+	assert!(check_response_frame(&header(lookup, 1), lookup, envelope).is_err());
+	assert!(check_response_frame(&header(propose, envelope), lookup, envelope).is_err());
+}
+
+/// The previous build's own decision lookup frames (fixture, with provenance).
+fn previous_builds_lookup_frames() -> (Vec<u8>, Vec<u8>) {
+	let raw = include_str!("../../tests/fixtures/consensus_body/lookup_frames_v1_aa5a159a5.txt");
+	let get = |name: &str| {
+		let line = raw
+			.lines()
+			.find(|line| line.starts_with(&format!("{name}=")))
+			.unwrap_or_else(|| panic!("{name}"));
+		let hex = &line[name.len() + 1..];
+		(0..hex.len())
+			.step_by(2)
+			.map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+			.collect::<Vec<u8>>()
+	};
+	(get("lookup_request_v1"), get("lookup_reply_v1"))
+}
+
+/// Wendelon ADR 0123 D6 (V1, V2 at the frame level): the previous build's exact
+/// version-1 lookup frames are refused by version before any body is interpreted,
+/// though each body is well formed. Its reply is refused by the production client's
+/// judgment (`decode_response`, which `round_trip` uses); its request passes the
+/// generic frame reader (envelope 1 is admitted on every type) and is refused by the
+/// handler's mode check, which runs before the body is decoded.
+#[tokio::test]
+async fn the_previous_builds_lookup_frames_are_refused_before_their_bodies() {
+	use crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS;
+	use crate::consensus::decisions::Lookup;
+	use crate::network::core::read_frame;
+	use crate::network::decision_proposals::{
+		LookupRequest, LookupResponse, decode_bounded, decode_response,
+	};
+	let (request, reply) = previous_builds_lookup_frames();
+	let pool = crate::network::pool::BufPool::new(4, 1 << 20);
+
+	let reply = read_frame(&mut reply.as_slice(), &pool).await.unwrap();
+	assert_eq!(
+		(reply.header.version, reply.header.msg_type),
+		(1, MsgType::DECISION_LOOKUP_RESP.0)
+	);
+	let body: LookupResponse = decode_bounded(reply.meta.as_ref()).unwrap();
+	assert_eq!(
+		body,
+		LookupResponse::Found(Lookup::Absent { eligible: true }),
+		"premise: the body is a well-formed answer"
+	);
+	assert!(
+		decode_response::<LookupResponse>(
+			&reply,
+			MsgType::DECISION_LOOKUP_RESP,
+			RAFT_FRAME_VERSION_PARENT_DECISIONS
+		)
+		.is_err(),
+		"the client refuses the previous build's answer by its version"
+	);
+
+	let request = read_frame(&mut request.as_slice(), &pool).await.unwrap();
+	assert_eq!(
+		(request.header.version, request.header.msg_type),
+		(1, MsgType::DECISION_LOOKUP_REQ.0)
+	);
+	crate::network::wire::validate_frame_version(1, MsgType::DECISION_LOOKUP_REQ.0).unwrap();
+	let body: LookupRequest = decode_bounded(request.meta.as_ref()).unwrap();
+	assert_eq!(
+		postcard::to_stdvec(&body).unwrap(),
+		request.meta.as_ref().to_vec(),
+		"premise: the request body is well formed and this build encodes it identically"
+	);
+	assert_eq!(
+		DecisionMode::ParentDecisions
+			.check_raft_frame(request.header.version)
+			.unwrap_err()
+			.kind(),
+		std::io::ErrorKind::PermissionDenied,
+		"the handler refuses the previous build's request before its body"
+	);
 }

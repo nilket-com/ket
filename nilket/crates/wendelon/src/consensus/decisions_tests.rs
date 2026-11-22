@@ -5876,6 +5876,9 @@ pub(crate) fn retention_state(
 			oldest_visible: oldest,
 		});
 		decisions.generations.next_gid = 2;
+		// Wendelon ADR 0123 D7: a committed sampled certificate leaves its stamp as the
+		// settlement watermark.
+		decisions.generations.settled_ms = retention.stamp_ms;
 	}
 	if let Some(retention) = pending {
 		let target = generations::Target {
@@ -8311,4 +8314,1047 @@ fn an_abort_naming_a_noop_key_is_refused_with_no_effect() {
 		DecisionResult::Terminal { .. }
 	));
 	assert!(decisions(&state).validate().is_ok());
+}
+
+// ============================================================
+//  WENDELON ADR 0123 SLICE 1: A SETTLED RECEIPT IN THE REDUCER
+// ============================================================
+
+/// A formed store bound to the positive Section 8 window before any write.
+fn windowed_base() -> SmState {
+	let mut state = base(3);
+	bind_window(&mut state, WINDOW_MS);
+	grant_all(&mut state);
+	state
+}
+
+/// Reserves and accepts `claim` at `stamp_ms`: its reservation and decision.
+fn accept_claim(state: &mut SmState, claim: &Claim, stamp_ms: u64) -> (u64, u64) {
+	let DecisionResult::Reserved { reservation } = reserve(state, claim, stamp_ms) else {
+		panic!("reserve");
+	};
+	let DecisionResult::Terminal {
+		status: ParentStatus::Accepted { dec },
+		..
+	} = finalize(state, claim, quorum_acks(claim, reservation))
+	else {
+		panic!("accept");
+	};
+	(reservation, dec)
+}
+
+/// Proposes a generation over `t` that keeps the current floor, and commits it.
+fn settle_through(state: &mut SmState, t: u64) -> u64 {
+	let d = decisions(state);
+	let (gid, predecessor) = (d.generations.next_gid, d.generations.current_gid());
+	let retention = cut(d.retention_window_ms(), 0, d.generations.floor_ms());
+	assert_eq!(
+		propose_cut(state, gid, t, predecessor, retention),
+		DecisionResult::TargetRecorded { gid }
+	);
+	commit_with(state, None);
+	gid
+}
+
+fn record_kind(state: &SmState, key: &ParentKey) -> Option<RecordKind> {
+	decisions(state).keys.get(key).map(|entry| entry.record)
+}
+
+/// C1: the fixed key charge is a conservative representation-level bound: tight over
+/// every record kind with each field at its type's maximum (not all legal: an all-ones
+/// uuid is not a UUIDv7, `u32::MAX` counts exceed a 512-row delete, and a body receipt
+/// needs dec > reservation), and above the largest legal boundary encoding.
+#[test]
+fn a_key_record_charge_bounds_every_encoding() {
+	let max_key = ParentKey {
+		tenant: TenantId::new(u64::MAX),
+		namespace: ParentNamespace::Table(crate::schema::TableObjectId::new([0xFF; 16])),
+		client_uuid: [0xFF; 16],
+		sequence_no: u64::MAX,
+	};
+	let hlc = crate::schema::HybridTimestamp {
+		physical_ms: u64::MAX,
+		logical: u32::MAX,
+		node_id: u32::MAX,
+	};
+	let causes = [
+		RefusalCause::LineageClosed,
+		RefusalCause::Aborted,
+		RefusalCause::TableDropped,
+		RefusalCause::CtasAbandoned,
+	];
+	let mut records = vec![RecordKind::Body, RecordKind::Noop];
+	for effect in [
+		AcceptedEffect::Write,
+		AcceptedEffect::Kv,
+		AcceptedEffect::Delete([u32::MAX; 3]),
+	] {
+		records.push(RecordKind::Settled(Settlement::Accepted {
+			dec: u64::MAX,
+			claim_digest: [0xFF; 32],
+			commit_hlc: hlc,
+			effect,
+		}));
+	}
+	for cause in causes {
+		for kind in [
+			OperationKind::Write,
+			OperationKind::Delete,
+			OperationKind::Kv,
+		] {
+			records.push(RecordKind::Settled(Settlement::Refused {
+				dec: u64::MAX,
+				claim_digest: [0xFF; 32],
+				cause,
+				kind,
+			}));
+		}
+	}
+	records.push(RecordKind::Settled(Settlement::Noop {
+		counts: [u32::MAX; 3],
+	}));
+	let sizes: Vec<u64> = records
+		.iter()
+		.map(|record| {
+			let entry = KeyEntry {
+				reservation: u64::MAX,
+				request_digest: [0xFF; 32],
+				record: *record,
+			};
+			postcard::to_stdvec(&(max_key, entry)).unwrap().len() as u64
+		})
+		.collect();
+	eprintln!("key record encodings: {sizes:?}");
+	assert!(sizes.iter().all(|size| *size <= KEY_RECORD_CHARGE));
+	assert_eq!(
+		sizes.iter().max(),
+		Some(&KEY_RECORD_CHARGE),
+		"the representation bound is tight"
+	);
+	// The largest legal boundary: a UUIDv7 at the last 48-bit millisecond, a
+	// reservation below its decision, a full 512-row Accepted delete.
+	let legal_key = ParentKey {
+		client_uuid: uuid_v7((1 << 48) - 1, 0xFF),
+		..max_key
+	};
+	assert!(legal_key.issued_ms().is_some(), "a UUIDv7");
+	let legal = Settlement::Accepted {
+		dec: u64::MAX,
+		claim_digest: [0xFF; 32],
+		commit_hlc: hlc,
+		effect: AcceptedEffect::Delete([MAX_DELETE_ROWS as u32, 0, 0]),
+	};
+	assert!(settlement_is_legal(&legal_key, legal));
+	let entry = KeyEntry {
+		reservation: u64::MAX - 1,
+		request_digest: [0xFF; 32],
+		record: RecordKind::Settled(legal),
+	};
+	let legal_size = postcard::to_stdvec(&(legal_key, entry)).unwrap().len() as u64;
+	eprintln!("largest legal boundary encoding: {legal_size}");
+	assert!(legal_size <= KEY_RECORD_CHARGE);
+}
+
+/// I2 (Codex, slice 1 review item 2): `validate` refuses, by isolated mutation of an
+/// otherwise valid settled state (indexes rederived), every receipt that is
+/// impossible for its key from facts still recoverable after erasure; the valid
+/// state round-trips and validates.
+#[test]
+fn validate_refuses_impossible_receipts_by_isolated_mutation() {
+	let mut state = windowed_base();
+	let write = claim(key(T0, 1), children(&state, 2), 0);
+	let (_, dec) = accept_claim(&mut state, &write, T0);
+	settle_through(&mut state, dec);
+	let valid = decisions(&state).clone();
+	valid.validate().unwrap();
+	let bytes = postcard::to_stdvec(&valid).unwrap();
+	let mut round: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	round.restore_table_operations().unwrap();
+	round.validate().unwrap();
+	assert_eq!(round, valid, "a valid round trip");
+	let RecordKind::Settled(Settlement::Accepted {
+		claim_digest,
+		commit_hlc,
+		..
+	}) = valid.keys[&write.key].record
+	else {
+		panic!("settled");
+	};
+	let refused = |mutate: &dyn Fn(&mut DecisionState), what: &str| {
+		let mut state = valid.clone();
+		mutate(&mut state);
+		state.restore_table_operations().unwrap();
+		assert!(state.validate().is_err(), "{what}");
+	};
+	let set = |state: &mut DecisionState, key: &ParentKey, settlement: Settlement| {
+		state.keys.get_mut(key).unwrap().record = RecordKind::Settled(settlement);
+	};
+	refused(
+		&|state| set(state, &write.key, Settlement::Noop { counts: [1, 0, 0] }),
+		"a noop that deleted a row",
+	);
+	refused(
+		&|state| {
+			set(
+				state,
+				&write.key,
+				Settlement::Accepted {
+					dec,
+					claim_digest,
+					commit_hlc,
+					effect: AcceptedEffect::Kv,
+				},
+			)
+		},
+		"a KV effect on a table key",
+	);
+	refused(
+		&|state| {
+			set(
+				state,
+				&write.key,
+				Settlement::Accepted {
+					dec,
+					claim_digest,
+					commit_hlc,
+					effect: AcceptedEffect::Delete([0, 0, 0]),
+				},
+			)
+		},
+		"a delete of no rows",
+	);
+	// The deleted count discriminates the origin: [0, 1, 0] is a legal noop (it
+	// matched nothing) and an impossible Accepted delete (a matched delete deleted
+	// a winner); [1, 0, 0] is the legal Accepted delete.
+	refused(
+		&|state| {
+			set(
+				state,
+				&write.key,
+				Settlement::Accepted {
+					dec,
+					claim_digest,
+					commit_hlc,
+					effect: AcceptedEffect::Delete([0, 1, 0]),
+				},
+			)
+		},
+		"an Accepted delete that deleted nothing",
+	);
+	let accepted = |state: &mut DecisionState, settlement: Settlement| {
+		set(state, &write.key, settlement);
+		state.restore_table_operations().unwrap();
+		state.validate()
+	};
+	assert!(
+		accepted(
+			&mut valid.clone(),
+			Settlement::Accepted {
+				dec,
+				claim_digest,
+				commit_hlc,
+				effect: AcceptedEffect::Delete([1, 0, 0]),
+			}
+		)
+		.is_ok(),
+		"a matched delete is a legal Accepted receipt"
+	);
+	assert!(
+		accepted(&mut valid.clone(), Settlement::Noop { counts: [0, 1, 0] }).is_ok(),
+		"the same counts are a legal noop"
+	);
+	refused(
+		&|state| {
+			set(
+				state,
+				&write.key,
+				Settlement::Accepted {
+					dec,
+					claim_digest,
+					commit_hlc,
+					effect: AcceptedEffect::Delete([MAX_DELETE_ROWS as u32, 1, 0]),
+				},
+			)
+		},
+		"a delete of more than 512 rows",
+	);
+	refused(
+		&|state| {
+			let entry = state.keys.remove(&write.key).unwrap();
+			state.keys.insert(
+				ParentKey {
+					namespace: ParentNamespace::Kv,
+					..write.key
+				},
+				entry,
+			);
+		},
+		"a table write settled under a KV key",
+	);
+	refused(
+		&|state| {
+			let entry = state.keys.remove(&write.key).unwrap();
+			state.keys.insert(
+				ParentKey {
+					client_uuid: [0xFF; 16],
+					..write.key
+				},
+				entry,
+			);
+		},
+		"a settled key that is not a UUIDv7",
+	);
+	// Unbound, isolated: a noop records a key and seals nothing, so only the
+	// binding check can refuse it.
+	let mut noop_only = windowed_base();
+	let noop = noop_body(&noop_only, 9, 1);
+	assert!(matches!(
+		record_noop(&mut noop_only, noop),
+		DecisionResult::Terminal { .. }
+	));
+	let mut unbound = decisions(&noop_only).clone();
+	unbound.validate().unwrap();
+	assert!(unbound.sealed.is_none(), "premise: nothing sealed");
+	unbound.retention = None;
+	unbound.retained_key_bytes = 0;
+	assert!(
+		unbound.validate().is_err(),
+		"a key and a noop retained while unbound"
+	);
+	// advance_floor refuses a short counter before any change.
+	let mut short = state.clone();
+	short.decisions.as_mut().unwrap().retained_key_bytes -= 1;
+	let before = short.decisions.clone();
+	assert_eq!(
+		floor(&mut short, T0, T0 + DECISION_EXPIRY_MS + 10),
+		self::refused(DecisionRefusal::CounterOverflow)
+	);
+	assert_eq!(short.decisions, before, "no partial change");
+	refused(
+		&|state| {
+			let entry = state.keys[&write.key];
+			let extra = (MAX_RETAINED_KEY_BYTES / KEY_RECORD_CHARGE) + 1;
+			for n in 0..extra {
+				state.keys.insert(
+					ParentKey {
+						sequence_no: 1_000 + n,
+						..write.key
+					},
+					KeyEntry {
+						reservation: entry.reservation + 1 + n,
+						..entry
+					},
+				);
+			}
+			state.retained_key_bytes = KEY_RECORD_CHARGE * state.keys.len() as u64;
+		},
+		"a correctly summed key charge above the cap",
+	);
+}
+
+/// R1: a replay answers the same terminal outcome before, during and after its
+/// record's settlement; lookup, resolve and conflict follow; conversion allocates
+/// nothing.
+#[test]
+fn a_replay_answers_the_same_before_and_after_its_record_is_settled() {
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (rsv, dec) = accept_claim(&mut state, &c, T0);
+	let answer = DecisionResult::Terminal {
+		reservation: rsv,
+		status: ParentStatus::Accepted { dec },
+	};
+	assert_eq!(reserve(&mut state, &c, T0), answer);
+	assert!(matches!(
+		lookup_parent(decisions(&state), &c.key, &c.request_digest),
+		Lookup::Recorded { .. }
+	));
+	assert_eq!(decisions(&state).retained_key_bytes(), KEY_RECORD_CHARGE);
+	let gid = decisions(&state).generations.next_gid;
+	assert_eq!(
+		propose_cut(&mut state, gid, dec, 0, cut(WINDOW_MS, 0, 0)),
+		DecisionResult::TargetRecorded { gid }
+	);
+	assert_eq!(
+		reserve(&mut state, &c, T0),
+		answer,
+		"while the target is pending"
+	);
+	commit_with(&mut state, None);
+	let settlement = Settlement::Accepted {
+		dec,
+		claim_digest: claim_digest(&c),
+		commit_hlc: c.commit_hlc,
+		effect: AcceptedEffect::Write,
+	};
+	assert_eq!(
+		record_kind(&state, &c.key),
+		Some(RecordKind::Settled(settlement))
+	);
+	assert!(decisions(&state).bodies.is_empty(), "the body is erased");
+	assert_eq!(reserve(&mut state, &c, T0), answer, "after settlement");
+	assert_eq!(finalize(&mut state, &c, quorum_acks(&c, rsv)), answer);
+	assert_eq!(
+		lookup_parent(decisions(&state), &c.key, &c.request_digest),
+		Lookup::Settled {
+			reservation: rsv,
+			settlement
+		}
+	);
+	assert_eq!(
+		lookup_parent(decisions(&state), &c.key, &[1; 32]),
+		Lookup::Conflict
+	);
+	assert_eq!(
+		resolve_table_operation(
+			decisions(&state),
+			TENANT,
+			c.key.client_uuid,
+			c.key.sequence_no
+		),
+		TableResolution::Accepted {
+			dec,
+			commit_hlc: c.commit_hlc,
+			delete_counts: None
+		}
+	);
+	assert_eq!(
+		decisions(&state).retained_key_bytes(),
+		KEY_RECORD_CHARGE,
+		"conversion allocates nothing"
+	);
+	decisions(&state).validate().unwrap();
+}
+
+/// R2: a key retired between the target's proposal and its commit leaves no
+/// receipt; its replay is unavailable, as today.
+#[test]
+fn a_key_retired_between_proposal_and_commit_leaves_no_receipt() {
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (_, dec) = accept_claim(&mut state, &c, T0);
+	assert_eq!(
+		propose_cut(&mut state, 1, dec, 0, cut(WINDOW_MS, 0, 0)),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	assert!(matches!(
+		floor(&mut state, T0, T0 + DECISION_EXPIRY_MS + 10),
+		DecisionResult::FloorAdvanced {
+			retired_keys: 1,
+			..
+		}
+	));
+	assert_eq!(decisions(&state).retained_key_bytes(), 0, "charge released");
+	commit_with(&mut state, None);
+	assert_eq!(record_kind(&state, &c.key), None, "no receipt");
+	assert!(decisions(&state).bodies.is_empty());
+	assert_eq!(
+		reserve(&mut state, &c, T0),
+		refused(DecisionRefusal::OutcomeUnavailable)
+	);
+	assert_eq!(
+		lookup_parent(decisions(&state), &c.key, &c.request_digest),
+		Lookup::Absent { eligible: false }
+	);
+	decisions(&state).validate().unwrap();
+}
+
+/// R3: a settled key retires with its receipt, and its charge is released once.
+#[test]
+fn a_settled_key_retires_with_its_receipt_and_its_charge_once() {
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (_, dec) = accept_claim(&mut state, &c, T0);
+	settle_through(&mut state, dec);
+	assert!(matches!(
+		record_kind(&state, &c.key),
+		Some(RecordKind::Settled(_))
+	));
+	assert!(matches!(
+		floor(&mut state, T0, T0 + DECISION_EXPIRY_MS + 10),
+		DecisionResult::FloorAdvanced {
+			retired_keys: 1,
+			..
+		}
+	));
+	assert_eq!(record_kind(&state, &c.key), None);
+	assert_eq!(decisions(&state).retained_key_bytes(), 0);
+	assert!(matches!(
+		floor(&mut state, T0 + 1, T0 + DECISION_EXPIRY_MS + 20),
+		DecisionResult::FloorAdvanced {
+			retired_keys: 0,
+			..
+		}
+	));
+	assert_eq!(decisions(&state).retained_key_bytes(), 0, "released once");
+	assert_eq!(
+		resolve_table_operation(
+			decisions(&state),
+			TENANT,
+			c.key.client_uuid,
+			c.key.sequence_no
+		),
+		TableResolution::Expired
+	);
+	decisions(&state).validate().unwrap();
+}
+
+/// R4: a record still Reserved blocks the cut; once concluded, a later target
+/// covers and settles it with the rest.
+#[test]
+fn a_reserved_record_blocks_the_cut_until_it_concludes() {
+	let mut state = windowed_base();
+	let first = claim(key(T0, 1), children(&state, 2), 0);
+	let DecisionResult::Reserved {
+		reservation: first_rsv,
+	} = reserve(&mut state, &first, T0)
+	else {
+		panic!("reserve");
+	};
+	let second = claim(key(T0, 2), children(&state, 2), 0);
+	let (_, second_dec) = accept_claim(&mut state, &second, T0);
+	assert_eq!(
+		propose_cut(&mut state, 1, second_dec, 0, cut(WINDOW_MS, 0, 0)),
+		refused(DecisionRefusal::TargetNotAdmissible),
+		"the Reserved record blocks"
+	);
+	let DecisionResult::Terminal {
+		status: ParentStatus::Accepted { dec: first_dec },
+		..
+	} = finalize(&mut state, &first, quorum_acks(&first, first_rsv))
+	else {
+		panic!("accept");
+	};
+	settle_through(&mut state, first_dec.max(second_dec));
+	assert!(matches!(
+		record_kind(&state, &first.key),
+		Some(RecordKind::Settled(Settlement::Accepted { .. }))
+	));
+	assert!(matches!(
+		record_kind(&state, &second.key),
+		Some(RecordKind::Settled(Settlement::Accepted { .. }))
+	));
+	decisions(&state).validate().unwrap();
+}
+
+/// D7 (slice 1, Codex 01a202bc): what a cut may cover is separate from what starts a
+/// generation. A fresh terminal record whose key is live, at a closed cut, with no
+/// retired key, structure or age due, starts nothing on a positive-window store,
+/// though its cut is closed; at window 0 its cut is not even closed.
+#[test]
+fn a_fresh_live_key_record_alone_starts_no_generation() {
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (_, dec) = accept_claim(&mut state, &c, T0);
+	assert!(
+		generations::covered(decisions(&state), dec).is_some(),
+		"closed"
+	);
+	assert!(generations::next_target(&state, peek_index(), Some(T0 + 1_000)).is_none());
+	assert!(generations::next_target(&state, peek_index(), None).is_none());
+
+	let mut zero = base(3);
+	grant_all(&mut zero);
+	let c = claim(key(T0, 1), children(&zero, 2), 0);
+	let (_, dec) = accept_claim(&mut zero, &c, T0);
+	assert!(
+		generations::covered(decisions(&zero), dec).is_none(),
+		"window 0"
+	);
+	assert!(generations::next_target(&zero, peek_index(), Some(T0 + 1_000)).is_none());
+}
+
+/// D7 (slice 1): a genuine independent trigger, an older record whose key has
+/// retired (T0), proposes a target whose cut also covers a fresh live-key record;
+/// its commit erases the old record with no receipt and settles the fresh one.
+#[test]
+fn an_independent_trigger_covers_and_settles_a_live_key_record() {
+	let mut state = windowed_base();
+	let old = claim(key(T0, 1), children(&state, 2), 0);
+	accept_claim(&mut state, &old, T0);
+	assert!(matches!(
+		floor(&mut state, T0, T0 + DECISION_EXPIRY_MS + 10),
+		DecisionResult::FloorAdvanced {
+			retired_keys: 1,
+			..
+		}
+	));
+	let fresh = claim(key(T0 + 20_000, 2), children(&state, 2), 0);
+	let (_, fresh_dec) = accept_claim(&mut state, &fresh, T0 + DECISION_EXPIRY_MS + 10);
+	let target = generations::next_target(&state, peek_index(), None).expect("T0: a retired key");
+	assert!(target.t >= fresh_dec, "the cut covers the fresh record too");
+	let gid = target.gid;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid }
+	);
+	commit_with(&mut state, None);
+	assert_eq!(record_kind(&state, &old.key), None, "no receipt");
+	assert_eq!(
+		record_kind(&state, &fresh.key),
+		Some(RecordKind::Settled(Settlement::Accepted {
+			dec: fresh_dec,
+			claim_digest: claim_digest(&fresh),
+			commit_hlc: fresh.commit_hlc,
+			effect: AcceptedEffect::Write,
+		}))
+	);
+	assert!(decisions(&state).bodies.is_empty());
+	assert_eq!(decisions(&state).retained_key_bytes(), KEY_RECORD_CHARGE);
+	decisions(&state).validate().unwrap();
+}
+
+/// R5: Abort answers by origin, before and after settlement: an Accepted or a
+/// Refused origin with its claim answers its terminal outcome and another claim
+/// conflicts; a noop origin conflicts (DC-284).
+#[test]
+fn abort_answers_by_origin_before_and_after_settlement() {
+	let mut state = windowed_base();
+	let accepted = claim(key(T0, 1), children(&state, 2), 0);
+	let (accepted_rsv, accepted_dec) = accept_claim(&mut state, &accepted, T0);
+	let other = claim(accepted.key, children(&state, 1), 0);
+	assert_ne!(claim_digest(&other), claim_digest(&accepted));
+	let aborted = claim(key(T0, 2), children(&state, 2), 0);
+	let DecisionResult::Reserved {
+		reservation: aborted_rsv,
+	} = reserve(&mut state, &aborted, T0)
+	else {
+		panic!("reserve");
+	};
+	let DecisionResult::Terminal {
+		status: aborted_status,
+		..
+	} = abort(&mut state, &aborted, aborted_rsv)
+	else {
+		panic!("abort");
+	};
+	let noop = noop_body(&state, 9, 1);
+	let noop_key = noop.key;
+	assert!(matches!(
+		record_noop(&mut state, noop),
+		DecisionResult::Terminal { .. }
+	));
+	let on_noop = claim(noop_key, children(&state, 2), 0);
+	let answers = |state: &mut SmState| {
+		(
+			abort(state, &accepted, accepted_rsv),
+			abort(state, &other, accepted_rsv),
+			abort(state, &aborted, aborted_rsv),
+			abort(state, &on_noop, 1),
+		)
+	};
+	let expected = (
+		DecisionResult::Terminal {
+			reservation: accepted_rsv,
+			status: ParentStatus::Accepted { dec: accepted_dec },
+		},
+		refused(DecisionRefusal::Conflict),
+		DecisionResult::Terminal {
+			reservation: aborted_rsv,
+			status: aborted_status,
+		},
+		refused(DecisionRefusal::Conflict),
+	);
+	assert_eq!(answers(&mut state), expected, "before settlement");
+	settle_through(&mut state, peek_index() - 1);
+	assert!(decisions(&state).bodies.is_empty() && decisions(&state).noops.is_empty());
+	for key in [accepted.key, aborted.key, noop_key] {
+		assert!(matches!(
+			record_kind(&state, &key),
+			Some(RecordKind::Settled(_))
+		));
+	}
+	let before = state.decisions.clone();
+	assert_eq!(answers(&mut state), expected, "after settlement");
+	assert_eq!(state.decisions, before, "no effect");
+	assert_eq!(
+		resolve_table_operation(
+			decisions(&state),
+			TENANT,
+			aborted.key.client_uuid,
+			aborted.key.sequence_no
+		),
+		TableResolution::Refused { delete: false }
+	);
+	assert!(matches!(
+		resolve_table_operation(
+			decisions(&state),
+			TENANT,
+			noop_key.client_uuid,
+			noop_key.sequence_no
+		),
+		TableResolution::Noop { .. }
+	));
+	decisions(&state).validate().unwrap();
+}
+
+/// R6: a snapshot taken between conversion and expiry decodes, rebuilds and
+/// validates with identical answers and key charge.
+#[test]
+fn a_snapshot_with_settled_keys_restores_with_identical_answers() {
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (_, dec) = accept_claim(&mut state, &c, T0);
+	settle_through(&mut state, dec);
+	let bytes = postcard::to_stdvec(decisions(&state)).unwrap();
+	let mut restored: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	restored.restore_table_operations().unwrap();
+	restored.validate().unwrap();
+	assert_eq!(&restored, decisions(&state));
+	assert_eq!(
+		lookup_parent(&restored, &c.key, &c.request_digest),
+		lookup_parent(decisions(&state), &c.key, &c.request_digest)
+	);
+	assert_eq!(restored.retained_key_bytes(), KEY_RECORD_CHARGE);
+}
+
+/// C2: at the key cap a new key is refused `RetainedFull` with no effect, and a
+/// replay of a recorded key is still answered.
+#[test]
+fn retries_are_answered_at_the_key_cap() {
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (rsv, dec) = accept_claim(&mut state, &c, T0);
+	state.decisions.as_mut().unwrap().retained_key_bytes = MAX_RETAINED_KEY_BYTES;
+	let fresh = claim(key(T0, 2), children(&state, 2), 0);
+	let before = state.decisions.clone();
+	assert_eq!(
+		reserve(&mut state, &fresh, T0),
+		refused(DecisionRefusal::RetainedFull)
+	);
+	assert_eq!(state.decisions, before, "no effect");
+	assert_eq!(
+		reserve(&mut state, &c, T0),
+		DecisionResult::Terminal {
+			reservation: rsv,
+			status: ParentStatus::Accepted { dec }
+		}
+	);
+}
+
+/// C3 and I1: validate refuses a wrong key charge and every impossible settled key.
+#[test]
+fn validate_refuses_a_wrong_charge_and_impossible_settled_keys() {
+	let mut state = windowed_base();
+	let a = claim(key(T0, 1), children(&state, 2), 0);
+	let (_, a_dec) = accept_claim(&mut state, &a, T0);
+	settle_through(&mut state, a_dec);
+	let b = claim(key(T0, 2), children(&state, 2), 0);
+	let (b_rsv, _) = accept_claim(&mut state, &b, T0);
+	decisions(&state).validate().unwrap();
+	let settled = decisions(&state).keys[&a.key];
+
+	let mut wrong = decisions(&state).clone();
+	wrong.retained_key_bytes += 1;
+	assert!(wrong.validate().is_err(), "a wrong charge");
+
+	let mut duplicate = decisions(&state).clone();
+	let third = key(T0, 3);
+	duplicate.keys.insert(third, settled);
+	duplicate.retained_key_bytes += KEY_RECORD_CHARGE;
+	assert!(
+		duplicate.validate().is_err(),
+		"two keys name one settled reservation"
+	);
+
+	let mut above = decisions(&state).clone();
+	above.keys.get_mut(&b.key).unwrap().record = settled.record;
+	assert!(
+		above.validate().is_err(),
+		"a settled key above the certified cut, its body still retained"
+	);
+	let _ = b_rsv;
+
+	let mut zero = decisions(&state).clone();
+	zero.retention = Some(RetentionBinding { window_ms: 0 });
+	zero.retained_key_bytes = 0;
+	assert!(zero.validate().is_err(), "a settled key at window 0");
+}
+
+/// U1: no noop is recorded, and no parent reserved, before the window binds.
+#[test]
+fn nothing_is_admitted_before_the_window_binds() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	state.decisions.as_mut().unwrap().retention = None;
+	let before = state.decisions.clone();
+	let noop = noop_body(&state, 9, 1);
+	assert_eq!(
+		record_noop(&mut state, noop),
+		refused(DecisionRefusal::FormationIncomplete)
+	);
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	assert_eq!(
+		reserve(&mut state, &c, T0),
+		refused(DecisionRefusal::FormationIncomplete)
+	);
+	assert_eq!(state.decisions, before, "no effect");
+}
+
+/// K1, K2: a live settled KV key keeps the roster's `KvDataPresent`; once the key
+/// retires, it no longer does (the next refusal is the positive window's own).
+#[test]
+fn a_live_settled_kv_key_keeps_kv_data_present() {
+	use crate::logical_backup::roster::RosterRefusal;
+	let mut state = windowed_base();
+	let one = point_child(&state, position_of(1));
+	let kv = Claim {
+		first_row_position: one.range_start,
+		..claim(
+			ParentKey {
+				namespace: ParentNamespace::Kv,
+				..key(T0, 1)
+			},
+			vec![one],
+			0,
+		)
+	};
+	let (_, dec) = accept_claim(&mut state, &kv, T0);
+	settle_through(&mut state, dec);
+	assert!(matches!(
+		record_kind(&state, &kv.key),
+		Some(RecordKind::Settled(Settlement::Accepted {
+			effect: AcceptedEffect::Kv,
+			..
+		}))
+	));
+	assert!(decisions(&state).bodies.is_empty());
+	let held = token(begin_hold(&mut state, 9));
+	assert_eq!(roster(&state, held), Err(RosterRefusal::KvDataPresent));
+	assert!(matches!(
+		floor(&mut state, T0, T0 + DECISION_EXPIRY_MS + 10),
+		DecisionResult::FloorAdvanced {
+			retired_keys: 1,
+			..
+		}
+	));
+	assert_ne!(roster(&state, held), Err(RosterRefusal::KvDataPresent));
+}
+
+// ============================================================
+//  WENDELON ADR 0123 SLICE 3: THE SETTLEMENT AND PRESSURE TRIGGERS
+// ============================================================
+
+/// T4 and L4 (reducer): no settlement before a live key's record is S old; at S it is
+/// proposed with its sample; its commit advances the watermark to exactly that stamp;
+/// a later record's settlement waits S past the watermark; an unsampled commit and a
+/// pending (never committed) target leave the watermark; it survives a snapshot.
+#[test]
+fn a_settlement_is_proposed_at_s_with_its_sample_and_the_watermark_spaces_the_next() {
+	use generations::{SETTLE_INTERVAL_MS as S, TargetReason, next_target_with_reason};
+	let mut state = windowed_base();
+	let first = claim(key(T0, 1), children(&state, 2), 0);
+	accept_claim(&mut state, &first, T0);
+	assert_eq!(decisions(&state).generations.settled_ms, 0, "genesis");
+	assert!(next_target_with_reason(&state, peek_index(), Some(T0 + S - 1)).is_none());
+	assert!(
+		next_target_with_reason(&state, peek_index(), None).is_none(),
+		"no sample, no settlement"
+	);
+	let (target, reason) =
+		next_target_with_reason(&state, peek_index(), Some(T0 + S)).expect("T4 at S");
+	assert_eq!(reason, TargetReason::Settlement);
+	assert_eq!(target.retention.stamp_ms, T0 + S, "it carries its sample");
+	let gid = target.gid;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid }
+	);
+	assert_eq!(
+		decisions(&state).generations.settled_ms,
+		0,
+		"a pending target leaves the watermark"
+	);
+	commit_with(&mut state, None);
+	assert_eq!(decisions(&state).generations.settled_ms, T0 + S);
+
+	// A later record: due S after its issue AND S after the watermark.
+	let second = claim(key(T0 + S, 2), children(&state, 2), 0);
+	accept_claim(&mut state, &second, T0 + S);
+	assert!(next_target_with_reason(&state, peek_index(), Some(T0 + 2 * S - 1)).is_none());
+	let (target, reason) =
+		next_target_with_reason(&state, peek_index(), Some(T0 + 2 * S)).expect("the next T4");
+	assert_eq!(reason, TargetReason::Settlement);
+
+	// An unsampled commit (T0, no sample) leaves the watermark.
+	let _ = target;
+	assert!(matches!(
+		floor(&mut state, T0 + S, T0 + S + DECISION_EXPIRY_MS + 10),
+		DecisionResult::FloorAdvanced { .. }
+	));
+	let third = claim(key(T0 + S + DECISION_EXPIRY_MS, 3), children(&state, 2), 0);
+	accept_claim(&mut state, &third, T0 + S + DECISION_EXPIRY_MS + 10);
+	let (target, reason) =
+		next_target_with_reason(&state, peek_index(), None).expect("T0: retired keys");
+	assert_eq!(reason, TargetReason::RetiredKey);
+	assert_eq!(target.retention.stamp_ms, 0, "unsampled");
+	let gid = target.gid;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid }
+	);
+	commit_with(&mut state, None);
+	assert_eq!(
+		decisions(&state).generations.settled_ms,
+		T0 + S,
+		"an unsampled commit leaves the watermark"
+	);
+	decisions(&state).validate().unwrap();
+	let bytes = postcard::to_stdvec(decisions(&state)).unwrap();
+	let mut restored: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	restored.restore_table_operations().unwrap();
+	assert_eq!(restored.generations.settled_ms, T0 + S, "replicated");
+}
+
+/// T4 and T3 only on a positive window: at window 0 a live key never settles.
+#[test]
+fn no_settlement_or_pressure_at_window_zero() {
+	use generations::{SETTLE_INTERVAL_MS as S, next_target_with_reason};
+	let mut zero = base(3);
+	grant_all(&mut zero);
+	let c = claim(key(T0, 1), children(&zero, 2), 0);
+	accept_claim(&mut zero, &c, T0);
+	assert!(next_target_with_reason(&zero, peek_index(), Some(T0 + 10 * S)).is_none());
+}
+
+/// T3: pressure is due only at the mark AND with at least the least release; a tiny
+/// releasable prefix never proposes. Through the proposer: with a sample it names
+/// `Pressure` before a settlement is due; with none it proposes nothing.
+#[test]
+fn pressure_needs_the_mark_a_real_release_and_a_sample() {
+	use generations::{
+		PRESSURE_MARK_BYTES as P, PRESSURE_RELEASE_BYTES as R, TargetReason,
+		next_target_with_reason, pressure_due,
+	};
+	assert!(!pressure_due(P - 1, R));
+	assert!(!pressure_due(P, R - 1), "a tiny prefix does not repeat");
+	assert!(pressure_due(P, R));
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	let (rsv, _) = accept_claim(&mut state, &c, T0);
+	// Test-only shaping of the counters (the proposer reads them; nothing is applied).
+	let d = state.decisions.as_mut().unwrap();
+	d.bodies.get_mut(&rsv).unwrap().claim_bytes = R;
+	d.retained_claim_bytes = P;
+	let (_, reason) = next_target_with_reason(&state, peek_index(), Some(T0 + 1)).expect("T3");
+	assert_eq!(reason, TargetReason::Pressure);
+	assert!(
+		next_target_with_reason(&state, peek_index(), None).is_none(),
+		"no sample, no pressure target"
+	);
+}
+
+/// L4 (reducer): a pending sampled target replaced after a member change never commits,
+/// so it leaves the watermark; a sampled NON-settlement commit (T2, age) advances it to
+/// exactly its own stamp; the next settlement is then due only S past that stamp.
+#[test]
+fn a_replaced_target_leaves_the_watermark_and_a_sampled_age_commit_moves_it() {
+	use generations::{SETTLE_INTERVAL_MS as S, TargetReason, next_target_with_reason};
+	let mut state = windowed_base();
+	let first = claim(key(T0, 1), children(&state, 2), 0);
+	accept_claim(&mut state, &first, T0);
+	let (target, reason) = next_target_with_reason(&state, peek_index(), Some(T0 + S)).expect("T4");
+	assert_eq!(reason, TargetReason::Settlement);
+	let gid = target.gid;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid }
+	);
+	// A member's store is replaced: the pending target names a stale incarnation, so the
+	// proposer replaces it with a fresh one; the stale one never commits.
+	let mut changed = state.clone();
+	changed.incarnations.get_mut(&3).unwrap().current =
+		Some(crate::consensus::StoreIncarnation::from_raw(0x0123_0003));
+	let (replacement, _) = next_target_with_reason(&changed, peek_index(), Some(T0 + S + 1))
+		.expect("a replacement target");
+	assert!(replacement.gid > gid, "a fresh gid");
+	assert_eq!(
+		decisions(&changed).generations.settled_ms,
+		0,
+		"a replaced target leaves the watermark"
+	);
+	// Commit the original (members unchanged here), with a visible governed row.
+	commit_with(&mut state, Some(hlc_at(T0 + S)));
+	assert_eq!(decisions(&state).generations.settled_ms, T0 + S);
+	// Past the window and a step from that row: the age trigger, sampled, not T4.
+	let step = generations::retention_step_ms(WINDOW_MS);
+	let now = T0 + S + WINDOW_MS + 2 * step;
+	let second = claim(key(T0 + S, 2), children(&state, 2), 0);
+	accept_claim(&mut state, &second, T0 + S);
+	let (target, reason) = next_target_with_reason(&state, peek_index(), Some(now)).expect("T2");
+	assert_eq!(reason, TargetReason::Age, "age precedes settlement");
+	assert_eq!(target.retention.stamp_ms, now);
+	let gid = target.gid;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid }
+	);
+	commit_with(&mut state, None);
+	assert_eq!(
+		decisions(&state).generations.settled_ms,
+		now,
+		"a sampled non-settlement commit moves the watermark to its stamp"
+	);
+	// The next settlement is due only S past that stamp.
+	let third = claim(key(now, 3), children(&state, 2), 0);
+	accept_claim(&mut state, &third, now);
+	assert!(next_target_with_reason(&state, peek_index(), Some(now + S - 1)).is_none());
+	let (_, reason) =
+		next_target_with_reason(&state, peek_index(), Some(now + S)).expect("the next T4");
+	assert_eq!(reason, TargetReason::Settlement);
+	decisions(&state).validate().unwrap();
+}
+
+/// Codex finding (slice 3): `validate` rejects the watermark's reconstructible
+/// contradictions by isolated mutation, and accepts a legal carried watermark.
+#[test]
+fn validate_rejects_impossible_watermarks() {
+	use generations::SETTLE_INTERVAL_MS as S;
+	let mut state = windowed_base();
+	let c = claim(key(T0, 1), children(&state, 2), 0);
+	accept_claim(&mut state, &c, T0);
+	let (target, _) =
+		generations::next_target_with_reason(&state, peek_index(), Some(T0 + S)).unwrap();
+	let gid = target.gid;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid }
+	);
+	commit_with(&mut state, None);
+	let valid = decisions(&state).clone();
+	valid.validate().unwrap();
+	let bytes = postcard::to_stdvec(&valid).unwrap();
+	let mut round: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	round.restore_table_operations().unwrap();
+	round.validate().unwrap();
+	assert_eq!(round, valid, "a legal round trip");
+	let refused = |mutate: &dyn Fn(&mut DecisionState), what: &str| {
+		let mut state = valid.clone();
+		mutate(&mut state);
+		assert!(state.validate().is_err(), "{what}");
+	};
+	refused(
+		&|state| state.generations.settled_ms = state.clock_ms + 1,
+		"a watermark ahead of the clock",
+	);
+	refused(
+		&|state| state.generations.settled_ms = T0 + S - 1,
+		"a watermark below the current sampled certificate's stamp",
+	);
+	let mut genesis = windowed_base();
+	genesis.decisions.as_mut().unwrap().generations.settled_ms = 1;
+	assert!(
+		decisions(&genesis).validate().is_err(),
+		"a watermark with no committed generation"
+	);
+	// Carried: an unsampled current certificate keeps an earlier sampled stamp.
+	let mut carried = valid.clone();
+	carried
+		.generations
+		.current
+		.as_mut()
+		.unwrap()
+		.retention
+		.stamp_ms = 0;
+	carried.validate().unwrap();
 }

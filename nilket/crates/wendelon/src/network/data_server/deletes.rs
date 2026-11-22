@@ -391,6 +391,44 @@ impl WendelonDataServer {
 						counts: record.body.selection.counts(),
 					};
 				}
+				// Wendelon ADR 0123 D3: an erased record's live key answers its actual
+				// terminal outcome: exact counts only on an Accepted delete or a noop; a
+				// settled non-delete under this key is another request.
+				LookupResponse::Found(Lookup::Settled {
+					reservation,
+					settlement,
+				}) => {
+					use crate::consensus::decisions::{
+						AcceptedEffect, OperationKind, Settlement as Receipt,
+					};
+					return match settlement {
+						Receipt::Noop { counts } => DeleteSettled::Committed {
+							dec: reservation,
+							commit_hlc: meta.client_hlc,
+							counts,
+						},
+						Receipt::Accepted {
+							dec,
+							commit_hlc,
+							effect: AcceptedEffect::Delete(counts),
+							..
+						} => DeleteSettled::Committed {
+							dec,
+							commit_hlc,
+							counts,
+						},
+						Receipt::Refused {
+							kind: OperationKind::Delete,
+							..
+						} => DeleteSettled::KnownNotCommitted,
+						Receipt::Accepted { .. } | Receipt::Refused { .. } => {
+							DeleteSettled::Refused(
+								WriteStatus::WRITE_KEY_CONFLICT,
+								PbcRejectCode::NONE,
+							)
+						}
+					};
+				}
 				LookupResponse::Found(Lookup::Recorded { record }) => {
 					let Operation::Delete { selection, .. } = &record.claim.operation else {
 						return DeleteSettled::Refused(

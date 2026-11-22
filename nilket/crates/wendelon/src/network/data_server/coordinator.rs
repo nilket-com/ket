@@ -900,6 +900,20 @@ impl WendelonDataServer {
 				LookupResponse::Found(Lookup::Absent { eligible: false }) => {
 					return Settled::Indeterminate(WriteStatus::WRITE_OPERATION_EXPIRED);
 				}
+				// Wendelon ADR 0123 D3: an erased record's live key answers its actual
+				// terminal outcome, as its retained body did; never a fresh admission.
+				LookupResponse::Found(Lookup::Settled { settlement, .. }) => {
+					use crate::consensus::decisions::Settlement as Receipt;
+					return match settlement {
+						Receipt::Accepted {
+							dec, commit_hlc, ..
+						} => Settled::Committed { dec, commit_hlc },
+						Receipt::Refused { .. } => Settled::KnownNotCommitted,
+						// A write's digest never matches a delete's: a settled noop
+						// under this key is another request.
+						Receipt::Noop { .. } => Settled::Refused(WriteStatus::WRITE_KEY_CONFLICT),
+					};
+				}
 				// A write's digest never matches a delete's: a recorded noop under
 				// this key is another request.
 				LookupResponse::Found(Lookup::Noop { .. } | Lookup::Conflict) => {

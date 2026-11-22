@@ -861,7 +861,32 @@ pub struct DecisionProposals {
 	/// control can move the clock to a chosen point before the next target samples it.
 	#[cfg(test)]
 	pub(crate) generations_paused: std::sync::atomic::AtomicBool,
+	/// Wendelon ADR 0123 D7: the targets this node proposed as leader, counted by
+	/// reason, and the most recent (gid, reason) pairs, bounded. Proposer policy only.
+	proposed_reasons: std::sync::Mutex<ProposedReasons>,
 }
+
+/// Wendelon ADR 0123 D7: proposals by reason, and the recent ones by gid.
+#[derive(Default)]
+pub(crate) struct ProposedReasons {
+	pub(crate) counts: BTreeMap<&'static str, u64>,
+	pub(crate) recent: std::collections::VecDeque<(
+		u64,
+		[u8; 32],
+		crate::consensus::decisions::generations::TargetReason,
+	)>,
+}
+
+const RECENT_PROPOSED_REASONS: usize = 256;
+
+/// Test-only (wendelon ADR 0123 L3): each forwarded Reserve the reducer refused, by key.
+#[cfg(test)]
+pub(crate) static RESERVE_REFUSALS: std::sync::Mutex<
+	Vec<(
+		crate::consensus::decisions::ParentKey,
+		crate::consensus::decisions::DecisionRefusal,
+	)>,
+> = std::sync::Mutex::new(Vec::new());
 
 /// Test-only (ADR 0707): holds the leader's handling of the next forwarded
 /// proposal from `sender` that `matches`, once: `reached` is notified with the
@@ -943,6 +968,7 @@ impl DecisionProposals {
 			ctas_maintenance_paused: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]
 			generations_paused: std::sync::atomic::AtomicBool::new(false),
+			proposed_reasons: Default::default(),
 		}
 	}
 
@@ -1046,6 +1072,13 @@ impl DecisionProposals {
 				leader_hint: leader,
 			};
 		}
+		// Test-only (wendelon ADR 0123 L3): a Reserve's key, so its applied refusal can be
+		// recorded at the reducer boundary.
+		#[cfg(test)]
+		let reserve_key = match &request {
+			ForwardedDecision::Reserve { claim } => Some(claim.body.key),
+			_ => None,
+		};
 		let command = match admission(self.mode, sender, request, &self.trusted_keys) {
 			Ok(Admitted::Ready(command)) => command,
 			// Only the gated decision clock stamps a time-bearing command. ADR
@@ -1073,7 +1106,22 @@ impl DecisionProposals {
 			}
 			Err(refusal) => return ProposalResponse::Refused(refusal),
 		};
-		self.commit(command).await
+		let response = self.commit(command).await;
+		#[cfg(test)]
+		if let (
+			Some(key),
+			ProposalResponse::Applied {
+				outcome:
+					ProposalOutcome::Decision(crate::consensus::decisions::DecisionResult::Refused(
+						refusal,
+					)),
+				..
+			},
+		) = (reserve_key, &response)
+		{
+			RESERVE_REFUSALS.lock().unwrap().push((key, *refusal));
+		}
+		response
 	}
 
 	async fn commit(&self, command: WendelonRequest) -> ProposalResponse {
@@ -1273,6 +1321,45 @@ impl DecisionProposals {
 		}
 	}
 
+	/// Wendelon ADR 0123 D7: the recent proposals (gid, target digest, reason), oldest
+	/// first, so a control can attribute a committed certificate by its target digest.
+	pub(crate) fn proposed_trace(
+		&self,
+	) -> Vec<(
+		u64,
+		[u8; 32],
+		crate::consensus::decisions::generations::TargetReason,
+	)> {
+		self.proposed_reasons
+			.lock()
+			.unwrap()
+			.recent
+			.iter()
+			.copied()
+			.collect()
+	}
+
+	/// Wendelon ADR 0123 D7: this node's proposals as leader, by reason.
+	pub(crate) fn proposed_counts(&self) -> BTreeMap<&'static str, u64> {
+		self.proposed_reasons.lock().unwrap().counts.clone()
+	}
+
+	/// Wendelon ADR 0123 D7: the reason this node proposed target `gid` with, if it
+	/// was among the recent proposals here.
+	pub(crate) fn proposed_reason(
+		&self,
+		gid: u64,
+	) -> Option<crate::consensus::decisions::generations::TargetReason> {
+		self.proposed_reasons
+			.lock()
+			.unwrap()
+			.recent
+			.iter()
+			.rev()
+			.find(|(recent, _, _)| *recent == gid)
+			.map(|(_, _, reason)| *reason)
+	}
+
 	/// Sender side: look up locally when leader, otherwise ask the leader.
 	pub(crate) async fn lookup(&self, request: LookupRequest) -> LookupResponse {
 		match self.leader_slot().await {
@@ -1282,7 +1369,8 @@ impl DecisionProposals {
 					leader,
 					MsgType::DECISION_LOOKUP_REQ,
 					MsgType::DECISION_LOOKUP_RESP,
-					crate::schema::HRFT_ENVELOPE_VERSION,
+					// Wendelon ADR 0123 D6: the decision envelope, both ways, checked before decode.
+					crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 					&request,
 				)
 				.await
@@ -1589,8 +1677,7 @@ impl DecisionProposals {
 			write_frame(&mut *stream, &header, &meta, None, None).await?;
 			stream.finish().await?;
 			let frame = read_frame(&mut *stream, &self.pool).await?;
-			check_response_frame(&frame.header, response_type, version)?;
-			decode_bounded(frame.meta.as_ref())
+			decode_response(&frame, response_type, version)
 		};
 		tokio::time::timeout_at(deadline, attempt)
 			.await
@@ -1725,17 +1812,40 @@ impl<'a> MaintenanceProposals<'a> {
 		// Wendelon ADR 0121 D3: the gated decision clock, the age trigger's only
 		// input; without a fresh sample, ordinary targets still progress.
 		let now_ms = proposals.decision_clock_now().await.ok();
-		let command = proposals
+		let (command, reason) = proposals
 			.state_machine
 			.read_state(move |state| {
 				if let Some(gid) = crate::consensus::decisions::generations::ready_commit(state) {
-					return Some(DecisionCommand::CommitGeneration { gid });
+					return Some((DecisionCommand::CommitGeneration { gid }, None));
 				}
 				let applied = state.last_applied_log_id.map_or(0, |id| id.index);
-				crate::consensus::decisions::generations::next_target(state, applied, now_ms)
-					.map(|target| DecisionCommand::ProposeTarget { target })
+				crate::consensus::decisions::generations::next_target_with_reason(
+					state, applied, now_ms,
+				)
+				.map(|(target, reason)| (DecisionCommand::ProposeTarget { target }, Some(reason)))
 			})
 			.await?;
+		// Wendelon ADR 0123 D7: each proposal is named once, by its first reason.
+		if let (DecisionCommand::ProposeTarget { target }, Some(reason)) = (&command, reason) {
+			tracing::info!(
+				gid = target.gid,
+				t = target.t,
+				stamp_ms = target.retention.stamp_ms,
+				reason = reason.label(),
+				"generation target proposed"
+			);
+			crate::metrics::global().observe_decision_generation_target_proposed(reason.label());
+			let mut proposed = proposals.proposed_reasons.lock().unwrap();
+			*proposed.counts.entry(reason.label()).or_default() += 1;
+			if proposed.recent.len() == RECENT_PROPOSED_REASONS {
+				proposed.recent.pop_front();
+			}
+			proposed.recent.push_back((
+				target.gid,
+				crate::consensus::decisions::generations::target_digest(target),
+				reason,
+			));
+		}
 		// Replay basis. ProposeTarget is derived with `gid = next_gid` while no
 		// current target is pending; a second copy is refused StaleGeneration,
 		// since the first moved `next_gid` (`consensus/decisions/generations.rs:167-176`,
@@ -2006,6 +2116,18 @@ pub(crate) fn check_response_frame(
 		));
 	}
 	Ok(())
+}
+
+/// The client's judgment of a decision answer: its type and frame version first,
+/// then (only then) its body. Wendelon ADR 0123 D6: an answer at another
+/// envelope is refused before its body is interpreted.
+pub(crate) fn decode_response<T: serde::de::DeserializeOwned>(
+	frame: &crate::network::core::HrftFrame,
+	response_type: MsgType,
+	version: u8,
+) -> std::io::Result<T> {
+	check_response_frame(&frame.header, response_type, version)?;
+	decode_bounded(frame.meta.as_ref())
 }
 
 pub(crate) fn decode_bounded<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {

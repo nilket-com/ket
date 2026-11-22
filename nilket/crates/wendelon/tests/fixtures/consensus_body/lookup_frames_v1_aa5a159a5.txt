@@ -1,0 +1,10 @@
+# Wendelon ADR 0123 D6: the PREVIOUS build's own decision lookup frames, version 1,
+# byte for byte (HRFT header, then the postcard body).
+# Provenance: generated on aa5a159a5bc9f421fb27fbaae0c065a26c460816 (delivered main before
+# ADR 0123) by a one-off test, print_the_previous_builds_lookup_frames (source sha256/16
+# ec81c3e08534f6de, run log 878be9cafa1a6b69; never committed there), with that build's
+# write_frame and postcard: a LookupRequest {tenant 7, table [0x51; 16], uuid 019a...0001,
+# sequence 3, digest [0x23; 32], sent_ms 1795000000000} and the reply
+# LookupResponse::Found(Lookup::Absent { eligible: true }).
+lookup_request_v1=544652480164000000000000490000000000000000000000070151515151515151515151515151515151019a000000007000800000000000000103232323232323232323232323232323232323232323232323232323232323232380bcd9f29e34
+lookup_reply_v1=544652480165000000000000030000000000000000000000000001

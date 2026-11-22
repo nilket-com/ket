@@ -118,6 +118,7 @@ impl WendelonDataServer {
 			built_gid: self.decisions.built_gid.clone(),
 			validated: self.decisions.base_validated.clone(),
 			behind: self.decisions.behind_boundary.clone(),
+			work: self.decisions.certification_work.clone(),
 		}
 	}
 
@@ -323,6 +324,39 @@ pub(crate) struct CertificationProgress {
 	pub(crate) validated: Arc<std::sync::atomic::AtomicBool>,
 	/// A committed generation has no matching staged candidate here.
 	pub(crate) behind: Arc<std::sync::atomic::AtomicBool>,
+	/// Wendelon ADR 0123 (L2/L3): the certification work this store did.
+	pub(crate) work: Arc<CertificationWork>,
+}
+
+/// Wendelon ADR 0123 (L2/L3): one store's certification work in this process,
+/// for the per-member accounting: candidate builds attempted (a rebuild after a
+/// restart counts again), base entries loaded by them, rows staged, activations,
+/// and the rows of the bases they installed.
+#[derive(Debug, Default)]
+pub(crate) struct CertificationWork {
+	pub(crate) builds: std::sync::atomic::AtomicU64,
+	pub(crate) base_entries_loaded: std::sync::atomic::AtomicU64,
+	pub(crate) staged_rows: std::sync::atomic::AtomicU64,
+	pub(crate) activations: std::sync::atomic::AtomicU64,
+	pub(crate) activation_rows: std::sync::atomic::AtomicU64,
+}
+
+impl CertificationWork {
+	fn add(counter: &std::sync::atomic::AtomicU64, by: u64) {
+		counter.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+	}
+
+	/// (builds, base entries loaded, staged rows, activations, activation rows).
+	pub(crate) fn snapshot(&self) -> [u64; 5] {
+		use std::sync::atomic::Ordering::Relaxed;
+		[
+			self.builds.load(Relaxed),
+			self.base_entries_loaded.load(Relaxed),
+			self.staged_rows.load(Relaxed),
+			self.activations.load(Relaxed),
+			self.activation_rows.load(Relaxed),
+		]
+	}
 }
 
 /// ADR 0107 (wendelon): what building a candidate needs beyond the store.
@@ -464,7 +498,14 @@ impl StoreCertification<'_> {
 				)
 				.await?
 			{
-				Ok(()) => return Ok(()),
+				Ok(()) => {
+					CertificationWork::add(&self.progress.work.activations, 1);
+					CertificationWork::add(
+						&self.progress.work.activation_rows,
+						cert.chunks.iter().map(|chunk| chunk.count).sum(),
+					);
+					return Ok(());
+				}
 				// Wendelon ADR 0122 D3: inconsistent aged evidence is damaged staging
 				// too: nothing was installed, labelled or cleared.
 				Err(
@@ -690,9 +731,11 @@ impl StoreCertification<'_> {
 					aged: aged_floor
 						.map(|_| crate::storage::index::certified_base::aged_evidence(&aged)),
 				};
+				let staged = entries.len() as u64;
 				if index.stage_base(candidate, entries, aged).await?.is_err() {
 					return Ok(None);
 				}
+				CertificationWork::add(&self.progress.work.staged_rows, staged);
 				built.store(gid, std::sync::atomic::Ordering::Release);
 			}
 		}
@@ -818,6 +861,11 @@ impl StoreCertification<'_> {
 		let unproved =
 			|refusal: super::reader::ReadRefusal| BuildRefusal::Incomplete(format!("{refusal:?}"));
 		let mut inherited = index.base_entries(false).await.map_err(storage)?;
+		CertificationWork::add(&self.progress.work.builds, 1);
+		CertificationWork::add(
+			&self.progress.work.base_entries_loaded,
+			inherited.len() as u64,
+		);
 		// Wendelon ADR 0115: an excluding target drops every inherited entry of a
 		// (tenant, table) whose drop was finalized at or before its cut: one keyed
 		// outcome lookup per distinct table in the base, never an enumeration.

@@ -8,7 +8,7 @@ use super::write_deadline::ReleaseOnDrop;
 use super::*;
 use crate::network::data_server::child_writes::PauseStage;
 use crate::node::test_time::TestTime;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 /// The frozen Section 8 window.
@@ -18,11 +18,19 @@ const WINDOW_MS: u64 = 15_000;
 /// A ready three-voter cluster on `time`, every member configured with the window, with the
 /// PK table of the shared fixture and an AppendOnly table applied.
 async fn windowed(time: &TestTime) -> (Cluster, u32, TableSchemaDescriptor, TableSchemaDescriptor) {
+	windowed_with(time, WINDOW).await
+}
+
+/// As [`windowed`], with `window` (ADR 0123: zero for the zero-window controls).
+async fn windowed_with(
+	time: &TestTime,
+	window: Duration,
+) -> (Cluster, u32, TableSchemaDescriptor, TableSchemaDescriptor) {
 	let (cluster, leader, pk) = ready_with({
 		let time = time.clone();
 		Cluster::start_with(move |_, cfg| {
 			cfg.test_time = Some(time.clone());
-			cfg.parent_decisions_retention_window = WINDOW;
+			cfg.parent_decisions_retention_window = window;
 			None
 		})
 	})
@@ -45,7 +53,7 @@ async fn windowed(time: &TestTime) -> (Cluster, u32, TableSchemaDescriptor, Tabl
 	assert_eq!(
 		bound,
 		Some(crate::consensus::decisions::RetentionBinding {
-			window_ms: WINDOW_MS
+			window_ms: window.as_millis() as u64
 		}),
 		"the leader bound its configured window before the first write"
 	);
@@ -252,6 +260,12 @@ async fn a_certified_floor_omits_aged_rows_as_aged_debt_and_serves_the_rest() {
 	append_rows_everywhere(&cluster, &append, &[(1, "a")], "a, under g1").await;
 	// e: accepted after g1's cut, so g2's covered intent winner.
 	let e = write_one(&cluster, leader, &append, (5, "e"), uuid_v7_at(floor1 + 1)).await;
+	// Wendelon ADR 0123 D2: read e's reservation now. A generation proposed while the clock
+	// moves may cover e (its live key keeps a settled receipt), erasing its body.
+	let e_rsv = record_of(&cluster, key_of(&append, &e))
+		.await
+		.expect("e recorded")
+		.rsv;
 	let e_written = time.clock.now_ms();
 	// The shared clock passes e's time by the window and a step, in restored steps.
 	let full: BTreeSet<u32> = NODES.into_iter().collect();
@@ -272,13 +286,13 @@ async fn a_certified_floor_omits_aged_rows_as_aged_debt_and_serves_the_rest() {
 	.unwrap();
 	let leader = cluster.leader().await;
 	let d = write_one(&cluster, leader, &append, (4, "d"), uuid_v7_at(floor1 + 2)).await;
-	// The generation that covers e and d (an age-only one may already have committed while the
-	// clock moved, its cut below e); its floor is due by age (a is old).
-	let covering = [key_of(&append, &e), key_of(&append, &d)];
-	let mut rsv = 0;
-	for key in covering {
-		rsv = rsv.max(record_of(&cluster, key).await.expect("recorded").rsv);
-	}
+	// The generation that covers e and d (one may already have committed while the clock moved;
+	// under wendelon ADR 0123 D2 its cut may cover e); its floor is due by age (a is old).
+	let d_rsv = record_of(&cluster, key_of(&append, &d))
+		.await
+		.expect("d recorded")
+		.rsv;
+	let rsv = e_rsv.max(d_rsv);
 	jump_floor(&cluster, floor1 + 60_000).await;
 	let gid = until_covered(&cluster, rsv).await;
 	assert!(gid >= 2, "g1 did not cover e");
@@ -2061,5 +2075,1295 @@ async fn one_generation_excludes_a_dropped_table_and_omits_an_aged_row() {
 		);
 	}
 	append_rows_everywhere(&cluster, &append, &[(2, "z")], "a is not served").await;
+	shut_down(cluster, &time).await;
+}
+
+// --- The product-semantics discriminator (Codex 01a20253) ---------------------------------------
+
+/// What blocks a generation cut over the leader's applied state, from one read: the applied
+/// index, the current generation, whether `key` is live, the blocking point below the highest
+/// candidate cut, the decision floor and clock, and whether the production trigger proposes a
+/// target at `now_ms`.
+async fn cut_blockers(cluster: &Cluster, key: ParentKey, now_ms: u64) -> String {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			let applied = state.last_applied_log_id.map_or(0, |id| id.index);
+			let decisions = state.decisions.as_ref().unwrap();
+			let generations = decisions.generations();
+			let next =
+				crate::consensus::decisions::generations::next_target(state, applied, Some(now_ms));
+			format!(
+				"applied {applied}, gid {}, cut {}, key live {}, blocking point below {} = {:?}, \
+				 decision floor {} ms, clock {} ms, proposed target {:?}",
+				generations.current_gid(),
+				generations.fr(),
+				decisions.key_is_live_for_test(&key),
+				applied.saturating_sub(1),
+				crate::consensus::decisions::generations::blocking_point_for_test(
+					state,
+					applied.saturating_sub(1)
+				),
+				decisions.floor_ms(),
+				decisions.clock_ms(),
+				next.map(|t| (t.gid, t.t, t.retention.floor_ms)),
+			)
+		})
+		.await
+}
+
+/// The current generation, waiting up to `bound` of real time for it to reach `gid`.
+async fn gid_within(cluster: &Cluster, gid: u64, bound: Duration) -> u64 {
+	let deadline = tokio::time::Instant::now() + bound;
+	loop {
+		let leader = cluster.leader().await;
+		let current = cluster
+			.node(leader)
+			.state_machine
+			.read_state(|state| {
+				state
+					.decisions
+					.as_ref()
+					.unwrap()
+					.generations()
+					.current_gid()
+			})
+			.await;
+		if current >= gid || tokio::time::Instant::now() >= deadline {
+			return current;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+}
+
+// --- ADR 0123 baselines (Codex 01a202b5) --------------------------------------------------------
+
+/// ADR 0123 D7: the settlement interval S, provisional (a hypothesis the controls measure).
+const SETTLE_INTERVAL_MS: u64 = crate::consensus::decisions::generations::SETTLE_INTERVAL_MS;
+
+/// The leader's current certificate.
+async fn current_certificate(
+	cluster: &Cluster,
+) -> Option<crate::consensus::decisions::generations::Certificate> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.decisions.as_ref()?.generations().current.clone())
+		.await
+}
+
+/// The leader's settlement watermark.
+async fn settled_ms(cluster: &Cluster) -> u64 {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.map_or(0, |decisions| decisions.generations().settled_ms)
+		})
+		.await
+}
+
+/// ADR 0123 L1 (Codex: bound to the actual first T4 certificate). A 15 s window; one governed
+/// row r at issue, a young survivor y written S − 5 s later; only the production advancer moves
+/// the clock (no floor shortcut, no key retired by hand). Nothing proposes before r is S old
+/// (no certificate, no retired key, no structure). The FIRST certificate is then:
+/// - proposed by the leader for the settlement reason (T4), carrying its sample;
+/// - a cut covering r and y, with the sampled floor between them: r omitted as aged in that
+///   same generation, y surviving and served;
+/// - the watermark advanced to exactly its stamp.
+/// r's key stays live with the typed receipt of its ORIGINAL outcome (its decision, claim
+/// digest and commit HLC as recorded in its body): an identical retry is that commit, a
+/// changed payload a key conflict, the public resolve PRESENT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_first_settlement_omits_an_aged_row_and_keeps_its_receipt() {
+	use crate::consensus::decisions::generations::TargetReason;
+	use crate::consensus::decisions::{AcceptedEffect, RecordKind, Settlement};
+	use crate::schema::MutationResolutionStatus;
+	let time = TestTime::new();
+	let (cluster, leader, _, append) = windowed(&time).await;
+	let issued = time.clock.now_ms();
+	let r = write_one(&cluster, leader, &append, (1, "r"), uuid_v7_at(issued)).await;
+	let r_key = key_of(&append, &r);
+	let r_body = record_of(&cluster, r_key).await.expect("r recorded");
+	let crate::consensus::decisions::ParentStatus::Accepted { dec: r_dec } = r_body.status else {
+		panic!("r accepted: {:?}", r_body.status);
+	};
+	advance(&cluster, &time, issued + SETTLE_INTERVAL_MS - 5_000).await;
+	assert_eq!(
+		gid_within(&cluster, 1, Duration::from_secs(3)).await,
+		0,
+		"nothing proposes before r is S old"
+	);
+	let leader = cluster.leader().await;
+	let y = write_one(
+		&cluster,
+		leader,
+		&append,
+		(2, "y"),
+		uuid_v7_at(time.clock.now_ms()),
+	)
+	.await;
+	let y_rsv = record_of(&cluster, key_of(&append, &y))
+		.await
+		.expect("y recorded")
+		.rsv;
+	advance(&cluster, &time, issued + SETTLE_INTERVAL_MS + 2_000).await;
+	let gid = gid_within(&cluster, 1, Duration::from_secs(10)).await;
+	let blockers = cut_blockers(&cluster, r_key, time.clock.now_ms()).await;
+	eprintln!(
+		"L1 at issue + {} ms: {blockers}",
+		time.clock.now_ms() - issued
+	);
+	assert!(
+		gid >= 1,
+		"no generation committed by the first settlement (issue + S + 2 s); {blockers}"
+	);
+	let certificate = current_certificate(&cluster).await.unwrap();
+	assert_eq!(certificate.gid, 1, "the first certificate");
+	let leader = cluster.leader().await;
+	assert_eq!(
+		cluster
+			.node(leader)
+			.data_server
+			.proposed_reason_for_test(certificate.gid),
+		Some(TargetReason::Settlement),
+		"the first target was proposed for the settlement"
+	);
+	let stamp = certificate.retention.stamp_ms;
+	assert!(
+		stamp >= issued + SETTLE_INTERVAL_MS,
+		"a settlement carries its sample: {stamp}"
+	);
+	assert!(
+		certificate.t >= y_rsv && certificate.t >= r_dec,
+		"the cut covers r and y: {certificate:?}"
+	);
+	assert_eq!(
+		certificate.retention.floor_ms,
+		stamp - WINDOW_MS,
+		"the sampled floor"
+	);
+	assert!(
+		r_body.claim.commit_hlc.physical_ms < certificate.retention.floor_ms,
+		"r is below the floor"
+	);
+	assert_eq!(
+		settled_ms(&cluster).await,
+		stamp,
+		"the watermark is the stamp"
+	);
+	eprintln!(
+		"L1 first certificate: gid {}, t {}, stamp {stamp}, floor {}",
+		certificate.gid, certificate.t, certificate.retention.floor_ms
+	);
+	// Every member activates that generation before its base and debt are read.
+	until_active(&cluster, certificate.gid).await;
+	// In that same generation: r omitted as aged, y surviving.
+	omitted_as_aged(&cluster, append.table_object_id, identity_of(&r, 0), "r").await;
+	append_rows_everywhere(&cluster, &append, &[(2, "y")], "y survives").await;
+	// r's typed receipt is its original outcome.
+	let entry = key_entry_when(&cluster, r_key, |entry| {
+		matches!(entry.record, RecordKind::Settled(_))
+	})
+	.await;
+	assert_eq!(entry.reservation, r_body.rsv);
+	assert_eq!(
+		entry.record,
+		RecordKind::Settled(Settlement::Accepted {
+			dec: r_dec,
+			claim_digest: r_body.claim_digest,
+			commit_hlc: r_body.claim.commit_hlc,
+			effect: AcceptedEffect::Write,
+		}),
+		"r's receipt is its original outcome"
+	);
+	let leader = cluster.leader().await;
+	let retry = write_through(&cluster, leader, r, named_rows(&append, &[(1, "r")])).await;
+	assert!(
+		matches!(retry.write.status, WriteStatus::OK | WriteStatus::DUPLICATE),
+		"an identical retry is its recorded commit: {retry:?}"
+	);
+	let conflict = write_through(&cluster, leader, r, named_rows(&append, &[(1, "changed")])).await;
+	assert_eq!(
+		conflict.write.status,
+		WriteStatus::WRITE_KEY_CONFLICT,
+		"{conflict:?}"
+	);
+	let present = super::resolve::resolve_at(&cluster, leader, r.parent_write_id).await;
+	assert_eq!(
+		present.resolution,
+		MutationResolutionStatus::PRESENT,
+		"{present:?}"
+	);
+
+	// L1b: with no new write, the survivor ages. Past y's window and a step, an age target
+	// (attributed by its target digest) omits y as aged in its own generation; then, for two
+	// more intervals, nothing is proposed: no record is left to settle and no governed row
+	// is visible (quiescence).
+	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	advance(&cluster, &time, stamp + WINDOW_MS + 2 * step).await;
+	let gid = gid_within(&cluster, certificate.gid + 1, Duration::from_secs(10)).await;
+	assert!(gid > certificate.gid, "y aged out by a later generation");
+	let aged = current_certificate(&cluster).await.unwrap();
+	assert_eq!(
+		reason_of_certificate(&cluster, &aged),
+		Some(TargetReason::Age),
+		"the survivor ages out by the age trigger: {aged:?}"
+	);
+	until_active(&cluster, aged.gid).await;
+	omitted_as_aged(&cluster, append.table_object_id, identity_of(&y, 0), "y").await;
+	eprintln!(
+		"L1b: gid {} (age) omits y; stamp {}, floor {}",
+		aged.gid, aged.retention.stamp_ms, aged.retention.floor_ms
+	);
+	let quiet_from = aged.gid;
+	advance(
+		&cluster,
+		&time,
+		time.clock.now_ms() + 2 * SETTLE_INTERVAL_MS,
+	)
+	.await;
+	assert_eq!(
+		gid_within(&cluster, quiet_from + 1, Duration::from_secs(5)).await,
+		quiet_from,
+		"quiescence: nothing more is proposed"
+	);
+	shut_down(cluster, &time).await;
+}
+
+/// ADR 0123 Z1, GREEN today and to stay GREEN: a quiet ZERO-window store keeps today's coverage
+/// and trigger. One row r; no target while r's key lives (issue + E − 10 s: generation 0, key
+/// live); once the key retires, exactly one ordinary retired-key generation (T0) covers r, which
+/// stays served (nothing ages at window 0); then, idle for several more minutes of test time,
+/// no further generation (quiescence). Crosses the production decision expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "crosses the production decision expiry (~66 min of test time); ADR 0123 Z1 baseline"]
+async fn a_quiet_zero_window_store_settles_only_when_its_key_retires() {
+	use crate::consensus::decisions::DECISION_EXPIRY_MS;
+	let time = TestTime::new();
+	let (cluster, leader, _, append) = windowed_with(&time, Duration::ZERO).await;
+	let issued = time.clock.now_ms();
+	let r = write_one(&cluster, leader, &append, (1, "r"), uuid_v7_at(issued)).await;
+	let r_key = key_of(&append, &r);
+	let r_rsv = record_of(&cluster, r_key).await.expect("r recorded").rsv;
+	advance(&cluster, &time, issued + DECISION_EXPIRY_MS - 10_000).await;
+	assert_eq!(
+		gid_within(&cluster, 1, Duration::from_secs(5)).await,
+		0,
+		"no target while r's key lives"
+	);
+	let blockers = cut_blockers(&cluster, r_key, time.clock.now_ms()).await;
+	eprintln!("Z1 before expiry: {blockers}");
+	assert!(blockers.contains("key live true") && blockers.contains("proposed target None"));
+	advance(&cluster, &time, issued + DECISION_EXPIRY_MS + 2_000).await;
+	let gid = until_covered(&cluster, r_rsv).await;
+	assert_eq!(gid, 1, "exactly one ordinary generation covers r");
+	let blockers = cut_blockers(&cluster, r_key, time.clock.now_ms()).await;
+	eprintln!("Z1 after expiry: {blockers}");
+	assert!(blockers.contains("key live false"), "{blockers}");
+	append_rows_everywhere(&cluster, &append, &[(1, "r")], "r stays served at window 0").await;
+	advance(
+		&cluster,
+		&time,
+		issued + DECISION_EXPIRY_MS + 5 * SETTLE_INTERVAL_MS,
+	)
+	.await;
+	assert_eq!(
+		gid_within(&cluster, 2, Duration::from_secs(5)).await,
+		1,
+		"quiescence: no further generation"
+	);
+	shut_down(cluster, &time).await;
+}
+
+/// A key's entry in the leader's applied decisions, waiting up to the bound for `ready`.
+async fn key_entry_when(
+	cluster: &Cluster,
+	key: ParentKey,
+	ready: impl Fn(&crate::consensus::decisions::KeyEntry) -> bool,
+) -> crate::consensus::decisions::KeyEntry {
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let leader = cluster.leader().await;
+		let entry = cluster
+			.node(leader)
+			.state_machine
+			.read_state(move |state| state.decisions.as_ref()?.key_entry_for_test(&key))
+			.await;
+		if let Some(entry) = entry
+			&& ready(&entry)
+		{
+			return entry;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"key {key:?}: {entry:?}"
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+}
+
+fn delete_key(
+	descriptor: &TableSchemaDescriptor,
+	meta: &crate::schema::TableDeleteRowsRequestMeta,
+) -> ParentKey {
+	ParentKey {
+		tenant: TenantId::ZERO,
+		namespace: crate::consensus::decisions::ParentNamespace::Table(descriptor.table_object_id),
+		client_uuid: meta.parent_write_id.client_uuid,
+		sequence_no: meta.parent_write_id.sequence_no,
+	}
+}
+
+/// ADR 0123 slice 1 (Codex 01a202bc item 2), same build, in process: a write, a matched
+/// delete and a delete that published nothing are recorded with live keys; an older write's
+/// key then retires (T0), so a generation is proposed whose cut also covers the three fresh
+/// records and settles them. Each retry through the coordinator then answers its actual
+/// recorded outcome from the receipt: the identical write its commit, a changed payload a
+/// key conflict, the public resolve PRESENT, and each delete its exact frozen counts. Nothing
+/// is admitted afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn settled_write_and_delete_retries_answer_their_recorded_outcomes() {
+	use crate::consensus::decisions::{AcceptedEffect, RecordKind, Settlement};
+	use crate::schema::MutationResolutionStatus;
+	let time = TestTime::new();
+	let (cluster, leader, pk, append) = windowed(&time).await;
+	let t0 = time.clock.now_ms();
+	write_one(&cluster, leader, &append, (1, "old"), uuid_v7_at(t0)).await;
+	write_one(&cluster, leader, &pk, (1, "p1"), uuid_v7_at(t0 + 1)).await;
+	let fresh_ms = t0 + 60_000;
+	let r = write_one(&cluster, leader, &append, (2, "r"), uuid_v7_at(fresh_ms)).await;
+	let p1 = cluster
+		.node(leader)
+		.data_server
+		.row_identity_and_locality_for_test(TenantId::ZERO, &pk, &named_rows(&pk, &[(1, "p1")]))
+		.0;
+	let mut matched = delete_meta(&pk);
+	matched.parent_write_id.client_uuid = uuid_v7_at(fresh_ms + 1);
+	let deleted = delete_through(&cluster, leader, matched, vec![p1]).await;
+	assert_eq!(counts(&deleted), [1, 0, 0], "p1 deleted");
+	let absent = cluster
+		.node(leader)
+		.data_server
+		.row_identity_and_locality_for_test(TenantId::ZERO, &pk, &named_rows(&pk, &[(9, "none")]))
+		.0;
+	let mut missed = delete_meta(&pk);
+	missed.parent_write_id.client_uuid = uuid_v7_at(fresh_ms + 2);
+	let published_nothing = delete_through(&cluster, leader, missed, vec![absent]).await;
+	let nothing = counts(&published_nothing);
+	assert_eq!(nothing[0], 0, "nothing deleted: {nothing:?}");
+	let keys = [
+		key_of(&append, &r),
+		delete_key(&pk, &matched),
+		delete_key(&pk, &missed),
+	];
+	let mut last = 0;
+	for key in keys {
+		last = last.max(key_entry_when(&cluster, key, |_| true).await.reservation);
+	}
+	// T0: the older keys retire; the generation proposed for them also covers the fresh ones.
+	jump_floor(&cluster, t0 + 30_000).await;
+	until_covered(&cluster, last).await;
+	let settled = |entry: &crate::consensus::decisions::KeyEntry| {
+		matches!(entry.record, RecordKind::Settled(_))
+	};
+	let r_entry = key_entry_when(&cluster, keys[0], settled).await;
+	assert!(
+		matches!(
+			r_entry.record,
+			RecordKind::Settled(Settlement::Accepted {
+				effect: AcceptedEffect::Write,
+				..
+			})
+		),
+		"{r_entry:?}"
+	);
+	let matched_entry = key_entry_when(&cluster, keys[1], settled).await;
+	assert!(
+		matches!(
+			matched_entry.record,
+			RecordKind::Settled(Settlement::Accepted {
+				effect: AcceptedEffect::Delete([1, 0, 0]),
+				..
+			})
+		),
+		"{matched_entry:?}"
+	);
+	let missed_entry = key_entry_when(&cluster, keys[2], settled).await;
+	assert_eq!(
+		missed_entry.record,
+		RecordKind::Settled(Settlement::Noop { counts: nothing }),
+		"{missed_entry:?}"
+	);
+	// Retries through the coordinator, from the receipts.
+	let leader = cluster.leader().await;
+	let retry = write_through(&cluster, leader, r, named_rows(&append, &[(2, "r")])).await;
+	assert!(
+		matches!(retry.write.status, WriteStatus::OK | WriteStatus::DUPLICATE),
+		"an identical retry is its recorded commit: {retry:?}"
+	);
+	let changed = write_through(&cluster, leader, r, named_rows(&append, &[(2, "changed")])).await;
+	assert_eq!(
+		changed.write.status,
+		WriteStatus::WRITE_KEY_CONFLICT,
+		"{changed:?}"
+	);
+	let present = super::resolve::resolve_at(&cluster, leader, r.parent_write_id).await;
+	assert_eq!(
+		present.resolution,
+		MutationResolutionStatus::PRESENT,
+		"{present:?}"
+	);
+	let again = delete_through(&cluster, leader, matched, vec![p1]).await;
+	assert_eq!(
+		counts(&again),
+		[1, 0, 0],
+		"the matched delete's frozen counts"
+	);
+	let again = delete_through(&cluster, leader, missed, vec![absent]).await;
+	assert_eq!(counts(&again), nothing, "the noop's frozen counts");
+	assert!(
+		key_entry_when(&cluster, keys[0], settled).await == r_entry,
+		"no retry admitted anything afresh"
+	);
+	shut_down(cluster, &time).await;
+}
+
+/// The key's entry on node `id`'s own applied decisions.
+async fn key_entry_on(
+	cluster: &Cluster,
+	id: u32,
+	key: ParentKey,
+) -> Option<crate::consensus::decisions::KeyEntry> {
+	cluster
+		.node(id)
+		.state_machine
+		.read_state(move |state| state.decisions.as_ref()?.key_entry_for_test(&key))
+		.await
+}
+
+/// Node `id`'s own settlement watermark.
+async fn settled_on(cluster: &Cluster, id: u32) -> u64 {
+	cluster
+		.node(id)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.map_or(0, |decisions| decisions.generations().settled_ms)
+		})
+		.await
+}
+
+/// Waits until node `id` holds exactly `expected` for `key`.
+async fn until_entry_on(
+	cluster: &Cluster,
+	id: u32,
+	key: ParentKey,
+	expected: crate::consensus::decisions::KeyEntry,
+	what: &str,
+) {
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let entry = key_entry_on(cluster, id, key).await;
+		if entry == Some(expected) {
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{what}: node {id} holds {entry:?}, not {expected:?}"
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+}
+
+/// Wendelon ADR 0123 D6, V3 and V4 (same build, in process): a fresh write's live key is
+/// settled by an ordinary retired-key generation. V3: a follower stopped and reopened replays
+/// its control log and holds the identical settled receipt. V4: another follower, stopped
+/// while the leader snapshots and purges past the settlement, catches up only by installing
+/// that snapshot and holds the identical receipt; a retry through the coordinator then answers
+/// its recorded commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_settled_receipt_survives_log_replay_and_snapshot_install() {
+	use crate::consensus::decisions::RecordKind;
+	let time = TestTime::new();
+	let (mut cluster, leader, _, append) = windowed(&time).await;
+	let t0 = time.clock.now_ms();
+	write_one(&cluster, leader, &append, (1, "old"), uuid_v7_at(t0)).await;
+	let r = write_one(&cluster, leader, &append, (2, "r"), uuid_v7_at(t0 + 60_000)).await;
+	let key = key_of(&append, &r);
+	let rsv = key_entry_when(&cluster, key, |_| true).await.reservation;
+	jump_floor(&cluster, t0 + 30_000).await;
+	until_covered(&cluster, rsv).await;
+	let settled = key_entry_when(&cluster, key, |entry| {
+		matches!(entry.record, RecordKind::Settled(_))
+	})
+	.await;
+	let followers: Vec<u32> = NODES.into_iter().filter(|id| *id != leader).collect();
+	for id in &followers {
+		until_entry_on(&cluster, *id, key, settled, "applied").await;
+	}
+
+	// V3: log replay.
+	let replayed = followers[0];
+	cluster.stop(replayed, false).await;
+	cluster.reopen(replayed).await;
+	until_entry_on(&cluster, replayed, key, settled, "V3 after log replay").await;
+	assert_eq!(
+		settled_on(&cluster, replayed).await,
+		settled_on(&cluster, leader).await,
+		"V3: the replayed watermark"
+	);
+	eprintln!("ADR 0123 V3: node {replayed} replayed its log: {settled:?}");
+
+	// V4: snapshot install past the settlement.
+	let installed = followers[1];
+	cluster.stop(installed, false).await;
+	for step in 1..=3 {
+		jump_floor(&cluster, t0 + 30_000 + step).await;
+	}
+	let at = cluster
+		.node(leader)
+		.raft
+		.metrics()
+		.borrow()
+		.last_applied
+		.unwrap()
+		.index;
+	cluster
+		.node(leader)
+		.raft
+		.trigger()
+		.snapshot()
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while cluster
+		.node(leader)
+		.raft
+		.metrics()
+		.borrow()
+		.snapshot
+		.is_none_or(|id| id.index < at)
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"no snapshot through {at}"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	cluster
+		.node(leader)
+		.raft
+		.trigger()
+		.purge_log(at)
+		.await
+		.unwrap();
+	// The purge is asynchronous: the member is reopened only once the leader's log is
+	// purged past it, so it can catch up by the snapshot alone.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while cluster
+		.node(leader)
+		.raft
+		.metrics()
+		.borrow()
+		.purged
+		.is_none_or(|id| id.index < at)
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the leader never purged through {at}"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	cluster.reopen(installed).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while cluster
+		.node(installed)
+		.raft
+		.metrics()
+		.borrow()
+		.snapshot
+		.is_none_or(|id| id.index < at)
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"node {installed} never installed the snapshot"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	until_entry_on(
+		&cluster,
+		installed,
+		key,
+		settled,
+		"V4 after snapshot install",
+	)
+	.await;
+	eprintln!("ADR 0123 V4: node {installed} installed the snapshot through {at}: {settled:?}");
+	let leader = cluster.leader().await;
+	assert_eq!(
+		settled_on(&cluster, installed).await,
+		settled_on(&cluster, leader).await,
+		"V4: the installed watermark"
+	);
+	eprintln!(
+		"ADR 0123 V3/V4: the watermark replayed and installed: {}",
+		settled_on(&cluster, leader).await
+	);
+	let leader = cluster.leader().await;
+	let retry = write_through(&cluster, leader, r, named_rows(&append, &[(2, "r")])).await;
+	assert!(
+		matches!(retry.write.status, WriteStatus::OK | WriteStatus::DUPLICATE),
+		"a retry after replay and install is its recorded commit: {retry:?}"
+	);
+	shut_down(cluster, &time).await;
+}
+
+/// The committed certificates of a watch, checked contiguous from gid 1 (no commit stepped
+/// past), each attributed to its proposal reason by its target digest; also the proposals
+/// that never committed (replaced or refused), by reason.
+fn attribute(
+	cluster: &Cluster,
+	seen: &BTreeMap<u64, crate::consensus::decisions::generations::Certificate>,
+	what: &str,
+) -> (BTreeMap<&'static str, u64>, BTreeMap<&'static str, u64>) {
+	let gids: Vec<u64> = seen.keys().copied().collect();
+	let expected: Vec<u64> = (1..=gids.last().copied().unwrap_or(0)).collect();
+	assert_eq!(gids, expected, "{what}: every commit observed");
+	let mut committed = BTreeMap::new();
+	for certificate in seen.values() {
+		let reason = reason_of_certificate(cluster, certificate)
+			.unwrap_or_else(|| panic!("{what}: certificate {} unattributed", certificate.gid));
+		*committed.entry(reason.label()).or_insert(0) += 1;
+	}
+	let mut uncommitted = BTreeMap::new();
+	for node in NODES {
+		for (gid, digest, reason) in cluster.node(node).data_server.proposed_trace_for_test() {
+			if !seen
+				.get(&gid)
+				.is_some_and(|certificate| certificate.target_digest == digest)
+			{
+				*uncommitted.entry(reason.label()).or_insert(0) += 1;
+			}
+		}
+	}
+	(committed, uncommitted)
+}
+
+/// ADR 0123 L2 (measurement, in process): steady load for k·S of test time on a 15 s
+/// window, one write every 10 s, the clock moved only by the production advancer. Every
+/// committed certificate is observed (contiguous gids) and attributed to its proposal reason
+/// by its target DIGEST; proposals that never committed are counted apart; proposal attempts
+/// (the exported counter's semantics) are reported apart again. Each member's certification
+/// work (builds, base entries loaded, staged rows, activations, activation rows) is
+/// reported. Asserted: committed settlements at most k + 1; and every write's identical
+/// retry is still its recorded commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn steady_load_settles_at_most_once_per_interval_with_exact_answers() {
+	const K: u64 = 3;
+	const STEP_MS: u64 = 10_000;
+	let time = TestTime::new();
+	let (cluster, _, _, append) = windowed(&time).await;
+	let watch = watch_certificates(&cluster, NODES[0]);
+	let start = time.clock.now_ms();
+	let mut written = Vec::new();
+	let mut id = 0_i64;
+	while time.clock.now_ms() < start + K * SETTLE_INTERVAL_MS {
+		id += 1;
+		let leader = cluster.leader().await;
+		let meta = write_one(
+			&cluster,
+			leader,
+			&append,
+			(id, "s"),
+			uuid_v7_at(time.clock.now_ms()),
+		)
+		.await;
+		written.push((id, meta));
+		let next = time.clock.now_ms() + STEP_MS;
+		advance(&cluster, &time, next).await;
+	}
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	let seen = watch.finish().await;
+	let (committed, uncommitted) = attribute(&cluster, &seen, "L2");
+	let leader = cluster.leader().await;
+	let attempts = cluster.node(leader).data_server.proposed_counts_for_test();
+	eprintln!(
+		"L2: {} writes over {} ms of test time; committed by reason {committed:?}; \
+		 proposals never committed {uncommitted:?}; leader proposal attempts {attempts:?}",
+		written.len(),
+		time.clock.now_ms() - start
+	);
+	for node in NODES {
+		let [builds, loaded, staged, activations, rows] =
+			cluster.node(node).data_server.certification_work_for_test();
+		eprintln!(
+			"L2 node {node}: builds {builds}, base entries loaded {loaded}, staged rows {staged}, \
+			 activations {activations}, activation rows {rows}"
+		);
+	}
+	let settlements = committed.get("settlement").copied().unwrap_or(0);
+	assert!(
+		(1..=K + 1).contains(&settlements),
+		"one to k + 1 committed settlements: {committed:?}"
+	);
+	let leader = cluster.leader().await;
+	for (id, meta) in written {
+		let retry = write_through(&cluster, leader, meta, named_rows(&append, &[(id, "s")])).await;
+		assert!(
+			matches!(retry.write.status, WriteStatus::OK | WriteStatus::DUPLICATE),
+			"write {id}: an identical retry is its recorded commit: {retry:?}"
+		);
+	}
+	shut_down(cluster, &time).await;
+}
+
+/// The reason a committed certificate's target was proposed with, attributed by its target
+/// DIGEST in any node's proposal trace (a leader change keeps each proposer's own trace).
+fn reason_of_certificate(
+	cluster: &Cluster,
+	certificate: &crate::consensus::decisions::generations::Certificate,
+) -> Option<crate::consensus::decisions::generations::TargetReason> {
+	NODES.into_iter().find_map(|node| {
+		cluster
+			.node(node)
+			.data_server
+			.proposed_trace_for_test()
+			.into_iter()
+			.find(|(gid, digest, _)| {
+				*gid == certificate.gid && *digest == certificate.target_digest
+			})
+			.map(|(_, _, reason)| reason)
+	})
+}
+
+/// A background watch of one voter's applied certificates (every commit applies on every
+/// voter), polled every 10 ms. `finish` returns every certificate seen, by gid; a control
+/// asserts the gids are contiguous, which shows no commit was stepped past.
+struct CertificateWatch {
+	seen:
+		Arc<std::sync::Mutex<BTreeMap<u64, crate::consensus::decisions::generations::Certificate>>>,
+	/// Each pending target first seen: its digest and the claim bytes its records at or
+	/// below its cut held then (what its commit releases: no record at or below a cut is
+	/// admitted after it).
+	pending: Arc<std::sync::Mutex<BTreeMap<u64, ([u8; 32], u64)>>>,
+	stop: Arc<std::sync::atomic::AtomicBool>,
+	task: tokio::task::JoinHandle<()>,
+}
+
+fn watch_certificates(cluster: &Cluster, node: u32) -> CertificateWatch {
+	let state_machine = cluster.node(node).state_machine.clone();
+	let seen: Arc<std::sync::Mutex<BTreeMap<u64, _>>> = Default::default();
+	let pending: Arc<std::sync::Mutex<BTreeMap<u64, ([u8; 32], u64)>>> = Default::default();
+	let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let task = tokio::spawn({
+		let (seen, pending, stop) = (seen.clone(), pending.clone(), stop.clone());
+		async move {
+			while !stop.load(std::sync::atomic::Ordering::Acquire) {
+				let target = state_machine
+					.read_state(|state| {
+						let decisions = state.decisions.as_ref()?;
+						let pending = decisions.generations().pending.as_ref()?;
+						let t = pending.target.t;
+						let bytes = decisions
+							.bodies()
+							.range(..=t)
+							.map(|(_, body)| body.claim_bytes)
+							.chain(decisions.noops().range(..=t).map(|(_, noop)| noop.bytes))
+							.sum::<u64>();
+						Some((pending.target.gid, pending.digest, bytes))
+					})
+					.await;
+				if let Some((gid, digest, bytes)) = target {
+					pending
+						.lock()
+						.unwrap()
+						.entry(gid)
+						.or_insert((digest, bytes));
+				}
+				let current = state_machine
+					.read_state(|state| state.decisions.as_ref()?.generations().current.clone())
+					.await;
+				if let Some(certificate) = current {
+					seen.lock()
+						.unwrap()
+						.entry(certificate.gid)
+						.or_insert(certificate);
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		}
+	});
+	CertificateWatch {
+		seen,
+		pending,
+		stop,
+		task,
+	}
+}
+
+impl CertificateWatch {
+	async fn finish(self) -> BTreeMap<u64, crate::consensus::decisions::generations::Certificate> {
+		self.stop.store(true, std::sync::atomic::Ordering::Release);
+		let _ = self.task.await;
+		let seen = self.seen.lock().unwrap().clone();
+		seen
+	}
+
+	/// The pending targets seen so far: gid -> (digest, releasable claim bytes).
+	fn pending(&self) -> BTreeMap<u64, ([u8; 32], u64)> {
+		self.pending.lock().unwrap().clone()
+	}
+}
+
+/// ADR 0123 M1: an outstanding read cut across a settlement. A governed row r, then a young
+/// row y; a statement through the leader takes its cut and is held right after it
+/// (`ReaderAfterCut`). The first settlement then commits (T4) and every member activates it,
+/// so K_min (its commit index) rises past the held cut, which is at most the applied index
+/// when the statement was held. Released, the statement is refused (`BACKPRESSURED`, the
+/// reader's typed answer to `cut expired: below K_min`) and returns no rows; it never reads
+/// erased decisions. A fresh statement then reads exactly the survivor y.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_outstanding_read_cut_is_refused_after_a_settlement_and_a_fresh_read_is_exact() {
+	use crate::network::data_server::child_writes::PauseStage;
+	let time = TestTime::new();
+	let (cluster, leader, _, append) = windowed(&time).await;
+	let issued = time.clock.now_ms();
+	write_one(&cluster, leader, &append, (1, "r"), uuid_v7_at(issued)).await;
+	advance(&cluster, &time, issued + SETTLE_INTERVAL_MS - 5_000).await;
+	let leader = cluster.leader().await;
+	write_one(
+		&cluster,
+		leader,
+		&append,
+		(2, "y"),
+		uuid_v7_at(time.clock.now_ms()),
+	)
+	.await;
+	let leader = cluster.leader().await;
+	let (reached, release) = cluster
+		.node(leader)
+		.data_server
+		.pause_coordinator_for_test(PauseStage::ReaderAfterCut);
+	let server = cluster.node(leader).data_server.clone();
+	let early = query_meta(&cluster, leader, &append);
+	let reading = tokio::spawn(async move { server.table_query_for_test(early).await.unwrap() });
+	reached.notified().await;
+	let held_at = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.last_applied_log_id.map_or(0, |id| id.index))
+		.await;
+	advance(&cluster, &time, issued + SETTLE_INTERVAL_MS + 2_000).await;
+	assert!(
+		gid_within(&cluster, 1, Duration::from_secs(10)).await >= 1,
+		"the first settlement committed"
+	);
+	let certificate = current_certificate(&cluster).await.unwrap();
+	until_active(&cluster, certificate.gid).await;
+	let k_min = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.decisions.as_ref().unwrap().generations().k_min())
+		.await;
+	assert!(
+		k_min > held_at,
+		"premise: K_min {k_min} passed the held cut (at most {held_at})"
+	);
+	release.notify_one();
+	let answer = reading.await.unwrap();
+	eprintln!(
+		"M1: held at {held_at}, K_min {k_min}, the held statement: {:?}",
+		answer.status
+	);
+	assert_eq!(
+		answer.status,
+		Some(crate::schema::ReadStatus::BACKPRESSURED),
+		"the held cut is below K_min: {answer:?}"
+	);
+	assert!(answer.batches.is_empty(), "no erased decision is read");
+	// The internal reason, which `BACKPRESSURED` does not carry: this node refused a read at a
+	// cut no later than the held one as below K_min.
+	let reasons: Vec<(u64, String)> = crate::network::data_server::reader::READ_REFUSALS
+		.lock()
+		.unwrap()
+		.iter()
+		.filter(|(node, k, _)| *node == leader && *k <= held_at)
+		.map(|(_, k, reason)| (*k, reason.clone()))
+		.collect();
+	eprintln!("M1: leader {leader} refusals at or below the held cut: {reasons:?}");
+	assert!(
+		reasons
+			.iter()
+			.any(|(_, reason)| reason == "cut expired: below K_min"),
+		"the held read was refused below K_min: {reasons:?}"
+	);
+	let leader = cluster.leader().await;
+	append_rows_everywhere(&cluster, &append, &[(2, "y")], "a fresh read is exact").await;
+	let fresh = cluster
+		.node(leader)
+		.data_server
+		.table_query_for_test(query_meta(&cluster, leader, &append))
+		.await
+		.unwrap();
+	assert_eq!(
+		fresh.status,
+		Some(crate::schema::ReadStatus::OK),
+		"{fresh:?}"
+	);
+	shut_down(cluster, &time).await;
+}
+
+/// ADR 0123 L4 (in process): the watermark across a leadership transfer and a restart. Writes
+/// go to the PK table (no governed row, so no age trigger moves the watermark). The first
+/// settlement commits at stamp W1 and the watermark is exactly W1. A follower is then elected
+/// leader and another member restarts; every member reads W1. A fresh write q follows: no
+/// settlement before q is S old; then the next one, attributed to `Settlement` by its target
+/// digest, at stamp W2 >= max(W1, q's issue) + S, and the watermark is exactly W2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_watermark_survives_a_leader_change_and_a_restart_and_spaces_the_next_settlement() {
+	use crate::consensus::decisions::generations::TargetReason;
+	let time = TestTime::new();
+	let (mut cluster, leader, pk, _) = windowed(&time).await;
+	let issued = time.clock.now_ms();
+	write_one(&cluster, leader, &pk, (1, "p"), uuid_v7_at(issued)).await;
+	advance(&cluster, &time, issued + SETTLE_INTERVAL_MS + 2_000).await;
+	assert!(gid_within(&cluster, 1, Duration::from_secs(10)).await >= 1);
+	let first = current_certificate(&cluster).await.unwrap();
+	assert_eq!(
+		reason_of_certificate(&cluster, &first),
+		Some(TargetReason::Settlement)
+	);
+	let w1 = first.retention.stamp_ms;
+	assert_eq!(settled_ms(&cluster).await, w1);
+
+	// Leadership transfer, then a restart of another member.
+	let old = cluster.leader().await;
+	let next = *NODES.iter().find(|id| **id != old).unwrap();
+	cluster.node(next).raft.trigger().elect().await.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while cluster.leader().await != next {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"node {next} never led"
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let restarted = *NODES.iter().find(|id| **id != next).unwrap();
+	cluster.stop(restarted, false).await;
+	cluster.reopen(restarted).await;
+	for node in NODES {
+		let deadline = tokio::time::Instant::now() + BOUND;
+		while settled_on(&cluster, node).await != w1 {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"node {node} never read the watermark {w1}"
+			);
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	}
+	eprintln!("L4: W1 {w1}; leader {old} -> {next}; node {restarted} restarted");
+
+	// The next eligible settlement, exactly spaced.
+	let q_issued = time.clock.now_ms();
+	let leader = cluster.leader().await;
+	write_one(&cluster, leader, &pk, (2, "q"), uuid_v7_at(q_issued)).await;
+	let due = w1.max(q_issued) + SETTLE_INTERVAL_MS;
+	advance(&cluster, &time, due + 2_000).await;
+	assert!(gid_within(&cluster, first.gid + 1, Duration::from_secs(10)).await > first.gid);
+	let second = current_certificate(&cluster).await.unwrap();
+	assert_eq!(
+		reason_of_certificate(&cluster, &second),
+		Some(TargetReason::Settlement),
+		"{second:?}"
+	);
+	assert_eq!(
+		second.gid,
+		first.gid + 1,
+		"no other generation in between: the next one is this settlement"
+	);
+	let w2 = second.retention.stamp_ms;
+	assert!(
+		w2 >= due,
+		"W2 {w2} is S past max(W1, q's issue) = {}",
+		due - SETTLE_INTERVAL_MS
+	);
+	assert_eq!(
+		settled_ms(&cluster).await,
+		w2,
+		"the watermark is exactly W2"
+	);
+	eprintln!("L4: W2 {w2} (due {due}), gid {}", second.gid);
+	shut_down(cluster, &time).await;
+}
+
+/// The leader's retained claim bytes.
+async fn retained_claim_bytes(cluster: &Cluster) -> u64 {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.map_or(0, |decisions| decisions.retained_claim_bytes())
+		})
+		.await
+}
+
+/// ADR 0123 L3 (in process; the production decision path and real admissions; a fixture-local
+/// scaled cap and thresholds set on every voter, documented: cap 16·b, P 6·b, R 2·b, where b
+/// is one PK write's claim bytes; the PK table, so no age trigger runs).
+/// 1. A backlog of 8 writes with live keys; the fixture is set: retained ≥ P with ≥ R
+///    releasable, so PRESSURE targets commit and release the backlog. Each committed
+///    pressure generation, attributed by its target digest, released ≥ R (its records at or
+///    below its cut when first pending).
+/// 2. A parent h is held Reserved (`BeforeFinalize`). Writes above it are admitted until the
+///    actual (scaled) admission cap refuses one; meanwhile no pressure target is proposed
+///    over the tiny releasable prefix below h.
+/// 3. Retries of a released backlog write and of an admitted write are their recorded
+///    commits.
+/// 4. h is released and concludes; a pressure target then covers everything and the
+///    backlog is released.
+/// Bound: committed pressure generations ≤ (backlog + admitted) · b / R.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sustained_pressure_releases_by_committed_generations_and_backpressures_at_the_cap() {
+	use crate::consensus::decisions::generations::TargetReason;
+	use crate::network::data_server::child_writes::PauseStage;
+	const BACKLOG: i64 = 8;
+	let time = TestTime::new();
+	let (cluster, leader, pk, _) = windowed(&time).await;
+	let t0 = time.clock.now_ms();
+	let mut written = Vec::new();
+	for id in 1..=BACKLOG {
+		let leader = cluster.leader().await;
+		let meta = write_one(&cluster, leader, &pk, (id, "b"), uuid_v7_at(t0 + id as u64)).await;
+		written.push((id, meta));
+	}
+	let b = record_of(&cluster, key_of(&pk, &written[0].1))
+		.await
+		.expect("recorded")
+		.claim_bytes;
+	let (cap, mark, release) = (16 * b, 6 * b, 2 * b);
+	let watch = watch_certificates(&cluster, NODES[0]);
+	for node in NODES {
+		cluster
+			.node(node)
+			.state_machine
+			.set_pressure_fixture_for_test(Some((cap, mark, release)))
+			.await;
+	}
+	let before = retained_claim_bytes(&cluster).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while retained_claim_bytes(&cluster).await >= mark {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"pressure never released the backlog: retained {}",
+			retained_claim_bytes(&cluster).await
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	eprintln!(
+		"L3 1: b {b}, cap {cap}, P {mark}, R {release}; retained {before} -> {}",
+		retained_claim_bytes(&cluster).await
+	);
+
+	// 2. A held Reserved parent (held at its row's primary, which coordinates it), then
+	// admissions to the cap.
+	let leader = cluster.leader().await;
+	let batch = named_rows(&pk, &[(100, "h")]);
+	let primary = cluster
+		.node(leader)
+		.data_server
+		.primary_for_test(TenantId::ZERO, &pk, &batch)
+		.await
+		.expect("every position is leased");
+	let (reached, hold) = cluster
+		.node(primary)
+		.data_server
+		.pause_coordinator_for_test(PauseStage::BeforeFinalize);
+	let held = write_meta(&pk, 1, uuid_v7_at(t0 + 100));
+	let server = cluster.node(primary).data_server.clone();
+	let holding = tokio::spawn(async move { write_retrying(&server, held, batch).await });
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the parent is held Reserved before Finalize");
+	assert_eq!(
+		record_of(&cluster, key_of(&pk, &held))
+			.await
+			.map(|record| record.status),
+		Some(crate::consensus::decisions::ParentStatus::Reserved),
+		"premise: h is Reserved"
+	);
+	let pressure_before = cluster
+		.node(leader)
+		.data_server
+		.proposed_counts_for_test()
+		.get("pressure")
+		.copied()
+		.unwrap_or(0);
+	let mut admitted = 0;
+	let mut refused = None;
+	for id in 200..240_i64 {
+		let meta = write_meta(&pk, 1, uuid_v7_at(t0 + id as u64));
+		// One attempt, following only a redirect: a refusal at the cap stays visible.
+		let mut entry = leader;
+		let response = loop {
+			let (response, _) = cluster
+				.node(entry)
+				.data_server
+				.table_write_for_test(meta, named_rows(&pk, &[(id, "a")]))
+				.await
+				.unwrap();
+			if response.write.status == WriteStatus::NOT_LEADER
+				&& response.write.leader_hint.id != entry
+			{
+				entry = response.write.leader_hint.id;
+				continue;
+			}
+			break response;
+		};
+		if response.write.status == WriteStatus::OK {
+			admitted += 1;
+			written.push((id, meta));
+		} else {
+			// The actual request and response of the refused admission.
+			refused = Some((id, meta, response.write.status));
+			break;
+		}
+	}
+	let retained = retained_claim_bytes(&cluster).await;
+	eprintln!(
+		"L3 2: admitted {admitted} above the held parent; refused {refused:?}; retained {retained} (cap {cap})"
+	);
+	let (refused_id, refused_meta, refused_status) = refused.expect("the cap refuses an admission");
+	assert!(retained <= cap, "the cap holds: {retained}");
+	// That exact identity: no record and no retry key; and the reducer refused exactly its
+	// Reserve for the claim cap (so no other stall can satisfy this premise).
+	let refused_key = key_of(&pk, &refused_meta);
+	assert!(
+		record_of(&cluster, refused_key).await.is_none(),
+		"the refused admission (id {refused_id}, {refused_status:?}) recorded nothing"
+	);
+	let leader_now = cluster.leader().await;
+	assert_eq!(
+		cluster
+			.node(leader_now)
+			.state_machine
+			.read_state(move |state| state.decisions.as_ref()?.key_entry_for_test(&refused_key))
+			.await,
+		None,
+		"no retry key for the refused identity"
+	);
+	let reducer_refusals: Vec<_> = crate::network::decision_proposals::RESERVE_REFUSALS
+		.lock()
+		.unwrap()
+		.iter()
+		.filter(|(key, _)| *key == refused_key)
+		.map(|(_, refusal)| *refusal)
+		.collect();
+	assert!(
+		!reducer_refusals.is_empty()
+			&& reducer_refusals
+				.iter()
+				.all(|refusal| *refusal
+					== crate::consensus::decisions::DecisionRefusal::RetainedFull),
+		"the reducer refused exactly this Reserve for the cap: {reducer_refusals:?}"
+	);
+	let before_second_release = retained;
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(
+		cluster
+			.node(leader)
+			.data_server
+			.proposed_counts_for_test()
+			.get("pressure")
+			.copied()
+			.unwrap_or(0),
+		pressure_before,
+		"no pressure target over the tiny prefix below the held parent"
+	);
+
+	// 3. Exact retries.
+	for (id, meta) in [written[0], *written.last().unwrap()] {
+		let retry = write_through(
+			&cluster,
+			leader,
+			meta,
+			named_rows(&pk, &[(id, if id <= BACKLOG { "b" } else { "a" })]),
+		)
+		.await;
+		assert!(
+			matches!(retry.write.status, WriteStatus::OK | WriteStatus::DUPLICATE),
+			"write {id}: {retry:?}"
+		);
+	}
+
+	// 4. Release the held parent; the backlog above it is released.
+	hold.notify_one();
+	let concluded = holding.await.unwrap();
+	assert_eq!(
+		concluded.write.status,
+		WriteStatus::OK,
+		"the held parent concludes once released: {concluded:?}"
+	);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while retained_claim_bytes(&cluster).await >= mark {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the backlog above the released parent was never released: {}",
+			retained_claim_bytes(&cluster).await
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	tokio::time::sleep(Duration::from_secs(1)).await;
+	let pending = watch.pending();
+	let seen = watch.finish().await;
+	let (committed, uncommitted) = attribute(&cluster, &seen, "L3");
+	let mut pressure_commits = 0;
+	for certificate in seen.values() {
+		if reason_of_certificate(&cluster, certificate) == Some(TargetReason::Pressure) {
+			pressure_commits += 1;
+			let (digest, releasable) = pending
+				.get(&certificate.gid)
+				.copied()
+				.unwrap_or_else(|| panic!("gid {} never seen pending", certificate.gid));
+			assert_eq!(digest, certificate.target_digest);
+			assert!(
+				releasable >= release,
+				"pressure gid {} released {releasable} < R {release}",
+				certificate.gid
+			);
+		}
+	}
+	// The bound from actual claim bytes: the retained totals before each release (no other
+	// erasure runs in this fixture: no age, no settlement, no retired key).
+	let admitted_bytes = before + before_second_release;
+	eprintln!(
+		"L3: committed by reason {committed:?}; never committed {uncommitted:?}; pressure commits {pressure_commits} <= ({before} + {before_second_release}) / {release}"
+	);
+	assert!(
+		pressure_commits >= 2,
+		"pressure released twice: {committed:?}"
+	);
+	assert!(pressure_commits as u64 <= admitted_bytes / release);
+	for node in NODES {
+		let [builds, loaded, staged, activations, rows] =
+			cluster.node(node).data_server.certification_work_for_test();
+		eprintln!(
+			"L3 node {node}: builds {builds}, base entries loaded {loaded}, staged rows {staged}, \
+			 activations {activations}, activation rows {rows}"
+		);
+	}
 	shut_down(cluster, &time).await;
 }

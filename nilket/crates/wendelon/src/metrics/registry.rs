@@ -454,6 +454,42 @@ impl TableRetentionRowKindCounters {
 	}
 }
 
+/// Wendelon ADR 0123 D7: the generation targets this node, as leader, attempted to
+/// propose, by the one reason it named each by. Attempts, counted before submission:
+/// a proposal later replaced or refused is still counted, and a count is not a commit.
+#[derive(Default)]
+struct GenerationTargetReasonCounters {
+	structure: Counter,
+	age: Counter,
+	pressure: Counter,
+	settlement: Counter,
+	retired_key: Counter,
+}
+
+impl GenerationTargetReasonCounters {
+	const REASONS: [&'static str; 5] =
+		["structure", "age", "pressure", "settlement", "retired_key"];
+
+	fn counter(&self, reason: &str) -> Option<&Counter> {
+		match reason {
+			"structure" => Some(&self.structure),
+			"age" => Some(&self.age),
+			"pressure" => Some(&self.pressure),
+			"settlement" => Some(&self.settlement),
+			"retired_key" => Some(&self.retired_key),
+			_ => None,
+		}
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for reason in Self::REASONS {
+			let value = self.counter(reason).map_or(0, Counter::get);
+			render_counter_with_labels(out, name, &[("reason", reason)], value);
+		}
+	}
+}
+
 #[derive(Default)]
 struct TableRetentionActiveTableGauges {
 	inherit: Gauge,
@@ -3036,6 +3072,7 @@ pub struct MetricsRegistry {
 	storage_table_retention_l1_rows_pruned: TableRetentionRowKindCounters,
 	pub storage_table_retention_l1_bytes_reclaimed_total: Counter,
 	storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters,
+	decision_generation_targets_proposed: GenerationTargetReasonCounters,
 	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
 	pub storage_l2_superseded_objects_retained_total: Counter,
 	pub storage_supersession_metadata_degraded_total: Counter,
@@ -3394,6 +3431,7 @@ impl Default for MetricsRegistry {
 			storage_table_retention_l1_rows_pruned: TableRetentionRowKindCounters::default(),
 			storage_table_retention_l1_bytes_reclaimed_total: Counter::default(),
 			storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters::default(),
+			decision_generation_targets_proposed: GenerationTargetReasonCounters::default(),
 			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
 			storage_l2_superseded_objects_retained_total: Counter::default(),
 			storage_supersession_metadata_degraded_total: Counter::default(),
@@ -4155,6 +4193,14 @@ impl MetricsRegistry {
 
 	/// Wendelon ADR 0122 D4: aged rows a certified tier job removed from the committed
 	/// active L2 inventory, on the delivery of its own Applied op. Row counters only.
+	/// Wendelon ADR 0123 D7: one generation target proposal attempted for `reason`
+	/// (`structure`, `age`, `pressure`, `settlement` or `retired_key`).
+	pub fn observe_decision_generation_target_proposed(&self, reason: &str) {
+		if let Some(counter) = self.decision_generation_targets_proposed.counter(reason) {
+			counter.add(1);
+		}
+	}
+
 	pub fn observe_storage_table_retention_l2_rows_pruned(
 		&self,
 		data_rows: u64,
@@ -6221,6 +6267,11 @@ impl MetricsRegistry {
 			&mut out,
 			"wendelon_storage_table_retention_l2_rows_pruned_total",
 			"Logical row versions pruned by table-aware L2 retention rewrites.",
+		);
+		self.decision_generation_targets_proposed.render(
+			&mut out,
+			"wendelon_decision_generation_targets_proposed_total",
+			"Generation targets this node attempted to propose as leader, by the one reason named; attempts, not commits.",
 		);
 		render_counter(
 			&mut out,

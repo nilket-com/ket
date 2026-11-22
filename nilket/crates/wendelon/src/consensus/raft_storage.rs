@@ -4838,6 +4838,16 @@ impl WendelonStateMachine {
 		}
 	}
 
+	/// Test-only (wendelon ADR 0123 L3): this voter's fixture-local scaled claim cap and
+	/// pressure thresholds `(cap, P, R)`. A fixture sets the same values on every voter,
+	/// so admission and the proposer agree; nothing is replicated or serialized.
+	#[cfg(test)]
+	pub(crate) async fn set_pressure_fixture_for_test(&self, fixture: Option<(u64, u64, u64)>) {
+		if let Some(decisions) = self.inner.write().await.state.decisions.as_mut() {
+			decisions.pressure_fixture = fixture;
+		}
+	}
+
 	#[cfg(test)]
 	pub(crate) async fn seed_complete_snapshot_state_for_test(&self, state: SmState) {
 		self.inner.write().await.state = state;
