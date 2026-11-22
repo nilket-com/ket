@@ -155,6 +155,44 @@ async fn stored_and_owing_nothing(
 	hlcs.into_iter().next().unwrap()
 }
 
+/// Wendelon ADR 0122: at every node, `row` of `table` is no base entry and is owed as
+/// debt labelled aged, at one HLC everywhere; that HLC.
+async fn omitted_as_aged(
+	cluster: &Cluster,
+	table: TableObjectId,
+	row: crate::schema::Identity,
+	what: &str,
+) -> crate::schema::HybridTimestamp {
+	let mut hlcs = BTreeSet::new();
+	for node in NODES {
+		let index = cluster.node(node).slab.persistent_index().unwrap();
+		assert!(
+			!index
+				.base_entries(false)
+				.await
+				.unwrap()
+				.iter()
+				.any(|entry| entry.table == table && entry.key_identity == *row.as_bytes()),
+			"{what}: no base entry at {node}"
+		);
+		let owed: Vec<_> = index
+			.debt_page(None, usize::MAX)
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|(key, _)| key.table == table && key.key_identity == *row.as_bytes())
+			.collect();
+		assert_eq!(owed.len(), 1, "{what}: one debt record at {node}: {owed:?}");
+		assert!(
+			owed[0].1.aged,
+			"{what}: its debt is aged at {node}: {owed:?}"
+		);
+		hlcs.insert(owed[0].0.hlc);
+	}
+	assert_eq!(hlcs.len(), 1, "{what}: one version everywhere");
+	hlcs.into_iter().next().unwrap()
+}
+
 /// Runs one bounded certified cleanup step and one debt sweep page at every node.
 async fn cleanup_pass(cluster: &Cluster) {
 	for node in NODES {
@@ -183,11 +221,12 @@ async fn shut_down(mut cluster: Cluster, time: &TestTime) {
 /// accepted after g1's cut and covered by g2), both older than the window when g2 is proposed,
 /// are not served under g2's floor; a younger row (d), the PK key written before g1 and never
 /// updated (p1), and a deleted PK key (p2, a winning tombstone) are as before. Every member
-/// holds one certified cut; a and e stay durable base entries owing no cleanup debt, through
-/// g2's activation and a cleanup pass; a delete of either finds nothing; the backup roster of a
-/// governed table is refused.
+/// holds one certified cut. Wendelon ADR 0122 (superseding S1's "stays stored"): a and e leave
+/// the base as aged debt at g2's activation while d stays stored owing nothing through a
+/// cleanup pass; a delete of either finds nothing; the backup roster of a governed table is
+/// refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_certified_floor_hides_aged_rows_it_still_stores_and_owes_no_cleanup() {
+async fn a_certified_floor_omits_aged_rows_as_aged_debt_and_serves_the_rest() {
 	let time = TestTime::new();
 	let (cluster, leader, pk, append) = windowed(&time).await;
 	let t0 = time.clock.now_ms();
@@ -250,10 +289,9 @@ async fn a_certified_floor_hides_aged_rows_it_still_stores_and_owes_no_cleanup()
 		logical: 0,
 		node_id: 0,
 	};
-	let a_hlc =
-		stored_and_owing_nothing(&cluster, append.table_object_id, identity_of(&a, 0), "a").await;
-	let e_hlc =
-		stored_and_owing_nothing(&cluster, append.table_object_id, identity_of(&e, 0), "e").await;
+	// Wendelon ADR 0122: the inherited and the covered aged winners leave the base as aged debt.
+	let a_hlc = omitted_as_aged(&cluster, append.table_object_id, identity_of(&a, 0), "a").await;
+	let e_hlc = omitted_as_aged(&cluster, append.table_object_id, identity_of(&e, 0), "e").await;
 	let d_hlc =
 		stored_and_owing_nothing(&cluster, append.table_object_id, identity_of(&d, 0), "d").await;
 	assert!(
@@ -266,20 +304,13 @@ async fn a_certified_floor_hides_aged_rows_it_still_stores_and_owes_no_cleanup()
 	let mut pk_expected = Expected::new();
 	pk_expected.insert(1, "p1".into());
 	expect_everywhere(&cluster, &pk, &pk_expected, "p1 kept, p2 still deleted").await;
-	// Physical: nothing reclaimed through a cleanup pass.
+	// A cleanup pass reclaims only debt: d stays stored, owing nothing, and served.
 	cleanup_pass(&cluster).await;
 	stored_and_owing_nothing(
 		&cluster,
 		append.table_object_id,
-		identity_of(&a, 0),
-		"a after cleanup",
-	)
-	.await;
-	stored_and_owing_nothing(
-		&cluster,
-		append.table_object_id,
-		identity_of(&e, 0),
-		"e after cleanup",
+		identity_of(&d, 0),
+		"d after cleanup",
 	)
 	.await;
 	append_rows_everywhere(&cluster, &append, &[(4, "d")], "d only, after cleanup").await;
@@ -399,19 +430,11 @@ async fn an_idle_store_hides_an_aged_row_by_the_clock_alone() {
 		"{cut:?} {r_hlc:?}"
 	);
 	append_rows_everywhere(&cluster, &append, &[], "r hidden under g2").await;
-	stored_and_owing_nothing(
+	omitted_as_aged(
 		&cluster,
 		append.table_object_id,
 		identity_of(&r, 0),
 		"r in g2",
-	)
-	.await;
-	cleanup_pass(&cluster).await;
-	stored_and_owing_nothing(
-		&cluster,
-		append.table_object_id,
-		identity_of(&r, 0),
-		"r after cleanup",
 	)
 	.await;
 	assert_eq!(
@@ -501,14 +524,31 @@ async fn a_late_write_below_the_active_floor_keeps_its_receipt_and_is_not_served
 		crate::consensus::decisions::ParentStatus::Reserved
 	);
 	let x_hlc = reserved.claim.commit_hlc;
-	// The clock passes x by the window and a step; g2 commits, its cut below x.
+	// The clock passes x by the window and a step; g2 commits, its cut below x. Generation steps
+	// are held meanwhile: a samples the age trigger first (it is older than x), and a target
+	// proposed at an intermediate step would fix g2's floor between a and x (8/30 under load,
+	// `adr0122-stress-cand.log`), a legal floor that is not this control's premise.
 	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	pause_generations(&cluster, true);
 	advance(
 		&cluster,
 		&time,
 		x_hlc.physical_ms + WINDOW_MS + step + 1_000,
 	)
 	.await;
+	assert_eq!(
+		cluster
+			.node(cluster.leader().await)
+			.state_machine
+			.read_state(|state| {
+				let generations = state.decisions.as_ref().unwrap().generations();
+				(generations.current_gid(), generations.pending.is_some())
+			})
+			.await,
+		(1, false),
+		"no target sampled the clock during the advance"
+	);
+	pause_generations(&cluster, false);
 	until_active(&cluster, 2).await;
 	let cut = certified_cut(&cluster).await;
 	let (t2, floor) = cluster
@@ -561,23 +601,15 @@ async fn a_late_write_below_the_active_floor_keeps_its_receipt_and_is_not_served
 		Some(reserved.rsv)
 	);
 	append_rows_everywhere(&cluster, &append, &[(8, "y")], "after x's retry").await;
-	// A later generation covers x: stored, owing no debt, still not served.
+	// A later generation covers x (wendelon ADR 0122): omitted as aged debt, still not served.
 	jump_floor(&cluster, floor1 + 60_000).await;
 	until_covered(&cluster, reserved.rsv).await;
 	assert!(certified_cut(&cluster).await.floor_ms >= cut.floor_ms);
-	stored_and_owing_nothing(
+	omitted_as_aged(
 		&cluster,
 		append.table_object_id,
 		identity_of(&x_meta, 0),
-		"x in g3",
-	)
-	.await;
-	cleanup_pass(&cluster).await;
-	stored_and_owing_nothing(
-		&cluster,
-		append.table_object_id,
-		identity_of(&x_meta, 0),
-		"x after cleanup",
+		"x when covered",
 	)
 	.await;
 	append_rows_everywhere(&cluster, &append, &[(8, "y")], "under g3").await;
@@ -890,4 +922,1144 @@ async fn a_reopened_member_reports_its_rebuilt_staged_minimum() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_reopened_member_refuses_a_staged_minimum_it_cannot_rebuild() {
 	reopened_with_its_staged_minimum(true).await;
+}
+
+/// Wendelon ADR 0122 baseline (test-only on `a9d411d4f`): under a certified floor an aged
+/// governed row is reclaimed. The floor generation omits it from the certified base, its
+/// activation records it as debt at every member, and one cleanup pass removes every local copy
+/// while the table still reads exactly as before. On main S1 keeps aged winners stored, so the
+/// first assertion (no base entry) fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_aged_row_leaves_the_certified_base_and_is_reclaimed() {
+	let time = TestTime::new();
+	let (cluster, leader, _, append) = windowed(&time).await;
+	let export = retention_series(L1_DATA);
+	let r = write_one(
+		&cluster,
+		leader,
+		&append,
+		(1, "r"),
+		uuid_v7_at(time.clock.now_ms()),
+	)
+	.await;
+	jump_floor(&cluster, time.clock.now_ms() + 60_000).await;
+	until_active(&cluster, 1).await;
+	let row = identity_of(&r, 0);
+	let r_hlc = stored_and_owing_nothing(&cluster, append.table_object_id, row, "r in g1").await;
+	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	advance(
+		&cluster,
+		&time,
+		r_hlc.physical_ms + WINDOW_MS + step + 1_000,
+	)
+	.await;
+	until_active(&cluster, 2).await;
+	assert!(certified_cut(&cluster).await.floor_ms > r_hlc.physical_ms);
+	for node in NODES {
+		let index = cluster.node(node).slab.persistent_index().unwrap();
+		let in_base = index
+			.base_entries(false)
+			.await
+			.unwrap()
+			.into_iter()
+			.any(|entry| {
+				entry.table == append.table_object_id && entry.key_identity == *row.as_bytes()
+			});
+		assert!(!in_base, "the aged row left the certified base at {node}");
+		let owed = index
+			.debt_page(None, usize::MAX)
+			.await
+			.unwrap()
+			.into_iter()
+			.any(|(key, _)| {
+				key.table == append.table_object_id && key.key_identity == *row.as_bytes()
+			});
+		assert!(owed, "its activation recorded it as debt at {node}");
+	}
+	// Wendelon ADR 0122 D3: that debt is labelled aged at every member.
+	omitted_as_aged(&cluster, append.table_object_id, row, "r").await;
+	// S5b cleans sealed local slabs only: every member seals its active slab first, so the
+	// row's copies are eligible; then the cleanup step's own result is checked.
+	for node in NODES {
+		let server = &cluster.node(node).data_server;
+		let sealed = cluster.node(node).slab.force_seal_active_for_test().await;
+		let deadline = tokio::time::Instant::now() + BOUND;
+		let mut reclaimed = 0;
+		loop {
+			reclaimed += server.certified_cleanup_step().await.unwrap();
+			let copies = cluster
+				.node(node)
+				.slab
+				.version_locations(TenantId::ZERO, row, r_hlc)
+				.unwrap();
+			if copies.is_empty() {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"its local copies at {node} were never reclaimed (sealed {sealed:?}): {copies:?}"
+			);
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(reclaimed > 0, "the cleanup step reclaimed it at {node}");
+	}
+	// Wendelon ADR 0122 D4: each member's one local copy is one aged L1 removal, counted once
+	// on its installed rewrite (S5b, or the leader's certified LSM first); L2 counts nothing.
+	// Each store's own tally (Codex 01a20151 R3); the export moved by at least as much.
+	for node in NODES {
+		assert_eq!(
+			aged_tally(&cluster, &[node], AgedLevel::L1),
+			aged_data(1),
+			"one aged L1 removal at {node}"
+		);
+	}
+	assert_eq!(
+		aged_tally(&cluster, &NODES, AgedLevel::L2),
+		AgedRows::default(),
+		"no L2 removal here"
+	);
+	assert!(
+		retention_series(L1_DATA) >= export + NODES.len() as u64,
+		"exported"
+	);
+	append_rows_everywhere(&cluster, &append, &[], "the table reads as before").await;
+	shut_down(cluster, &time).await;
+}
+
+/// A ready windowed cluster whose members also tier to a local-filesystem L2 (the leader's
+/// certified tier step reads and rewrites it).
+async fn windowed_with_l2(
+	time: &TestTime,
+) -> (Cluster, u32, TableSchemaDescriptor, TableSchemaDescriptor) {
+	let (cluster, leader, pk) = ready_with({
+		let time = time.clone();
+		Cluster::start_with(move |id, cfg| {
+			cfg.test_time = Some(time.clone());
+			cfg.parent_decisions_retention_window = WINDOW;
+			let root = crate::test_support::TestDir::new(&format!("aged-l2-{id}"));
+			cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs {
+				root: root.to_path_buf(),
+			});
+			cfg.tiering.scan_interval = Duration::from_millis(200);
+			Some(root)
+		})
+	})
+	.await;
+	let append = append_only_descriptor();
+	cluster
+		.node(leader)
+		.raft
+		.client_write(crate::consensus::WendelonRequest::SchemaUpdate(
+			schema_update(&append),
+		))
+		.await
+		.unwrap();
+	until_settled(&cluster, &append).await;
+	(cluster, leader, pk, append)
+}
+
+/// The exported value of one retention series, exactly as the Section 8 evaluator reads it from
+/// the scrape. Wendelon ADR 0122 (Codex 01a20151 R3): a required series that is missing, repeated
+/// or not a whole non-negative number fails; absence is not zero. The registry is the process's,
+/// and in-process parallel tests add to it: a control judges its own work by its stores' tallies
+/// (`aged_rows_pruned_for_test`, recorded at the same call as the export) and asks of the export
+/// only that it moved by at least that much.
+fn retention_series(series: &str) -> u64 {
+	let text = crate::metrics::global().render_prometheus();
+	let values: Vec<&str> = text
+		.lines()
+		.filter_map(|line| {
+			let (name, value) = line.rsplit_once(' ')?;
+			(name == series).then_some(value)
+		})
+		.collect();
+	assert_eq!(
+		values.len(),
+		1,
+		"exactly one exported sample of {series}: {values:?}"
+	);
+	let value: f64 = values[0]
+		.parse()
+		.unwrap_or_else(|_| panic!("{series} = {:?} is not a number", values[0]));
+	assert!(
+		value.is_finite() && value >= 0.0 && value.fract() == 0.0,
+		"{series} = {value}"
+	);
+	value as u64
+}
+
+const L2_DATA: &str = "wendelon_storage_table_retention_l2_rows_pruned_total{kind=\"data\"}";
+const L1_DATA: &str = "wendelon_storage_table_retention_l1_rows_pruned_total{kind=\"data\"}";
+const L2_TOMBSTONE: &str =
+	"wendelon_storage_table_retention_l2_rows_pruned_total{kind=\"tombstone\"}";
+
+use crate::storage::manager::certified_tier::{
+	AgedLevel, AgedRows, CertifiedTierCut, CertifiedTierStep,
+};
+
+/// The aged rows `nodes`' current stores recorded at `level`, summed.
+fn aged_tally(cluster: &Cluster, nodes: &[u32], level: AgedLevel) -> AgedRows {
+	nodes.iter().fold(AgedRows::default(), |sum, node| {
+		let rows = cluster.node(*node).slab.aged_rows_pruned_for_test(level);
+		AgedRows {
+			data: sum.data + rows.data,
+			tombstone: sum.tombstone + rows.tombstone,
+		}
+	})
+}
+
+const fn aged_data(data: u64) -> AgedRows {
+	AgedRows { data, tombstone: 0 }
+}
+
+/// Wendelon ADR 0122 D4: the leader's own tiered slabs, with its cleanup paused so a control drives
+/// every certified tier step itself:
+/// - S2 holds only aged rows (a2, a3): a step retires it;
+/// - S1 holds an aged row (a1), a younger surviving neighbour (n) and a younger row deleted next
+///   (d, ordinary debt): a step rewrites it by a certified `Tier` to an object holding n alone.
+struct AgedL2 {
+	time: TestTime,
+	cluster: Cluster,
+	leader: u32,
+	append: TableSchemaDescriptor,
+	s1: crate::schema::SlabId,
+	s2: crate::schema::SlabId,
+	a1: crate::schema::Identity,
+	n: crate::schema::Identity,
+	d: crate::schema::Identity,
+}
+
+async fn aged_l2() -> AgedL2 {
+	use std::sync::atomic::Ordering::Release;
+	let time = TestTime::new();
+	let (cluster, leader, _, append) = windowed_with_l2(&time).await;
+	let server = cluster.node(leader).data_server.clone();
+	server
+		.decision_peer_for_test()
+		.pause_cleanup
+		.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let floor1 = time.clock.now_ms() + 60_000;
+	let now = |offset| uuid_v7_at(time.clock.now_ms() + offset);
+	let a2 = write_one(&cluster, leader, &append, (2, "a2"), now(0)).await;
+	let a3 = write_one(&cluster, leader, &append, (3, "a3"), now(1)).await;
+	let s2 = slab.force_seal_active_for_test().await;
+	let a1 = write_one(&cluster, leader, &append, (1, "a1"), now(2)).await;
+	// The clock passes the aged rows by the window and a step.
+	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	advance(
+		&cluster,
+		&time,
+		time.clock.now_ms() + WINDOW_MS + step + 1_000,
+	)
+	.await;
+	assert_eq!(
+		cluster.leader().await,
+		leader,
+		"the leader stays (its own tiered slabs)"
+	);
+	let n = write_one(&cluster, leader, &append, (4, "n"), now(0)).await;
+	let d = write_one(&cluster, leader, &append, (5, "d"), now(1)).await;
+	let s1 = slab.force_seal_active_for_test().await;
+	assert!(
+		s2 < s1,
+		"premise: S2 is sealed first, so a step visits it first"
+	);
+	let mut delete = delete_meta(&append);
+	delete.parent_write_id.client_uuid = now(2);
+	assert_eq!(
+		counts(&delete_through(&cluster, leader, delete, vec![identity_of(&d, 0)]).await),
+		[1, 0, 0],
+		"d deleted"
+	);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	for id in [s1, s2] {
+		while slab.tier_pointer(id).await.is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"slab {id:?} never tiered"
+			);
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	}
+	// The covering generation omits a1, a2 and a3 by age; d's version is ordinary debt.
+	let mut rsv = 0;
+	for key in [key_of(&append, &a1), key_of(&append, &d)] {
+		rsv = rsv.max(record_of(&cluster, key).await.expect("recorded").rsv);
+	}
+	jump_floor(&cluster, floor1 + 60_000).await;
+	until_covered(&cluster, rsv).await;
+	for row in [&a1, &a2, &a3] {
+		omitted_as_aged(
+			&cluster,
+			append.table_object_id,
+			identity_of(row, 0),
+			"an aged row",
+		)
+		.await;
+	}
+	let index = slab.persistent_index().unwrap();
+	let d_debt = index
+		.debt_page(None, usize::MAX)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|(key, _)| key.key_identity == *identity_of(&d, 0).as_bytes())
+		.expect("d's version is owed");
+	assert!(!d_debt.1.aged, "d's debt is ordinary: {d_debt:?}");
+	assert_eq!(
+		slab.aged_rows_pruned_for_test(AgedLevel::L2),
+		AgedRows::default()
+	);
+	// No later generation while a control drives its steps: under a slow run the window would
+	// otherwise age n too, and its replacement would rightly be retired (one more aged row).
+	pause_generations(&cluster, true);
+	AgedL2 {
+		time,
+		cluster,
+		leader,
+		append,
+		s1,
+		s2,
+		a1: identity_of(&a1, 0),
+		n: identity_of(&n, 0),
+		d: identity_of(&d, 0),
+	}
+}
+
+/// One certified tier step on `server`'s store, past the paused loop; retried while it finds
+/// nothing to do yet.
+async fn tier_step(
+	server: Arc<crate::network::data_server::WendelonDataServer>,
+	committer: crate::storage::RaftCommitter,
+) -> std::io::Result<CertifiedTierStep> {
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		match server.certified_tier_step_unpaused(&committer).await {
+			Ok(
+				CertifiedTierStep::Idle
+				| CertifiedTierStep::NothingSelected(_)
+				| CertifiedTierStep::GenerationMoved { .. },
+			) if tokio::time::Instant::now() < deadline => {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+			other => return other,
+		}
+	}
+}
+
+impl AgedL2 {
+	fn slab(&self) -> Arc<crate::storage::SlabManager> {
+		self.cluster.node(self.leader).slab.clone()
+	}
+
+	/// As the node's own committer is built, with its owner authority (ADR 0725).
+	fn committer(&self) -> crate::storage::RaftCommitter {
+		let node = self.cluster.node(self.leader);
+		crate::storage::RaftCommitter::new(node.raft.clone())
+			.with_state_machine(node.state_machine.clone())
+			.with_owner_authority(node.data_server.owner_authority())
+	}
+
+	/// One step that visits the lowest eligible slab first: S2 while it is left, then S1.
+	async fn step(&self) -> std::io::Result<CertifiedTierStep> {
+		self.slab().restart_certified_tier_cursor_for_test();
+		tier_step(
+			self.cluster.node(self.leader).data_server.clone(),
+			self.committer(),
+		)
+		.await
+	}
+
+	/// One step, from the lowest eligible slab, not retried.
+	async fn step_once(&self) -> std::io::Result<CertifiedTierStep> {
+		self.slab().restart_certified_tier_cursor_for_test();
+		self.cluster
+			.node(self.leader)
+			.data_server
+			.certified_tier_step_unpaused(&self.committer())
+			.await
+	}
+
+	/// What this store's own Applied effects have earned, from what is in force: S2's two aged
+	/// rows once it is retired, S1's one once its replacement is installed.
+	async fn earned(&self) -> AgedRows {
+		aged_data(2 * u64::from(self.retired().await) + u64::from(self.rewritten().await.is_some()))
+	}
+
+	/// One step, once: nothing is left to do.
+	async fn nothing_left(&self) {
+		self.slab().restart_certified_tier_cursor_for_test();
+		let answer = self
+			.cluster
+			.node(self.leader)
+			.data_server
+			.certified_tier_step_unpaused(&self.committer())
+			.await;
+		assert!(
+			matches!(
+				answer,
+				Ok(CertifiedTierStep::Idle | CertifiedTierStep::NothingSelected(_))
+			),
+			"nothing left: {answer:?}"
+		);
+	}
+
+	fn tally(&self) -> AgedRows {
+		self.slab().aged_rows_pruned_for_test(AgedLevel::L2)
+	}
+
+	/// The slab's committed tier record in the leader's state.
+	async fn committed(&self, slab: crate::schema::SlabId) -> Option<String> {
+		let owner = self.slab().owner_ref().unwrap();
+		self.cluster
+			.node(self.leader)
+			.state_machine
+			.tiered_slab(owner.slab(slab))
+			.await
+			.map(|tier| tier.l2_uri)
+	}
+
+	/// S2 retired: no local pointer and no committed one.
+	async fn retired(&self) -> bool {
+		self.slab().tier_pointer(self.s2).await.is_none() && self.committed(self.s2).await.is_none()
+	}
+
+	/// S1's local pointer, once it names a certified object: the replacement.
+	async fn rewritten(&self) -> Option<crate::storage::TieredSlabPointer> {
+		self.slab()
+			.tier_pointer(self.s1)
+			.await
+			.filter(|pointer| pointer.l2_uri.contains("certified/"))
+	}
+
+	async fn until(&self, what: &str, done: impl AsyncFn() -> bool) {
+		let deadline = tokio::time::Instant::now() + BOUND;
+		while !done().await {
+			assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}
+
+	/// The row identities `pointer`'s object physically holds, decoded from L2 (R2).
+	async fn object_rows(
+		&self,
+		pointer: &crate::storage::TieredSlabPointer,
+	) -> BTreeSet<crate::schema::Identity> {
+		self.slab()
+			.tiered_object_identities_for_test(pointer)
+			.await
+			.unwrap()
+			.into_iter()
+			.collect()
+	}
+
+	/// S1's replacement: its local and committed pointers name the same certified object, which
+	/// holds exactly n (a1 and d are gone from the bytes, not only from reads).
+	async fn s1_holds_only_n(&self) {
+		let replacement = self.rewritten().await.expect("S1 rewritten");
+		assert_eq!(
+			self.committed(self.s1).await.as_deref(),
+			Some(replacement.l2_uri.as_str()),
+			"the committed pointer is the replacement"
+		);
+		assert_eq!(
+			self.object_rows(&replacement).await,
+			BTreeSet::from([self.n]),
+			"the replacement object holds n alone"
+		);
+	}
+}
+
+/// Wendelon ADR 0122 D4, R1/R2 (Codex 01a20151), driven step by step:
+/// - an uncommitted rewrite (cut after its upload) earns nothing and installs nothing;
+/// - S2's own Applied `Retire` earns its two aged rows; no pointer remains, local or committed;
+/// - S1's own Applied `Tier` earns its one aged row, never d's ordinary one; its source object
+///   held a1, n and d, and the committed replacement holds n alone;
+/// - nothing is left, and nothing more is earned; the export moved by at least the store's own
+///   three; a clean reopen of the leader replays the log and its new store earns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn aged_rows_leave_the_leaders_tiered_objects_by_their_own_applied_effects() {
+	let mut fx = aged_l2().await;
+	let slab = fx.slab();
+	let export = retention_series(L2_DATA);
+	let _ = retention_series(L2_TOMBSTONE);
+	// Read before any step can publish (R2).
+	let source = slab.tier_pointer(fx.s1).await.unwrap();
+	assert_eq!(
+		fx.object_rows(&source).await,
+		BTreeSet::from([fx.a1, fx.n, fx.d]),
+		"S1's source object"
+	);
+	// The rewrite cut after its upload; S2 (the lowest slab) is retired first. After every step
+	// the tally is exactly what this store's own Applied effects earned so far.
+	slab.cut_next_certified_tier_step(CertifiedTierCut::AfterUpload);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while slab.certified_tier_cut_pending_for_test().is_some() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the rewrite never uploaded"
+		);
+		let _ = fx.step_once().await;
+		assert_eq!(fx.tally(), fx.earned().await, "only Applied effects earn");
+	}
+	assert_eq!(
+		slab.tier_pointer(fx.s1).await.as_ref(),
+		Some(&source),
+		"an uploaded, unsubmitted rewrite installs nothing"
+	);
+	assert_eq!(fx.tally(), fx.earned().await, "and earns nothing");
+	steps_until(&fx, "S2 retired and S1 rewritten", async || {
+		assert_eq!(
+			fx.tally(),
+			fx.earned().await,
+			"only Applied effects earn; S2 local {:?} committed {:?}",
+			fx.slab()
+				.tier_pointer(fx.s2)
+				.await
+				.map(|pointer| pointer.l2_uri),
+			fx.committed(fx.s2).await
+		);
+		fx.retired().await && fx.rewritten().await.is_some()
+	})
+	.await;
+	assert!(fx.retired().await, "no pointer remains, local or committed");
+	assert_eq!(
+		fx.tally(),
+		aged_data(3),
+		"a1, a2, a3 only, never d's ordinary version"
+	);
+	fx.s1_holds_only_n().await;
+	fx.nothing_left().await;
+	assert_eq!(fx.tally(), aged_data(3));
+	assert!(retention_series(L2_DATA) >= export + 3, "exported");
+	append_rows_everywhere(&fx.cluster, &fx.append, &[(4, "n")], "only the neighbour").await;
+	// A clean reopen replays the log: the new store earns nothing.
+	fx.cluster.stop(fx.leader, false).await;
+	fx.cluster.reopen(fx.leader).await;
+	pause_generations(&fx.cluster, true);
+	until_settled(&fx.cluster, &fx.append).await;
+	assert!(fx.retired().await);
+	assert_eq!(fx.tally(), AgedRows::default(), "no recount on replay");
+	assert_eq!(slab.aged_rows_pruned_for_test(AgedLevel::L2), aged_data(3));
+	fx.s1_holds_only_n().await;
+	append_rows_everywhere(&fx.cluster, &fx.append, &[(4, "n")], "after the reopen").await;
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0122 D4, R1 (Codex 01a20151): observer-first success. S2 is retired by its worker
+/// (2). S1's rewrite is then held right after the ring decides its `Tier` Applied; the leader's
+/// apply observer installs the replacement while the worker waits, and earns nothing; released,
+/// the worker verifies its own effect and counts it once (3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_observer_first_delivery_is_counted_once_by_its_own_worker() {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	assert_eq!(fx.tally(), aged_data(2));
+	let (reached, release) = slab.hold_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, reached.acquire())
+		.await
+		.expect("S1's step reaches acceptance")
+		.unwrap()
+		.forget();
+	fx.until("the observer installs S1's replacement", async || {
+		fx.rewritten().await.is_some()
+	})
+	.await;
+	assert_eq!(fx.tally(), aged_data(2), "the observer earns nothing");
+	release.add_permits(1);
+	match worker.await.unwrap() {
+		Ok(CertifiedTierStep::Rewritten { slab, .. }) if slab == fx.s1 => {}
+		other => panic!("the held worker's step: {other:?}"),
+	}
+	assert_eq!(fx.tally(), aged_data(3), "its own worker counts it, once");
+	fx.s1_holds_only_n().await;
+	fx.nothing_left().await;
+	assert_eq!(fx.tally(), aged_data(3));
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0122 D4, R2 (Codex 01a20151): an unsubmitted retirement earns nothing. S2's
+/// retirement is cut after its intent and certificate are durable and before submission: nothing
+/// is earned and nothing changes (S2 stays tiered, locally and committed). That intent is open's
+/// to resolve (ADR 0704); in this process S2 is not retried, and S1's own rewrite earns exactly
+/// its one aged row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_unsubmitted_retirement_earns_nothing() {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	let source = slab.tier_pointer(fx.s1).await.unwrap();
+	slab.cut_next_certified_tier_step(CertifiedTierCut::BeforeSubmit);
+	let cut = fx.step().await;
+	assert!(
+		cut.is_err(),
+		"the retirement is cut before submission: {cut:?}"
+	);
+	assert_eq!(
+		fx.tally(),
+		AgedRows::default(),
+		"nothing submitted, nothing earned"
+	);
+	assert!(slab.tier_pointer(fx.s2).await.is_some() && fx.committed(fx.s2).await.is_some());
+	assert_eq!(slab.tier_pointer(fx.s1).await.as_ref(), Some(&source));
+	steps_until(&fx, "S1 rewritten", async || fx.rewritten().await.is_some()).await;
+	assert_eq!(fx.tally(), aged_data(1), "S1's own rewrite alone");
+	assert!(slab.tier_pointer(fx.s2).await.is_some() && fx.committed(fx.s2).await.is_some());
+	fx.s1_holds_only_n().await;
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0122 D4 (Codex 01a201b7): only the worker's own Applied op earns its count. With
+/// each exact effect installed (S2 retired, S1's replacement published, locally and committed),
+/// the production counting entry is called with the worker's real op key but a mismatched digest,
+/// and with a key whose outcome is missing: it answers false and the store's tally is unchanged.
+/// The same call with the op's real digest answers true and adds its rows, so only the op proof
+/// made the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn only_its_own_applied_op_earns_a_count() {
+	use crate::storage::manager::certified_tier::AgedL2Effect;
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	let retire_op = match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, op }) if slab == fx.s2 => op,
+		other => panic!("S2's retirement: {other:?}"),
+	};
+	let (tier_op, candidate) = match fx.step().await {
+		Ok(CertifiedTierStep::Rewritten {
+			slab,
+			op,
+			candidate,
+		}) if slab == fx.s1 => (op, candidate),
+		other => panic!("S1's rewrite: {other:?}"),
+	};
+	assert_eq!(fx.tally(), aged_data(3));
+	assert!(fx.retired().await);
+	fx.s1_holds_only_n().await;
+	let tier = AgedL2Effect::Tier(candidate);
+	for (slab_id, op, effect, rows) in [
+		(fx.s1, tier_op, &tier, aged_data(1)),
+		(fx.s2, retire_op, &AgedL2Effect::Retire, aged_data(2)),
+	] {
+		let digest = slab
+			.applied_op_digest_for_test(op)
+			.await
+			.expect("the op's Applied outcome is retained");
+		let mut wrong = digest;
+		wrong[0] ^= 0xFF;
+		let missing = crate::consensus::slab_ops::OpKey {
+			op_seq: op.op_seq + 1_000_000,
+			..op
+		};
+		let before = fx.tally();
+		for (key, claimed, what) in [
+			(op, wrong, "a mismatched digest"),
+			(missing, digest, "a missing outcome"),
+		] {
+			assert!(
+				!slab
+					.record_aged_l2_if_applied(slab_id, key, claimed, effect, rows)
+					.await,
+				"{what} earns nothing for {effect:?}"
+			);
+			assert_eq!(fx.tally(), before, "{what}: the tally is unchanged");
+		}
+		assert!(
+			slab.record_aged_l2_if_applied(slab_id, op, digest, effect, rows)
+				.await,
+			"the real op earns it ({effect:?})"
+		);
+		assert_eq!(
+			fx.tally(),
+			AgedRows {
+				data: before.data + rows.data,
+				tombstone: before.tombstone
+			}
+		);
+	}
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Steps the leader's certified tier work until `done`: later steps recover what an unfinished
+/// worker left (or find the observer already did).
+async fn steps_until(fx: &AgedL2, what: &str, done: impl AsyncFn() -> bool) {
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !done().await {
+		assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+		let _ = fx.step_once().await;
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+}
+
+/// Wendelon ADR 0122 D4, R1/R2 (Codex 01a20151): an effect whose worker never finished earns
+/// nothing, whichever route then completes it (a later step's recovery, or the apply observer):
+/// - an error right after acceptance (S2's retirement);
+/// - a cancellation right after acceptance: the step's task is aborted while it waits (S1's
+///   rewrite).
+/// No registration exists to outlive either, and nothing later earns them; the effects are
+/// complete (S2 retired; S1's committed replacement holds n alone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_effect_its_worker_never_finished_earns_nothing() {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	slab.cut_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	let failed = fx.step().await;
+	assert!(
+		failed.is_err(),
+		"S2's worker fails after acceptance: {failed:?}"
+	);
+	steps_until(&fx, "S2's decided retirement is delivered", async || {
+		fx.retired().await
+	})
+	.await;
+	assert_eq!(fx.tally(), AgedRows::default(), "an error earns nothing");
+	let (reached, _release) = slab.hold_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, reached.acquire())
+		.await
+		.expect("S1's step reaches acceptance")
+		.unwrap()
+		.forget();
+	worker.abort();
+	assert!(
+		worker.await.unwrap_err().is_cancelled(),
+		"the worker is cancelled"
+	);
+	steps_until(&fx, "S1's decided rewrite is installed", async || {
+		fx.rewritten().await.is_some()
+	})
+	.await;
+	assert_eq!(
+		fx.tally(),
+		AgedRows::default(),
+		"a cancellation earns nothing"
+	);
+	fx.s1_holds_only_n().await;
+	fx.nothing_left().await;
+	assert_eq!(fx.tally(), AgedRows::default(), "nothing earns them later");
+	append_rows_everywhere(&fx.cluster, &fx.append, &[(4, "n")], "only the neighbour").await;
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0122, the idle tombstone bound (S1's trigger kept): when a store's last governed
+/// winner is a tombstone, the certificate agrees no visible row, so the clock alone schedules no
+/// generation that would omit it; it stays a base entry however late it is. The next generation
+/// triggered by something else (an ordinary erasing write) with a covering floor omits it as aged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_last_tombstone_waits_for_a_covering_ordinary_generation() {
+	let time = TestTime::new();
+	let (cluster, leader, _, append) = windowed(&time).await;
+	let r = write_one(
+		&cluster,
+		leader,
+		&append,
+		(1, "r"),
+		uuid_v7_at(time.clock.now_ms()),
+	)
+	.await;
+	let floor1 = time.clock.now_ms() + 60_000;
+	jump_floor(&cluster, floor1).await;
+	until_active(&cluster, 1).await;
+	// r deleted: its tombstone becomes the only governed winner.
+	let mut delete = delete_meta(&append);
+	delete.parent_write_id.client_uuid = uuid_v7_at(floor1 + 1);
+	let delete_key = ParentKey {
+		tenant: TenantId::ZERO,
+		namespace: ParentNamespace::Table(append.table_object_id),
+		client_uuid: delete.parent_write_id.client_uuid,
+		sequence_no: delete.parent_write_id.sequence_no,
+	};
+	assert_eq!(
+		counts(&delete_through(&cluster, leader, delete, vec![identity_of(&r, 0)]).await),
+		[1, 0, 0]
+	);
+	let rsv = record_of(&cluster, delete_key).await.expect("recorded").rsv;
+	jump_floor(&cluster, floor1 + 60_000).await;
+	let gid = until_covered(&cluster, rsv).await;
+	let (table, row) = (append.table_object_id, identity_of(&r, 0));
+	assert_eq!(
+		tombstone_in_base(&cluster, table, row).await,
+		vec![true; NODES.len()]
+	);
+	assert_eq!(
+		certified_oldest(&cluster).await,
+		None,
+		"a tombstone is never the least visible row"
+	);
+	// Only the clock passes it by the window and steps: no generation commits.
+	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	advance(
+		&cluster,
+		&time,
+		time.clock.now_ms() + WINDOW_MS + 2 * step + 1_000,
+	)
+	.await;
+	let leader = cluster.leader().await;
+	let current = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.generations()
+				.current_gid()
+		})
+		.await;
+	assert_eq!(current, gid, "the clock alone schedules nothing");
+	assert_eq!(
+		tombstone_in_base(&cluster, table, row).await,
+		vec![true; NODES.len()]
+	);
+	// An ordinary erasing write's generation raises the floor and omits it as aged.
+	let y = write_one(
+		&cluster,
+		leader,
+		&append,
+		(2, "y"),
+		uuid_v7_at(floor1 + 60_001),
+	)
+	.await;
+	let y_rsv = record_of(&cluster, key_of(&append, &y))
+		.await
+		.expect("recorded")
+		.rsv;
+	jump_floor(&cluster, floor1 + 120_000).await;
+	until_covered(&cluster, y_rsv).await;
+	assert_eq!(
+		tombstone_in_base(&cluster, table, row).await,
+		vec![false; NODES.len()]
+	);
+	// Two debt records at this key: r's data version, displaced by its tombstone (ordinary), and
+	// the tombstone, omitted by age (aged).
+	for node in NODES {
+		let index = cluster.node(node).slab.persistent_index().unwrap();
+		let mut owed: Vec<_> = index
+			.debt_page(None, usize::MAX)
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|(key, _)| key.table == table && key.key_identity == *row.as_bytes())
+			.collect();
+		owed.sort_by_key(|(key, _)| key.hlc);
+		assert_eq!(owed.len(), 2, "at {node}: {owed:?}");
+		assert!(
+			!owed[0].1.aged
+				&& matches!(
+					owed[0].1.source,
+					crate::storage::index::certified_base::DebtSource::DisplacedBase {
+						tombstone: false
+					}
+				),
+			"r's data version is ordinary debt at {node}: {owed:?}"
+		);
+		assert!(owed[1].1.aged, "the tombstone is aged at {node}: {owed:?}");
+	}
+	append_rows_everywhere(&cluster, &append, &[(2, "y")], "y served").await;
+	shut_down(cluster, &time).await;
+}
+
+/// Whether each node's active base holds `row` of `table` as a tombstone.
+async fn tombstone_in_base(
+	cluster: &Cluster,
+	table: TableObjectId,
+	row: crate::schema::Identity,
+) -> Vec<bool> {
+	let mut held = Vec::new();
+	for node in NODES {
+		let index = cluster.node(node).slab.persistent_index().unwrap();
+		held.push(
+			index
+				.base_entries(false)
+				.await
+				.unwrap()
+				.into_iter()
+				.any(|entry| {
+					entry.table == table && entry.key_identity == *row.as_bytes() && entry.tombstone
+				}),
+		);
+	}
+	held
+}
+
+/// Holds (or releases) every node's generation steps.
+fn pause_generations(cluster: &Cluster, paused: bool) {
+	for node in NODES {
+		cluster
+			.node(node)
+			.data_server
+			.pause_generations_for_test(paused);
+	}
+}
+
+/// Wendelon ADR 0122 D4 (Codex 01a20151 R2), the certified LSM alone: the leader's cleanup (S5b
+/// included) is paused, and a certified LSM job, driven here, elides both an aged row (a) and an
+/// ordinary obsolete version (x, overwritten by y in a table no window governs). The leader's L1
+/// tally earns exactly a, once; x earns nothing; no S5b and no L2 credit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_certified_lsm_job_counts_its_aged_elisions_only() {
+	use std::sync::atomic::Ordering::Release;
+	let time = TestTime::new();
+	let (cluster, leader, pk, append) = windowed(&time).await;
+	let server = cluster.node(leader).data_server.clone();
+	server
+		.decision_peer_for_test()
+		.pause_cleanup
+		.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let floor1 = time.clock.now_ms() + 60_000;
+	// Each write in its own L0 run on the leader.
+	let a = write_one(
+		&cluster,
+		leader,
+		&append,
+		(1, "a"),
+		uuid_v7_at(time.clock.now_ms()),
+	)
+	.await;
+	slab.force_seal_active_for_test().await;
+	let mut last = key_of(&append, &a);
+	for value in ["x", "y"] {
+		let meta = write_meta(&pk, 1, uuid_v7_at(time.clock.now_ms()));
+		assert_committed(
+			&write_through(&cluster, leader, meta, named_rows(&pk, &[(1, value)])).await,
+			"an overwrite",
+		);
+		last = key_of(&pk, &meta);
+		slab.force_seal_active_for_test().await;
+	}
+	// Read while their intents are retained (a covering generation retires them).
+	let one = server
+		.row_identity_and_locality_for_test(TenantId::ZERO, &pk, &named_rows(&pk, &[(1, "x")]))
+		.0;
+	let ones = owned_versions(&cluster, leader, one).await;
+	assert_eq!(ones.len(), 2, "x and y owned");
+	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	advance(
+		&cluster,
+		&time,
+		time.clock.now_ms() + WINDOW_MS + step + 1_000,
+	)
+	.await;
+	let rsv = record_of(&cluster, last).await.expect("recorded").rsv;
+	jump_floor(&cluster, floor1 + 60_000).await;
+	until_covered(&cluster, rsv).await;
+	let a_hlc = omitted_as_aged(&cluster, append.table_object_id, identity_of(&a, 0), "a").await;
+	let index = slab.persistent_index().unwrap();
+	let x_debt = index
+		.debt_page(None, usize::MAX)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|(key, _)| key.key_identity == *one.as_bytes() && key.hlc == ones[0])
+		.expect("x's version is owed");
+	assert!(!x_debt.1.aged, "x's debt is ordinary: {x_debt:?}");
+	let worker = crate::storage::LsmCompactionWorker::new(
+		crate::storage::LsmConfig {
+			max_l0_slab_count: 1,
+			lsm_l0_max_age_millis: 0,
+			..crate::storage::LsmConfig::default()
+		},
+		slab.slab_pin_table(),
+	)
+	.unwrap();
+	let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
+		.with_state_machine(cluster.node(leader).state_machine.clone())
+		.with_owner_authority(server.owner_authority());
+	let at = HybridTimestamp {
+		physical_ms: time.clock.now_ms(),
+		logical: 0,
+		node_id: 0,
+	};
+	let a_id = identity_of(&a, 0);
+	let copies = |key, hlc| {
+		slab.version_locations(TenantId::ZERO, key, hlc)
+			.unwrap()
+			.len()
+	};
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let mut jobs = 0;
+	while copies(a_id, a_hlc) + copies(one, ones[0]) > 0 {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"a {} and x {} copies remain after {jobs} certified jobs",
+			copies(a_id, a_hlc),
+			copies(one, ones[0])
+		);
+		match server
+			.certified_lsm_step_unpaused(&worker, at, &committer)
+			.await
+		{
+			Ok(Some(_)) => jobs += 1,
+			Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+			Err(error) => panic!("a certified LSM job failed: {error}"),
+		}
+	}
+	assert!(copies(one, ones[1]) > 0, "y stays");
+	assert_eq!(
+		slab.aged_rows_pruned_for_test(AgedLevel::L1),
+		aged_data(1),
+		"a once; x's ordinary version earns nothing"
+	);
+	assert_eq!(
+		slab.aged_rows_pruned_for_test(AgedLevel::L2),
+		AgedRows::default()
+	);
+	append_rows_everywhere(&cluster, &append, &[], "a is not served").await;
+	shut_down(cluster, &time).await;
+}
+
+/// Wendelon ADR 0122 D2 (Codex 01a20151), policy 4 live: one generation both excludes a finalized
+/// drop (ADR 0115) and omits an aged row. Generation steps are held while the clock passes the
+/// aged row and the drop is finalized, so the next target carries both: its cut is past the drop
+/// and its floor past the row, and its policy is the composition of the two (4). At every member
+/// the dropped table's entries leave the base as ordinary debt, and the aged row as aged debt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn one_generation_excludes_a_dropped_table_and_omits_an_aged_row() {
+	use crate::consensus::decisions::generations::{
+		SURVIVOR_POLICY_EXCLUDING_AGED, compose_survivor_policy,
+	};
+	let time = TestTime::new();
+	let (cluster, leader, pk, append) = windowed(&time).await;
+	let a = write_one(
+		&cluster,
+		leader,
+		&append,
+		(1, "a"),
+		uuid_v7_at(time.clock.now_ms()),
+	)
+	.await;
+	let p = write_meta(&pk, 1, uuid_v7_at(time.clock.now_ms()));
+	assert_committed(
+		&write_through(&cluster, leader, p, named_rows(&pk, &[(1, "p")])).await,
+		"p",
+	);
+	let floor1 = time.clock.now_ms() + 60_000;
+	jump_floor(&cluster, floor1).await;
+	until_active(&cluster, 1).await;
+	let dropped = pk.table_object_id;
+	for node in NODES {
+		let base = cluster
+			.node(node)
+			.slab
+			.persistent_index()
+			.unwrap()
+			.base_entries(false)
+			.await
+			.unwrap();
+		assert!(
+			base.iter().any(|entry| entry.table == dropped),
+			"p certified at {node}"
+		);
+		assert!(
+			base.iter()
+				.any(|entry| entry.key_identity == *identity_of(&a, 0).as_bytes()),
+			"a certified at {node}"
+		);
+	}
+	pause_generations(&cluster, true);
+	let step = crate::consensus::decisions::generations::retention_step_ms(WINDOW_MS);
+	advance(
+		&cluster,
+		&time,
+		time.clock.now_ms() + WINDOW_MS + step + 1_000,
+	)
+	.await;
+	let (_, finalized) = super::drop_exclusion::drop_logically(&cluster, &pk).await;
+	// A later entry, so the next target's cut can close past the finalize.
+	write_one(
+		&cluster,
+		cluster.leader().await,
+		&append,
+		(2, "z"),
+		// Above the jumped decision floor, or it expires.
+		uuid_v7_at(floor1 + 1),
+	)
+	.await;
+	pause_generations(&cluster, false);
+	let gid = until_covered(&cluster, finalized).await;
+	let (t, floor_ms, policy) = cluster
+		.node(cluster.leader().await)
+		.state_machine
+		.read_state(|state| {
+			let certificate = state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.generations()
+				.current
+				.clone()
+				.expect("g2");
+			(
+				certificate.t,
+				certificate.retention.floor_ms,
+				compose_survivor_policy(
+					state.pd_survivor_policy_at(certificate.t),
+					certificate.retention.floor_ms,
+				),
+			)
+		})
+		.await;
+	assert!(
+		t >= finalized,
+		"g2's cut {t} is past the drop at {finalized}"
+	);
+	assert_eq!(
+		policy, SURVIVOR_POLICY_EXCLUDING_AGED,
+		"exclusion and age together"
+	);
+	let a_hlc = omitted_as_aged(&cluster, append.table_object_id, identity_of(&a, 0), "a").await;
+	assert!(a_hlc.physical_ms < floor_ms, "a is below g2's floor");
+	for node in NODES {
+		let index = cluster.node(node).slab.persistent_index().unwrap();
+		let base = index.base_entries(false).await.unwrap();
+		assert!(
+			!base.iter().any(|entry| entry.table == dropped),
+			"the dropped table left the base at {node}"
+		);
+		let owed: Vec<_> = index
+			.debt_page(None, usize::MAX)
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|(key, _)| key.table == dropped)
+			.collect();
+		assert!(
+			!owed.is_empty(),
+			"the dropped table's entries are owed at {node}"
+		);
+		assert!(
+			owed.iter().all(|(_, record)| !record.aged),
+			"excluded, not aged, at {node}: {owed:?}"
+		);
+		// One build did both: the exclusion and the age omission are the same generation's debt.
+		let a_debt: Vec<_> = index
+			.debt_page(None, usize::MAX)
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|(key, _)| key.key_identity == *identity_of(&a, 0).as_bytes())
+			.collect();
+		assert!(
+			owed.iter()
+				.chain(&a_debt)
+				.all(|(_, record)| record.gid == gid),
+			"both by generation {gid} at {node}: {owed:?} {a_debt:?}"
+		);
+	}
+	append_rows_everywhere(&cluster, &append, &[(2, "z")], "a is not served").await;
+	shut_down(cluster, &time).await;
 }

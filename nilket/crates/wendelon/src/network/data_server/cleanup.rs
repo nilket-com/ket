@@ -414,6 +414,19 @@ impl WendelonDataServer {
 		if self.cleanup_paused_for_test() {
 			return Ok(CertifiedTierStep::Idle);
 		}
+		self.certified_tier_step_unpaused(committer).await
+	}
+
+	/// The tier step itself, past its admission checks; a test drives it directly
+	/// while the store's own steps are paused (wendelon ADR 0122).
+	pub(crate) async fn certified_tier_step_unpaused(
+		&self,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> std::io::Result<crate::storage::manager::certified_tier::CertifiedTierStep> {
+		use crate::storage::manager::certified_tier::CertifiedTierStep;
+		if !self.parent_decisions() || !self.may_clean() {
+			return Ok(CertifiedTierStep::Idle);
+		}
 		let permit = match self.slab.directory_owner() {
 			Some(owner) => Some(owner.lifecycle_permit()?),
 			None => None,

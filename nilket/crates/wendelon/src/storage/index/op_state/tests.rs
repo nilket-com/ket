@@ -1178,13 +1178,14 @@ async fn a_certified_tier_allocation_under_a_moved_generation_writes_nothing() {
 	};
 	let candidate = StagedCandidate {
 		oldest_visible: None,
+		aged: None,
 		gid: 1,
 		target_digest: [1; 32],
 		predecessor_gid: 0,
 		chunks: chunk_sums(&[entry]),
 	};
 	index
-		.stage_base(candidate.clone(), vec![entry])
+		.stage_base(candidate.clone(), vec![entry], Vec::new())
 		.await
 		.unwrap()
 		.unwrap();

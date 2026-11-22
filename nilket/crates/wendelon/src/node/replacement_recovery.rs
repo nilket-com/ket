@@ -689,6 +689,7 @@ impl RecoveryDriver {
 			predecessor_gid: certificate.predecessor_gid,
 			chunks: certificate.chunks.clone(),
 			oldest_visible: certificate.oldest_visible,
+			aged: None,
 		};
 		// Phase 1.
 		if !index.recovered_staging_matches(candidate.clone()).await? {

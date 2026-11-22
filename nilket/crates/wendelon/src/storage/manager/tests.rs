@@ -20648,13 +20648,14 @@ async fn certified_cleanup_reclaims_only_planned_debt_under_its_generation() {
 			async move {
 				let candidate = StagedCandidate {
 					oldest_visible: None,
+					aged: None,
 					gid,
 					target_digest: [gid as u8; 32],
 					predecessor_gid: gid - 1,
 					chunks: chunk_sums(&[winner]),
 				};
 				index
-					.stage_base(candidate.clone(), vec![winner])
+					.stage_base(candidate.clone(), vec![winner], Vec::new())
 					.await
 					.unwrap()
 					.unwrap();
@@ -20871,13 +20872,14 @@ async fn cleanup_fixture(tag: &str) -> (CleanupFixture, Arc<SlabManager>) {
 	};
 	let candidate = StagedCandidate {
 		oldest_visible: None,
+		aged: None,
 		gid: 1,
 		target_digest: [1; 32],
 		predecessor_gid: 0,
 		chunks: chunk_sums(&[winner]),
 	};
 	index
-		.stage_base(candidate.clone(), vec![winner])
+		.stage_base(candidate.clone(), vec![winner], Vec::new())
 		.await
 		.unwrap()
 		.unwrap();
@@ -65060,13 +65062,14 @@ async fn certified_lsm_activate(
 	};
 	let candidate = StagedCandidate {
 		oldest_visible: None,
+		aged: None,
 		gid,
 		target_digest: [gid as u8; 32],
 		predecessor_gid: gid - 1,
 		chunks: chunk_sums(&[winner]),
 	};
 	index
-		.stage_base(candidate.clone(), vec![winner])
+		.stage_base(candidate.clone(), vec![winner], Vec::new())
 		.await
 		.unwrap()
 		.unwrap();
@@ -70288,4 +70291,17 @@ async fn an_orphaned_publication_refuses_the_debt_absence_authority_until_reopen
 		reopened.try_debt_absence_authority().is_some(),
 		"granted again after the reopen"
 	);
+}
+
+impl SlabManager {
+	/// Test-only (wendelon ADR 0122, Codex 01a201b7): the digest `op` was decided Applied under,
+	/// while its outcome is retained (a test reader of the canonical lease, outside the
+	/// production lease census).
+	pub(crate) async fn applied_op_digest_for_test(
+		&self,
+		op: crate::consensus::slab_ops::OpKey,
+	) -> Option<[u8; 32]> {
+		let lease = self.canonical_tier_lease().await.ok()??;
+		lease.applied_op_digest(op)
+	}
 }

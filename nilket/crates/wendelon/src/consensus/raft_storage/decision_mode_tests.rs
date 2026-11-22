@@ -118,15 +118,15 @@ fn a_new_mode_snapshot_is_refused_by_today_before_its_body_is_trusted() {
 	assert!(error.contains("newer than this build accepts"), "{error}");
 }
 
-/// Wendelon ADR 0119 D6, then ADR 0120 D9 and ADR 0121 D1: a ParentDecisions build
-/// refuses a ParentDecisions snapshot of the previous format (33, ADR 0120's) and of a later one before
+/// Wendelon ADR 0119 D6, then ADR 0120 D9, ADR 0121 D1 and ADR 0122 D2: a ParentDecisions build
+/// refuses a ParentDecisions snapshot of the previous format (34, ADR 0121's) and of a later one before
 /// its body is trusted; snapshot install decodes through this same reader
 /// (`decode_snapshot_file`), so an install of either is refused before anything
 /// is published.
 #[test]
 fn a_parent_decisions_snapshot_of_another_format_is_refused_before_its_body_is_trusted() {
 	let new = DecisionMode::ParentDecisions;
-	assert_eq!(new.snapshot_format(), 34);
+	assert_eq!(new.snapshot_format(), 35);
 	let state = SmState {
 		decisions: Some(Default::default()),
 		..SmState::default()
@@ -247,6 +247,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V35_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v35.txt");
+/// Wendelon ADR 0121's format-34 bodies, retained. Wendelon ADR 0122 moved none and
+/// added a target carrying the aged survivor policy.
 const PARENT_DECISIONS_V34_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v34.txt");
 /// Wendelon ADR 0120's format-33 bodies, retained. Wendelon ADR 0121 moved only
@@ -339,7 +343,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V34_MANIFEST)
+	parse(PARENT_DECISIONS_V35_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -508,7 +512,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_34_bodies_match_their_goldens_and_round_trip() {
+fn the_format_35_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -769,7 +773,7 @@ fn the_format_34_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-34 bodies moved or are missing; expected lines:\n{}",
+		"format-35 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -796,17 +800,32 @@ fn the_format_34_bodies_match_their_goldens_and_round_trip() {
 		"report_retention",
 		"certificate_retention",
 	];
+	// Wendelon ADR 0122: against the format-34 corpus no body moved; a target carrying
+	// the aged survivor policy was added.
+	const ADDED_0122: [&str; 1] = ["propose_target_aged"];
+	let retained_v34 = parse(PARENT_DECISIONS_V34_MANIFEST);
+	assert_eq!(stored.len(), retained_v34.len() + ADDED_0122.len());
+	for (name, hex) in &retained_v34 {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
+	for name in ADDED_0122 {
+		assert!(stored.contains_key(name), "{name}");
+	}
 	let retained_v33 = parse(PARENT_DECISIONS_V33_MANIFEST);
-	assert_eq!(stored.len(), retained_v33.len() + ADDED_0121.len());
+	assert_eq!(retained_v34.len(), retained_v33.len() + ADDED_0121.len());
 	for (name, hex) in &retained_v33 {
 		if name == "decisions_golden_history" {
-			assert_eq!(stored.get(name), Some(&format!("{hex}0100")), "{name}");
+			assert_eq!(
+				retained_v34.get(name),
+				Some(&format!("{hex}0100")),
+				"{name}"
+			);
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v34.get(name), Some(hex), "{name}");
 		}
 	}
 	for name in ADDED_0121 {
-		assert!(stored.contains_key(name), "{name}");
+		assert!(retained_v34.contains_key(name), "{name}");
 	}
 	// Wendelon ADR 0120: against the format-32 corpus only the decision state
 	// moved, by exactly its appended empty CTAS part (four empty maps and two zero
@@ -2923,6 +2942,17 @@ fn golden_retention_shapes() -> Vec<(&'static str, Vec<u8>)> {
 			"propose_target_retention",
 			postcard::to_stdvec(&WendelonRequest::Decision(DecisionCommand::ProposeTarget {
 				target: target.clone(),
+			}))
+			.unwrap(),
+		),
+		// Wendelon ADR 0122 D2: the same target under the signed aged policy.
+		(
+			"propose_target_aged",
+			postcard::to_stdvec(&WendelonRequest::Decision(DecisionCommand::ProposeTarget {
+				target: Target {
+					survivor_policy: crate::consensus::decisions::generations::SURVIVOR_POLICY_AGED,
+					..target.clone()
+				},
 			}))
 			.unwrap(),
 		),

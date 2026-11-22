@@ -2466,9 +2466,15 @@ fn propose_cut(
 	predecessor_gid: u64,
 	retention: generations::RetentionCut,
 ) -> DecisionResult {
+	let base = target(state, gid, t, predecessor_gid);
+	// Wendelon ADR 0122 D2: a floor above 0 carries the signed aged component.
 	let target = generations::Target {
+		survivor_policy: generations::compose_survivor_policy(
+			base.survivor_policy,
+			retention.floor_ms,
+		),
 		retention,
-		..target(state, gid, t, predecessor_gid)
+		..base
 	};
 	decide(state, DecisionCommand::ProposeTarget { target })
 }
@@ -2730,6 +2736,92 @@ fn an_idle_base_older_than_the_window_gets_a_next_target() {
 		),
 		refused(DecisionRefusal::RetentionCutInadmissible)
 	);
+}
+
+/// Wendelon ADR 0122 D2: a target carries exactly the survivor policy its cut's base policy and
+/// its floor compose (1 or 2 with no floor, 3 or 4 with one); any other is refused at apply and
+/// changes nothing.
+#[test]
+fn a_target_carries_exactly_the_composed_survivor_policy() {
+	use generations::{
+		SURVIVOR_POLICY, SURVIVOR_POLICY_AGED, SURVIVOR_POLICY_EXCLUDING,
+		SURVIVOR_POLICY_EXCLUDING_AGED, compose_survivor_policy,
+	};
+	assert_eq!(compose_survivor_policy(SURVIVOR_POLICY, 0), SURVIVOR_POLICY);
+	assert_eq!(
+		compose_survivor_policy(SURVIVOR_POLICY_EXCLUDING, 0),
+		SURVIVOR_POLICY_EXCLUDING
+	);
+	assert_eq!(
+		compose_survivor_policy(SURVIVOR_POLICY, 7),
+		SURVIVOR_POLICY_AGED
+	);
+	assert_eq!(
+		compose_survivor_policy(SURVIVOR_POLICY_EXCLUDING, 7),
+		SURVIVOR_POLICY_EXCLUDING_AGED
+	);
+	let (mut state, _rsv, dec) = accepted_retired();
+	bind_window(&mut state, WINDOW_MS);
+	let clock = decisions(&state).clock_ms();
+	let floor = cut(WINDOW_MS, clock, clock - WINDOW_MS);
+	for policy in [
+		SURVIVOR_POLICY,
+		SURVIVOR_POLICY_EXCLUDING,
+		SURVIVOR_POLICY_EXCLUDING_AGED,
+		5,
+	] {
+		let wrong = generations::Target {
+			survivor_policy: policy,
+			retention: floor,
+			..target(&state, 1, dec, 0)
+		};
+		let before = state.decisions.clone();
+		assert_eq!(
+			decide(&mut state, DecisionCommand::ProposeTarget { target: wrong }),
+			refused(DecisionRefusal::StaleGeneration),
+			"policy {policy} with a floor"
+		);
+		assert_eq!(state.decisions, before, "policy {policy} changed nothing");
+	}
+	// The leader's own target with a raised floor carries policy 3.
+	let raised = generations::next_target(&state, peek_index(), Some(clock)).expect("it erases");
+	assert_eq!(raised.retention, floor);
+	assert_eq!(raised.survivor_policy, SURVIVOR_POLICY_AGED);
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::ProposeTarget { target: raised }
+		),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	// Without a floor the base policy stands.
+	let (state, _rsv, _dec) = accepted_retired();
+	let plain = generations::next_target(&state, peek_index(), None).expect("it erases");
+	assert_eq!(plain.survivor_policy, SURVIVOR_POLICY);
+}
+
+/// Wendelon ADR 0122 D2: an assembled (opened or installed) state whose pending target does
+/// not carry the policy its cut and floor compose is refused.
+#[test]
+fn an_installed_pending_target_must_carry_its_composed_policy() {
+	let (w, clock) = (WINDOW_MS, 1_000_000);
+	let good = cut(w, clock, clock - w);
+	let state = retention_state(Some(w), clock, Some(good), None, Some(good));
+	crate::consensus::raft_storage::validate_assembled_state(&state).unwrap();
+	let mut wrong = state.clone();
+	{
+		let pending = wrong
+			.decisions
+			.as_mut()
+			.unwrap()
+			.generations
+			.pending
+			.as_mut()
+			.unwrap();
+		pending.target.survivor_policy = generations::SURVIVOR_POLICY;
+		pending.digest = generations::target_digest(&pending.target);
+	}
+	assert!(crate::consensus::raft_storage::validate_assembled_state(&wrong).is_err());
 }
 
 /// D3: a target that erases something raises the floor when the leader's sample lets it advance
@@ -5792,7 +5884,11 @@ pub(crate) fn retention_state(
 			predecessor_gid: decisions.generations.current_gid(),
 			members,
 			chunk_bits: generations::CHUNK_BITS,
-			survivor_policy: generations::SURVIVOR_POLICY,
+			// Wendelon ADR 0122 D2: the policy its floor composes.
+			survivor_policy: generations::compose_survivor_policy(
+				generations::SURVIVOR_POLICY,
+				retention.floor_ms,
+			),
 			retention,
 		};
 		decisions.generations.next_gid += 1;

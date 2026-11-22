@@ -106,7 +106,7 @@ async fn certified(rows: i64) -> Certified {
 
 /// T's drop: the real Prepare, then the logical finalize; returns its
 /// operation id and F, the finalize's index.
-async fn drop_logically(
+pub(super) async fn drop_logically(
 	cluster: &Cluster,
 	table_t: &TableSchemaDescriptor,
 ) -> (crate::integration::compute::DropOperationId, u64) {

@@ -2761,6 +2761,25 @@ impl SlabManager {
 	}
 
 	/// `tiered_rows_from_plaintext_with_evidence` within `scratch`'s bound.
+	/// Test-only (wendelon ADR 0122, Codex 01a20151 R2): the row identities `pointer`'s object
+	/// physically holds, fetched from L2 and decoded exactly as a publication decodes it (the
+	/// validated plaintext, its record walk, and each frame's rows).
+	#[cfg(test)]
+	pub(crate) async fn tiered_object_identities_for_test(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<Vec<crate::schema::Identity>> {
+		let plaintext = self.tiered_plaintext_from_l2(pointer).await?;
+		let view = plaintext.view()?;
+		let entries =
+			crate::storage::core::recover_slab_entries_from_blob(view, &plaintext.record_offsets)?;
+		let mut rows = Vec::new();
+		for frame in crate::storage::core::recovered_frames(&entries) {
+			self.persistent_rows_from_recovered_frame(view, frame, &mut rows)?;
+		}
+		Ok(rows.into_iter().map(|row| row.key_identity).collect())
+	}
+
 	pub(super) fn tiered_rows_within(
 		&self,
 		plaintext: SlabView<'_>,

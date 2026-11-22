@@ -1891,6 +1891,17 @@ impl WendelonDataServer {
 		}
 	}
 
+	/// Test-only (wendelon ADR 0122): pauses or resumes this node's generation steps
+	/// (targets and commits).
+	#[cfg(test)]
+	pub(crate) fn pause_generations_for_test(&self, paused: bool) {
+		if let Some(proposals) = &self.decisions.proposals {
+			proposals
+				.generations_paused
+				.store(paused, std::sync::atomic::Ordering::Release);
+		}
+	}
+
 	/// Test-only: the lease ranges this node holds now, as a holder sees them
 	/// (`(low, high, epoch)`).
 	#[cfg(test)]

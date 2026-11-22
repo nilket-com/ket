@@ -1311,6 +1311,7 @@ async fn a_promoted_replacement_stores_and_reopens_a_recovered_base() {
 	];
 	let certificate = StagedCandidate {
 		oldest_visible: None,
+		aged: None,
 		gid: 5,
 		target_digest: [0x06; 32],
 		predecessor_gid: 4,
@@ -3079,6 +3080,7 @@ async fn an_installed_recovered_base_with_another_cut_does_not_record() {
 	let index = slab.persistent_index().unwrap();
 	let staged = StagedCandidate {
 		oldest_visible: None,
+		aged: None,
 		gid: certificate.gid,
 		target_digest: certificate.target_digest,
 		predecessor_gid: certificate.predecessor_gid,

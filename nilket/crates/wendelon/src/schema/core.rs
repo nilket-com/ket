@@ -2643,7 +2643,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0121: 34, whose decision state binds a retention window and
 /// whose targets and certificates carry its cut (33 was wendelon ADR 0120's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 34;
+///
+/// Wendelon ADR 0122: 35, whose pending targets may carry the aged survivor
+/// policies (34 was wendelon ADR 0121's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 35;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2711,7 +2714,10 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0121: 34. The retention binding and retention cuts apply; an
 /// earlier log is refused whole (33 was wendelon ADR 0120's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 34;
+///
+/// Wendelon ADR 0122: 35. A target with the aged survivor policies applies; an
+/// earlier log is refused whole (34 was wendelon ADR 0121's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 35;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

@@ -857,6 +857,10 @@ pub struct DecisionProposals {
 	/// control can drive Recover, Conclude and the owner's own Publish itself.
 	#[cfg(test)]
 	pub(crate) ctas_maintenance_paused: std::sync::atomic::AtomicBool,
+	/// Test-only (wendelon ADR 0122): pauses the leader's generation steps, so a
+	/// control can move the clock to a chosen point before the next target samples it.
+	#[cfg(test)]
+	pub(crate) generations_paused: std::sync::atomic::AtomicBool,
 }
 
 /// Test-only (ADR 0707): holds the leader's handling of the next forwarded
@@ -937,6 +941,8 @@ impl DecisionProposals {
 			forwarded_hold: std::sync::Mutex::new(None),
 			#[cfg(test)]
 			ctas_maintenance_paused: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			generations_paused: std::sync::atomic::AtomicBool::new(false),
 		}
 	}
 
@@ -1706,6 +1712,13 @@ impl<'a> MaintenanceProposals<'a> {
 		let proposals = self.proposals;
 		if proposals.mode != DecisionMode::ParentDecisions
 			|| proposals.leader_slot().await != Some(proposals.local.id)
+		{
+			return None;
+		}
+		#[cfg(test)]
+		if proposals
+			.generations_paused
+			.load(std::sync::atomic::Ordering::Acquire)
 		{
 			return None;
 		}

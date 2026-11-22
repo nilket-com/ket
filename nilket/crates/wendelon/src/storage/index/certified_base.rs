@@ -34,6 +34,90 @@ pub(super) const BASE_RECOVERY_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(super) const CLEANUP_DEBT_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("cleanup_debt_v1");
 
+/// Wendelon ADR 0122 D3: the winners a staged candidate omitted by age, keyed by
+/// their debt key, each its full base entry (key, HLC, digest and kind). Staged and
+/// cleared with the candidate's own rows; never replicated.
+pub(super) const BASE_AGED_STAGED_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("base_aged_staged_v1");
+
+/// Wendelon ADR 0122 D3: the count and canonical digest of a candidate's aged
+/// omissions, staged with its metadata and re-proved before restaging, signing and
+/// activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgedEvidence {
+	pub count: u64,
+	pub digest: [u8; 32],
+}
+
+/// Wendelon ADR 0122 D3: the evidence of `aged`: every entry's debt key, digest and
+/// kind, in debt-key order.
+pub fn aged_evidence(aged: &[BaseEntry]) -> AgedEvidence {
+	let mut keyed: Vec<([u8; 72], &BaseEntry)> =
+		aged.iter().map(|entry| (aged_key(entry), entry)).collect();
+	keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+	let mut hasher = blake3::Hasher::new_derive_key("wendelon aged evidence v1");
+	for (key, entry) in &keyed {
+		hasher.update(key);
+		hasher.update(&entry.row_digest);
+		hasher.update(&[u8::from(entry.tombstone)]);
+	}
+	AgedEvidence {
+		count: keyed.len() as u64,
+		digest: *hasher.finalize().as_bytes(),
+	}
+}
+
+/// Wendelon ADR 0122 D3: replaces the staged aged rows with `aged`, in `tx`,
+/// after checking that they reproduce `expected` (`None`: no aged component, so
+/// none). A mismatch or a repeated key refuses and writes nothing.
+fn write_aged(
+	tx: &redb::WriteTransaction,
+	aged: &[BaseEntry],
+	expected: Option<AgedEvidence>,
+) -> std::io::Result<Result<(), StageRefusal>> {
+	let matches = match expected {
+		None => aged.is_empty(),
+		Some(expected) => aged_evidence(aged) == expected,
+	};
+	if !matches {
+		return Ok(Err(StageRefusal::Conflicting));
+	}
+	let mut table = tx.open_table(BASE_AGED_STAGED_TABLE).map_err(redb_to_io)?;
+	table.retain(|_, _| false).map_err(redb_to_io)?;
+	for entry in aged {
+		if table
+			.insert(aged_key(entry).as_slice(), encode(entry)?.as_slice())
+			.map_err(redb_to_io)?
+			.is_some()
+		{
+			return Ok(Err(StageRefusal::DuplicateKey));
+		}
+	}
+	Ok(Ok(()))
+}
+
+/// Wendelon ADR 0122 D3: the staged aged rows, as stored.
+fn read_aged(tx: &redb::WriteTransaction) -> std::io::Result<Vec<BaseEntry>> {
+	let table = tx.open_table(BASE_AGED_STAGED_TABLE).map_err(redb_to_io)?;
+	let mut aged = Vec::new();
+	for row in table.iter().map_err(redb_to_io)? {
+		let (_, value) = row.map_err(redb_to_io)?;
+		aged.push(decode_entry(value.value())?);
+	}
+	Ok(aged)
+}
+
+/// The debt key an aged entry's debt would carry.
+fn aged_key(entry: &BaseEntry) -> [u8; 72] {
+	VersionKey {
+		tenant: entry.tenant,
+		table: entry.table,
+		key_identity: entry.key_identity,
+		hlc: entry.hlc,
+	}
+	.debt_bytes()
+}
+
 /// One version's identity: tenant, table, key and full HLC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VersionKey {
@@ -126,6 +210,11 @@ pub struct DebtRecord {
 	/// The retired content's digest, from the manifest or the base entry.
 	pub row_digest: [u8; 32],
 	pub source: DebtSource,
+	/// Wendelon ADR 0122 D3: the version left its base by age: its full key,
+	/// digest and kind are in the activated candidate's verified aged evidence.
+	/// Attribution only; the source, its producer stripe and the survivor rule are
+	/// unchanged.
+	pub aged: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +382,9 @@ pub struct StagedCandidate {
 	/// entries at or above its target's floor, staged with the chunks so a
 	/// reopened member reports the same value.
 	pub oldest_visible: Option<crate::schema::HybridTimestamp>,
+	/// Wendelon ADR 0122 D3: the evidence of the winners its build omitted by age,
+	/// staged in `base_aged_staged_v1`; `None` when its policy omits nothing by age.
+	pub aged: Option<AgedEvidence>,
 }
 
 /// The base's durable metadata.
@@ -326,6 +418,10 @@ pub enum ActivateRefusal {
 	/// stripe its fence does not hold (one begun after the fence's read).
 	/// Nothing changed; retryable.
 	ProducerUnfenced,
+	/// Wendelon ADR 0122 D3: the staged aged rows do not reproduce the staged
+	/// candidate's aged evidence (count and canonical digest). Nothing installed,
+	/// labelled or cleared: the old base, debt and staging stay.
+	AgedEvidenceMismatch,
 }
 
 /// What activation checks the staged candidate against.
@@ -656,6 +752,7 @@ impl PersistentLocalIndex {
 		&self,
 		candidate: StagedCandidate,
 		entries: Vec<BaseEntry>,
+		aged: Vec<BaseEntry>,
 	) -> std::io::Result<Result<(), StageRefusal>> {
 		let _guard = self.write_lock.lock().await;
 		self.db
@@ -691,6 +788,11 @@ impl PersistentLocalIndex {
 					}
 				}
 				drop(staged);
+				// Wendelon ADR 0122 D3: the aged evidence, replaced with the rows (an
+				// empty set included), in this transaction.
+				if let Err(refusal) = write_aged(&tx, &aged, candidate.aged)? {
+					return Ok(Err(refusal));
+				}
 				meta.staged = Some(candidate);
 				meta_table
 					.insert(BASE_META_KEY, encode(&meta)?.as_slice())
@@ -1051,6 +1153,7 @@ impl PersistentLocalIndex {
 		&self,
 		candidate: StagedCandidate,
 		entries: Vec<BaseEntry>,
+		aged: Vec<BaseEntry>,
 	) -> std::io::Result<Result<(), StageRefusal>> {
 		let _guard = self.write_lock.lock().await;
 		self.db
@@ -1078,6 +1181,11 @@ impl PersistentLocalIndex {
 							return Ok(Err(StageRefusal::DuplicateKey));
 						}
 					}
+				}
+				// Wendelon ADR 0122 D3: the rebuilt aged evidence, which must reproduce
+				// the staged evidence, restored with the rows.
+				if let Err(refusal) = write_aged(&tx, &aged, candidate.aged)? {
+					return Ok(Err(refusal));
 				}
 				tx.commit().map_err(redb_to_io)?;
 				Ok(Ok(()))
@@ -1183,6 +1291,21 @@ impl PersistentLocalIndex {
 				if chunk_sums(&entries) != activation.chunks {
 					return Ok(Err(ActivateRefusal::StagedRowsMismatch));
 				}
+				// Wendelon ADR 0122 D3: the actual staged aged rows must reproduce the
+				// staged evidence before any debt is labelled or evidence cleared; else
+				// nothing changes (the old base, debt and staging stay).
+				let aged_rows = read_aged(&tx)?;
+				let aged_ok = match meta.staged.as_ref().and_then(|staged| staged.aged) {
+					None => aged_rows.is_empty(),
+					Some(expected) => aged_evidence(&aged_rows) == expected,
+				};
+				if !aged_ok {
+					return Ok(Err(ActivateRefusal::AgedEvidenceMismatch));
+				}
+				let aged_index: std::collections::HashMap<[u8; 72], ([u8; 32], bool)> = aged_rows
+					.iter()
+					.map(|entry| (aged_key(entry), (entry.row_digest, entry.tombstone)))
+					.collect();
 				// ADR 0699 S5b: the previous base, whose displaced entries
 				// become debt.
 				let displaced: Vec<BaseEntry> = {
@@ -1206,6 +1329,10 @@ impl PersistentLocalIndex {
 				{
 					let mut staged = tx.open_table(BASE_STAGED_TABLE).map_err(redb_to_io)?;
 					staged.retain(|_, _| false).map_err(redb_to_io)?;
+					// Wendelon ADR 0122 D3: the aged evidence goes with the staging; the
+					// index above was read from it first.
+					let mut aged = tx.open_table(BASE_AGED_STAGED_TABLE).map_err(redb_to_io)?;
+					aged.retain(|_, _| false).map_err(redb_to_io)?;
 				}
 				// ADR 0699 S5b: the new base's entries by key, for the debt the
 				// activation records below.
@@ -1224,19 +1351,25 @@ impl PersistentLocalIndex {
 						.get(&entry.key())
 						.is_none_or(|new| new.hlc != entry.hlc || new.tombstone != entry.tombstone);
 					if replaced {
+						let key = VersionKey {
+							tenant: entry.tenant,
+							table: entry.table,
+							key_identity: entry.key_identity,
+							hlc: entry.hlc,
+						};
+						// Wendelon ADR 0122 D3: aged iff the verified evidence holds this
+						// exact version: key, digest and kind.
+						let aged = aged_index.get(&key.debt_bytes())
+							== Some(&(entry.row_digest, entry.tombstone));
 						record_debt(
-							VersionKey {
-								tenant: entry.tenant,
-								table: entry.table,
-								key_identity: entry.key_identity,
-								hlc: entry.hlc,
-							},
+							key,
 							DebtRecord {
 								gid: activation.gid,
 								row_digest: entry.row_digest,
 								source: DebtSource::DisplacedBase {
 									tombstone: entry.tombstone,
 								},
+								aged,
 							},
 						)?;
 					}
@@ -1280,13 +1413,23 @@ impl PersistentLocalIndex {
 								))
 								.is_some_and(|entry| entry.hlc == version.hlc);
 							if owned_here && !winner {
+								let key = VersionKey {
+									tenant: intent.tenant,
+									table: version.table,
+									key_identity: version.key_identity,
+									hlc: version.hlc,
+								};
+								// Wendelon ADR 0122 D3: aged iff the verified evidence
+								// holds this exact version. An intent version's kind
+								// follows from its digest (a typed tombstone has its own
+								// digest), so key and digest equality is full equality; a
+								// refused intent whose content differs at the same key is
+								// not credited. The source and its stripe are kept.
+								let aged = aged_index
+									.get(&key.debt_bytes())
+									.is_some_and(|(digest, _)| *digest == version.row_digest);
 								record_debt(
-									VersionKey {
-										tenant: intent.tenant,
-										table: version.table,
-										key_identity: version.key_identity,
-										hlc: version.hlc,
-									},
+									key,
 									DebtRecord {
 										gid: activation.gid,
 										row_digest: version.row_digest,
@@ -1294,6 +1437,7 @@ impl PersistentLocalIndex {
 											rsv: intent.rsv,
 											ordinal: intent.ordinal,
 										},
+										aged,
 									},
 								)?;
 							}
@@ -1585,6 +1729,44 @@ impl PersistentLocalIndex {
 			.await
 	}
 
+	/// Test-only (wendelon ADR 0122 D3): the staged aged rows, as stored.
+	pub(crate) async fn aged_staged_for_test(&self) -> std::io::Result<Vec<BaseEntry>> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let rows = read_aged(&tx)?;
+				tx.abort().map_err(redb_to_io)?;
+				Ok(rows)
+			})
+			.await
+	}
+
+	/// Test-only (wendelon ADR 0122 D3): changes one staged aged row's digest,
+	/// offline, leaving the staged candidate's metadata as it is.
+	pub(crate) async fn tamper_aged_staged_for_test(&self) -> std::io::Result<()> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx.open_table(BASE_AGED_STAGED_TABLE).map_err(redb_to_io)?;
+					let (key, mut entry) = {
+						let mut rows = table.iter().map_err(redb_to_io)?;
+						let (key, value) = rows
+							.next()
+							.ok_or_else(|| Error::other("no staged aged row"))?
+							.map_err(redb_to_io)?;
+						(key.value().to_vec(), decode_entry(value.value())?)
+					};
+					entry.row_digest[0] ^= 0xFF;
+					table
+						.insert(key.as_slice(), encode(&entry)?.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
 	/// Test-only (wendelon ADR 0121 R2): rewrites only the staged candidate's
 	/// least visible row, offline, leaving its rows, chunks and digests.
 	pub(crate) async fn set_staged_oldest_for_test(
@@ -1639,6 +1821,7 @@ mod tests {
 	fn candidate(gid: u64, predecessor_gid: u64, entries: &[BaseEntry]) -> StagedCandidate {
 		StagedCandidate {
 			oldest_visible: None,
+			aged: None,
 			gid,
 			target_digest: [gid as u8; 32],
 			predecessor_gid,
@@ -1663,7 +1846,7 @@ mod tests {
 		let entries = vec![entry(1, 5, 0), entry(2, 6, 7)];
 		let staged = candidate(1, 0, &entries);
 		index
-			.stage_base(staged.clone(), entries.clone())
+			.stage_base(staged.clone(), entries.clone(), Vec::new())
 			.await
 			.unwrap()
 			.unwrap();
@@ -1699,7 +1882,7 @@ mod tests {
 		// A rebuild with other evidence is refused and changes nothing.
 		assert_eq!(
 			index
-				.restage_base(staged.clone(), vec![entry(1, 5, 0)])
+				.restage_base(staged.clone(), vec![entry(1, 5, 0)], Vec::new())
 				.await
 				.unwrap(),
 			Err(StageRefusal::Conflicting)
@@ -1707,7 +1890,7 @@ mod tests {
 		assert!(!index.staged_rows_match().await.unwrap());
 		// A rebuild that reproduces the staged evidence restores its rows.
 		index
-			.restage_base(staged.clone(), entries.clone())
+			.restage_base(staged.clone(), entries.clone(), Vec::new())
 			.await
 			.unwrap()
 			.unwrap();
@@ -1773,7 +1956,7 @@ mod tests {
 	) {
 		let staged = candidate(gid, predecessor, &entries);
 		index
-			.stage_base(staged.clone(), entries)
+			.stage_base(staged.clone(), entries, Vec::new())
 			.await
 			.unwrap()
 			.unwrap();
@@ -1948,6 +2131,216 @@ mod tests {
 			.unwrap();
 	}
 
+	/// Wendelon ADR 0122 D3: stages `entries` with `aged` as gid 2 over gid 1.
+	async fn stage_aged(
+		index: &PersistentLocalIndex,
+		entries: Vec<BaseEntry>,
+		aged: Vec<BaseEntry>,
+	) -> StagedCandidate {
+		let staged = StagedCandidate {
+			aged: Some(aged_evidence(&aged)),
+			..candidate(2, 1, &entries)
+		};
+		index
+			.stage_base(staged.clone(), entries, aged)
+			.await
+			.unwrap()
+			.unwrap();
+		staged
+	}
+
+	fn activation_of(staged: &StagedCandidate, t: u64) -> Activation {
+		Activation {
+			gid: staged.gid,
+			target_digest: staged.target_digest,
+			predecessor_gid: staged.predecessor_gid,
+			chunks: staged.chunks.clone(),
+			t,
+		}
+	}
+
+	fn as_entry(version: &OwnedVersion) -> BaseEntry {
+		BaseEntry {
+			tenant: TENANT,
+			table: version.table,
+			key_identity: version.key_identity,
+			hlc: version.hlc,
+			row_digest: version.row_digest,
+			tombstone: false,
+			position: 0,
+		}
+	}
+
+	/// Wendelon ADR 0122 D3: activation labels debt aged exactly from its verified
+	/// evidence, by full key, digest and kind. An inherited aged entry (displaced) and an
+	/// aged intent winner are aged; an unrelated losing version of the same table and a
+	/// refused version at an evidence key with another digest are not credited (their
+	/// `RetiredIntent` source is kept); a kept entry owes nothing.
+	#[tokio::test]
+	async fn activation_labels_aged_debt_exactly_from_its_verified_evidence() {
+		let (_dir, index) = open("aged-labels").await;
+		let inherited = entry(3, 1, 0);
+		let kept = entry(6, 9, 0);
+		activate(&index, 1, 0, 0, vec![inherited, kept]).await;
+		let winner = owned(1, 2, 0x11);
+		let loser = owned(2, 2, 0x22);
+		begin(&index, 5, vec![winner, loser]).await;
+		let refused = owned(9, 4, 0x77);
+		begin(&index, 7, vec![refused]).await;
+		let other_content = BaseEntry {
+			row_digest: [0x99; 32],
+			..as_entry(&refused)
+		};
+		let aged = vec![inherited, as_entry(&winner), other_content];
+		let staged = stage_aged(&index, vec![kept], aged.clone()).await;
+		assert_eq!(index.aged_staged_for_test().await.unwrap().len(), 3);
+		index
+			.activate_base(
+				activation_of(&staged, 8),
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
+			.await
+			.unwrap()
+			.unwrap();
+		let debt = index.debt_page(None, 100).await.unwrap();
+		let label = |key: VersionKey| {
+			debt.iter()
+				.find(|(listed, _)| *listed == key)
+				.map(|(_, record)| (record.source, record.aged))
+		};
+		let inherited_key = VersionKey {
+			tenant: TENANT,
+			table: inherited.table,
+			key_identity: inherited.key_identity,
+			hlc: inherited.hlc,
+		};
+		assert_eq!(
+			label(inherited_key),
+			Some((DebtSource::DisplacedBase { tombstone: false }, true))
+		);
+		assert_eq!(
+			label(version_key(&winner)),
+			Some((DebtSource::RetiredIntent { rsv: 5, ordinal: 0 }, true))
+		);
+		assert_eq!(
+			label(version_key(&loser)),
+			Some((DebtSource::RetiredIntent { rsv: 5, ordinal: 0 }, false)),
+			"an unrelated loser is not aged"
+		);
+		assert_eq!(
+			label(version_key(&refused)),
+			Some((DebtSource::RetiredIntent { rsv: 7, ordinal: 0 }, false)),
+			"another digest at an evidence key is not credited"
+		);
+		assert_eq!(
+			debt.iter().filter(|(_, record)| record.aged).count(),
+			2,
+			"exactly the aged versions"
+		);
+		assert!(
+			index.aged_staged_for_test().await.unwrap().is_empty(),
+			"the evidence goes with the staging"
+		);
+	}
+
+	/// Wendelon ADR 0122 D3, the committed path: a staged aged row changed under unchanged
+	/// metadata refuses the activation before anything is labelled or cleared; the old base,
+	/// the debt and the staging (rows and evidence) stay.
+	#[tokio::test]
+	async fn changed_aged_evidence_refuses_the_activation_and_changes_nothing() {
+		let (_dir, index) = open("aged-committed").await;
+		let inherited = entry(3, 1, 0);
+		let kept = entry(6, 9, 0);
+		activate(&index, 1, 0, 0, vec![inherited, kept]).await;
+		let staged = stage_aged(&index, vec![kept], vec![inherited]).await;
+		index.tamper_aged_staged_for_test().await.unwrap();
+		let (meta, base, debt, aged) = (
+			index.base_meta().await.unwrap(),
+			index.base_entries(false).await.unwrap(),
+			index.debt_page(None, 100).await.unwrap(),
+			index.aged_staged_for_test().await.unwrap(),
+		);
+		assert_eq!(
+			index
+				.activate_base(
+					activation_of(&staged, 8),
+					crate::network::data_server::child_writes::ProducerFence::uncontended_for_test(
+					)
+					.await,
+				)
+				.await
+				.unwrap(),
+			Err(ActivateRefusal::AgedEvidenceMismatch)
+		);
+		assert_eq!(index.base_meta().await.unwrap(), meta, "the staging stays");
+		assert_eq!(
+			index.base_entries(false).await.unwrap(),
+			base,
+			"the old base stays"
+		);
+		assert_eq!(
+			index.debt_page(None, 100).await.unwrap(),
+			debt,
+			"no debt written"
+		);
+		assert_eq!(
+			index.aged_staged_for_test().await.unwrap(),
+			aged,
+			"the evidence stays"
+		);
+		assert!(index.staged_rows_match().await.unwrap());
+	}
+
+	/// Wendelon ADR 0122 D3: staging a newer gid replaces a superseded one's aged evidence
+	/// atomically, an empty set included; a restage must reproduce the staged evidence.
+	#[tokio::test]
+	async fn staging_replaces_aged_evidence_and_a_restage_must_reproduce_it() {
+		let (_dir, index) = open("aged-restage").await;
+		let inherited = entry(3, 1, 0);
+		let kept = entry(6, 9, 0);
+		activate(&index, 1, 0, 0, vec![inherited, kept]).await;
+		let staged = stage_aged(&index, vec![kept], vec![inherited]).await;
+		// A rebuild whose omission differs is refused, and changes nothing.
+		assert_eq!(
+			index
+				.restage_base(staged.clone(), vec![kept], Vec::new())
+				.await
+				.unwrap(),
+			Err(StageRefusal::Conflicting)
+		);
+		assert_eq!(index.aged_staged_for_test().await.unwrap(), vec![inherited]);
+		// The same rebuild restores it.
+		index
+			.restage_base(staged.clone(), vec![kept], vec![inherited])
+			.await
+			.unwrap()
+			.unwrap();
+		// A newer gid with no aged omission replaces the evidence: empty.
+		let newer = StagedCandidate {
+			aged: Some(aged_evidence(&[])),
+			..candidate(3, 1, &[inherited, kept])
+		};
+		index
+			.stage_base(newer, vec![inherited, kept], Vec::new())
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(index.aged_staged_for_test().await.unwrap().is_empty());
+		// Evidence that does not match its metadata is never staged.
+		let lying = StagedCandidate {
+			aged: Some(aged_evidence(&[])),
+			..candidate(4, 1, &[kept])
+		};
+		assert_eq!(
+			index
+				.stage_base(lying, vec![kept], vec![inherited])
+				.await
+				.unwrap(),
+			Err(StageRefusal::Conflicting)
+		);
+	}
+
 	#[test]
 	fn chunk_sums_cover_every_chunk_and_depend_on_content() {
 		let empty = chunk_sums(std::iter::empty());
@@ -1972,34 +2365,34 @@ mod tests {
 		// Built on a predecessor that is not active: refused.
 		assert_eq!(
 			index
-				.stage_base(candidate(2, 1, &entries), entries.clone())
+				.stage_base(candidate(2, 1, &entries), entries.clone(), Vec::new())
 				.await
 				.unwrap(),
 			Err(StageRefusal::PredecessorMoved)
 		);
 		// Target 3 staged first; a late worker for abandoned target 2 is refused.
 		index
-			.stage_base(candidate(3, 0, &entries), entries.clone())
+			.stage_base(candidate(3, 0, &entries), entries.clone(), Vec::new())
 			.await
 			.unwrap()
 			.unwrap();
 		assert_eq!(
 			index
-				.stage_base(candidate(2, 0, &entries), entries.clone())
+				.stage_base(candidate(2, 0, &entries), entries.clone(), Vec::new())
 				.await
 				.unwrap(),
 			Err(StageRefusal::Superseded)
 		);
 		// The same candidate again is idempotent; a different one conflicts.
 		index
-			.stage_base(candidate(3, 0, &entries), entries.clone())
+			.stage_base(candidate(3, 0, &entries), entries.clone(), Vec::new())
 			.await
 			.unwrap()
 			.unwrap();
 		let fewer = vec![entry(1, 10, 0)];
 		assert_eq!(
 			index
-				.stage_base(candidate(3, 0, &fewer), fewer)
+				.stage_base(candidate(3, 0, &fewer), fewer, Vec::new())
 				.await
 				.unwrap(),
 			Err(StageRefusal::Conflicting)
@@ -2039,7 +2432,7 @@ mod tests {
 		let entries = vec![entry(1, 5, 0)];
 		let staged = candidate(1, 0, &entries);
 		index
-			.stage_base(staged.clone(), entries.clone())
+			.stage_base(staged.clone(), entries.clone(), Vec::new())
 			.await
 			.unwrap()
 			.unwrap();
@@ -2448,7 +2841,7 @@ mod tests {
 		begin(&index, 3, vec![cut_version(30)]).await;
 		let staged = candidate(1, 0, &[]);
 		index
-			.stage_base(staged.clone(), Vec::new())
+			.stage_base(staged.clone(), Vec::new(), Vec::new())
 			.await
 			.unwrap()
 			.unwrap();

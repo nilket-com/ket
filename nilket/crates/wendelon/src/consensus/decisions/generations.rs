@@ -25,6 +25,39 @@ pub const SURVIVOR_POLICY: u8 = 1;
 /// outcome was finalized at or before the target's cut is excluded. Carried by a
 /// target iff such an outcome exists; test-admitted only until enablement.
 pub const SURVIVOR_POLICY_EXCLUDING: u8 = 2;
+/// Wendelon ADR 0122 D2: policy 1, then every governed winner strictly below the
+/// target's signed retention floor omitted. Carried iff the target's floor is
+/// above 0.
+pub const SURVIVOR_POLICY_AGED: u8 = 3;
+/// Wendelon ADR 0122 D2: policy 2 (ADR 0115's exclusion), then the age omission.
+pub const SURVIVOR_POLICY_EXCLUDING_AGED: u8 = 4;
+
+/// Wendelon ADR 0122 D2: the signed survivor policy of a target whose cut's
+/// base policy is `base` (1 or 2) and whose floor is `floor_ms`: the aged
+/// component exactly when the floor is above 0.
+pub fn compose_survivor_policy(base: u8, floor_ms: u64) -> u8 {
+	match (base, floor_ms > 0) {
+		(SURVIVOR_POLICY_EXCLUDING, true) => SURVIVOR_POLICY_EXCLUDING_AGED,
+		(_, true) => SURVIVOR_POLICY_AGED,
+		(base, false) => base,
+	}
+}
+
+/// Wendelon ADR 0122 D2: whether a policy excludes ADR 0115's dropped tables.
+pub fn policy_excludes_drops(policy: u8) -> bool {
+	matches!(
+		policy,
+		SURVIVOR_POLICY_EXCLUDING | SURVIVOR_POLICY_EXCLUDING_AGED
+	)
+}
+
+/// Wendelon ADR 0122 D2: whether a policy omits aged governed winners.
+pub fn policy_omits_aged(policy: u8) -> bool {
+	matches!(
+		policy,
+		SURVIVOR_POLICY_AGED | SURVIVOR_POLICY_EXCLUDING_AGED
+	)
+}
 pub const CHUNK_BITS: u8 = 8;
 
 /// Wendelon ADR 0121 D3: the least advance of a retention floor that an
@@ -228,8 +261,11 @@ pub(super) fn propose_target(
 		|| target.t >= log_index
 		|| target.t <= generations.fr()
 		|| target.chunk_bits != CHUNK_BITS
-		|| target.survivor_policy != state.survivor_policy_with(&decisions.ctas, target.t)
-		|| current_members(state).as_ref() != Some(&target.members)
+		|| target.survivor_policy
+			!= compose_survivor_policy(
+				state.survivor_policy_with(&decisions.ctas, target.t),
+				target.retention.floor_ms,
+			) || current_members(state).as_ref() != Some(&target.members)
 	{
 		return Err(StaleGeneration);
 	}
@@ -549,7 +585,11 @@ pub(crate) fn next_target(state: &SmState, applied: u64, now_ms: Option<u64>) ->
 		predecessor_gid: generations.current_gid(),
 		members: current_members(state)?,
 		chunk_bits: CHUNK_BITS,
-		survivor_policy: state.survivor_policy_with(&decisions.ctas, t),
+		// Wendelon ADR 0122 D2: the age omission is a signed policy component.
+		survivor_policy: compose_survivor_policy(
+			state.survivor_policy_with(&decisions.ctas, t),
+			retention.floor_ms,
+		),
 		retention,
 	})
 }

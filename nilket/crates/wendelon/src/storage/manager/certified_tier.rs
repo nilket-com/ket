@@ -23,6 +23,126 @@ use crate::storage::manager::certified_lsm::{
 	CertifiedSelection, DropSummary, FrameTable, canonical_drop, frame_tables_of,
 };
 
+/// Wendelon ADR 0122 D4: the effect a certified tier job's own operation makes, which its
+/// count must find in force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgedL2Effect {
+	/// A certified `Tier`: the fresh candidate object it publishes.
+	Tier(String),
+	/// A certified `Retire` of the slab.
+	Retire,
+}
+
+/// Wendelon ADR 0122 D4: aged occurrences, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgedRows {
+	pub(crate) data: u64,
+	pub(crate) tombstone: u64,
+}
+
+impl AgedRows {
+	pub(crate) fn is_empty(&self) -> bool {
+		self.data == 0 && self.tombstone == 0
+	}
+
+	#[cfg(test)]
+	fn add(&mut self, rows: AgedRows) {
+		self.data += rows.data;
+		self.tombstone += rows.tombstone;
+	}
+}
+
+impl SlabManager {
+	/// Wendelon ADR 0122 D4 (r2): the worker that submitted `op` records its aged rows once, at
+	/// the end of its own successful delivery, only when one coherent read of the canonical lease
+	/// shows `op` decided Applied under `digest` for its current owner and its own effect still in
+	/// force, and this store has installed it:
+	/// - `Tier`: the slab's committed pointer is exactly its fresh candidate, and so is the local
+	///   one;
+	/// - `Retire`: the retirement is in force and the slab is retired here.
+	/// An observer may have installed it first; the worker still counts it, once. Nothing is held
+	/// between calls: an error, a cancellation, a crash, a superseded or unresolved effect, or an
+	/// outcome no longer retained records nothing (an undercount, never an inflation). Returns
+	/// whether it recorded.
+	pub(crate) async fn record_aged_l2_if_applied(
+		&self,
+		slab_id: SlabId,
+		op: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		effect: &AgedL2Effect,
+		rows: AgedRows,
+	) -> bool {
+		if rows.is_empty() {
+			return false;
+		}
+		// This store's facts first (each under its own lock, released here), so the lease
+		// below is held for nothing but the canonical verdict (Codex 01a201b7).
+		let installed_here = match effect {
+			AgedL2Effect::Tier(uri) => self
+				.tier_pointer(slab_id)
+				.await
+				.is_some_and(|pointer| pointer.l2_uri == *uri),
+			AgedL2Effect::Retire => {
+				self.tier_pointer(slab_id).await.is_none()
+					&& self.retired_tier_slabs.contains(&slab_id)
+			}
+		};
+		let Ok(owner) = self.owner_ref() else {
+			return false;
+		};
+		let slab = owner.slab(slab_id);
+		let canonical = {
+			let Ok(Some(lease)) = self.canonical_tier_lease().await else {
+				return false;
+			};
+			lease.op_applied_for_current_owner(op, digest)
+				&& match effect {
+					AgedL2Effect::Tier(uri) => lease
+						.committed_tier(slab)
+						.is_some_and(|tier| tier.l2_uri == *uri),
+					AgedL2Effect::Retire => lease.retirement_in_force(slab),
+				}
+		};
+		let earned = canonical && installed_here;
+		if earned {
+			self.observe_aged_rows_pruned(AgedLevel::L2, rows);
+		}
+		earned
+	}
+
+	/// The one place an aged removal is recorded: the exported Section 8 series and, under
+	/// test, this store's own tally of exactly the same rows.
+	pub(crate) fn observe_aged_rows_pruned(&self, level: AgedLevel, rows: AgedRows) {
+		let metrics = crate::metrics::global();
+		match level {
+			AgedLevel::L1 => {
+				metrics.observe_storage_table_retention_l1_rows_pruned(rows.data, rows.tombstone)
+			}
+			AgedLevel::L2 => {
+				metrics.observe_storage_table_retention_l2_rows_pruned(rows.data, rows.tombstone)
+			}
+		}
+		#[cfg(test)]
+		self.continuity_test_holds.aged_pruned.lock().unwrap()[level as usize].add(rows);
+	}
+
+	/// Test-only (wendelon ADR 0122, Codex 01a20151 R3): the aged rows this store recorded, by
+	/// level: a store's own work, whatever other tests in this process record meanwhile.
+	#[cfg(test)]
+	pub(crate) fn aged_rows_pruned_for_test(&self, level: AgedLevel) -> AgedRows {
+		self.continuity_test_holds.aged_pruned.lock().unwrap()[level as usize]
+	}
+}
+
+/// Wendelon ADR 0122 D4: the level an aged removal is recorded at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgedLevel {
+	/// A local slab (S5b) or the certified LSM.
+	L1 = 0,
+	/// A tiered object (a certified `Tier` or `Retire`).
+	L2 = 1,
+}
+
 /// Why certified tiered cleanup is fenced on this store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CertifiedTierFence {
@@ -195,6 +315,47 @@ impl SlabManager {
 			return Err(Error::other(CertifiedTierCrash(at)));
 		}
 		Ok(())
+	}
+
+	/// Test-only (wendelon ADR 0122): the next certified tier step starts its visit over, so it
+	/// takes the lowest eligible slab.
+	pub(crate) fn restart_certified_tier_cursor_for_test(&self) {
+		self.certified_tier_cursor
+			.store(u64::MAX, std::sync::atomic::Ordering::Release);
+	}
+
+	/// Test-only (wendelon ADR 0122): parks the next certified tier step at `at` until the
+	/// returned release gets a permit; the first semaphore gets one when it is parked.
+	pub(crate) fn hold_next_certified_tier_step(
+		&self,
+		at: CertifiedTierCut,
+	) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let reached = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*self
+			.continuity_test_holds
+			.certified_tier_hold
+			.lock()
+			.unwrap() = Some((at, reached.clone(), release.clone()));
+		(reached, release)
+	}
+
+	async fn certified_tier_hold(&self, at: CertifiedTierCut) {
+		let held = {
+			let mut hold = self
+				.continuity_test_holds
+				.certified_tier_hold
+				.lock()
+				.unwrap();
+			match hold.as_ref() {
+				Some((cut, _, _)) if *cut == at => hold.take(),
+				_ => None,
+			}
+		};
+		if let Some((_, reached, release)) = held {
+			reached.add_permits(1);
+			let _ = release.acquire().await.map(|permit| permit.forget());
+		}
 	}
 }
 
@@ -663,6 +824,21 @@ impl SlabManager {
 			record.reclaim = selection.selects(entry);
 		}
 		self.keep_conflicting_versions(&mut records);
+		// Wendelon ADR 0122 D4: the aged occurrences this drop removes, by kind;
+		// registered under the job's own effect and recorded only by its delivery.
+		let aged = records.iter().zip(&job.entries).fold(
+			AgedRows::default(),
+			|mut aged, (record, entry)| {
+				if record.reclaim && selection.selects_aged(entry) {
+					if entry.location.is_tombstone {
+						aged.tombstone += 1;
+					} else {
+						aged.data += 1;
+					}
+				}
+				aged
+			},
+		);
 		let drop = certified_tier_drop(&records, &job.source_rows, &selection)?;
 		if drop.drop_count == 0 {
 			return Ok(CertifiedTierStep::NothingSelected(slab_id));
@@ -678,10 +854,10 @@ impl SlabManager {
 		};
 		if records.iter().all(|record| record.reclaim) {
 			return self
-				.propose_certified_retirement(&job, evidence, committer)
+				.propose_certified_retirement(&job, evidence, committer, aged)
 				.await;
 		}
-		self.propose_certified_rewrite(&job, &records, evidence, committer, table_schemas)
+		self.propose_certified_rewrite(&job, &records, evidence, committer, table_schemas, aged)
 			.await
 	}
 
@@ -692,6 +868,7 @@ impl SlabManager {
 		job: &TierCertifiedJob,
 		evidence: TierSelectionEvidence,
 		committer: &dyn TierCommitter,
+		aged: AgedRows,
 	) -> std::io::Result<CertifiedTierStep> {
 		let slab_id = job.slab_id();
 		committer.preflight(job.slab.owner()).await?;
@@ -711,14 +888,21 @@ impl SlabManager {
 			}
 			CertifiedTierAllocation::Allocated(allocation) => allocation.first,
 		};
-		let op = ticket.key();
+		let (op, digest) = (ticket.key(), ticket.digest());
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
 		crate::storage::sweeper::submit_tier_retirement(self, committer, &ticket).await?;
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::AfterAcceptance)?;
+		#[cfg(test)]
+		self.certified_tier_hold(CertifiedTierCut::AfterAcceptance)
+			.await;
 		self.retire_tiered_slab_at_snapshot_epoch(slab_id, observed_epoch)
 			.await?;
+		// Wendelon ADR 0122 D4: counted once, here, from this op's own verified effect
+		// (retired here or by the observer first).
+		self.record_aged_l2_if_applied(slab_id, op, digest, &AgedL2Effect::Retire, aged)
+			.await;
 		#[cfg(test)]
 		self.note_certified_retained_object(&job.source.l2_uri, job.source_bytes);
 		if Self::retain_superseded_l2_object(slab_id, &job.source.l2_uri, "superseded tier object")
@@ -739,6 +923,7 @@ impl SlabManager {
 		evidence: TierSelectionEvidence,
 		committer: &dyn TierCommitter,
 		table_schemas: &TableSchemaCatalog,
+		aged: AgedRows,
 	) -> std::io::Result<CertifiedTierStep> {
 		let slab_id = job.slab_id();
 		let owner = job.slab.owner();
@@ -862,7 +1047,7 @@ impl SlabManager {
 				// The reservation is released with its proposal.
 				CertifiedTierAllocation::GenerationMoved => Ok(None),
 				CertifiedTierAllocation::Allocated(allocation) => {
-					let op = allocation.first.key();
+					let (op, digest) = (allocation.first.key(), allocation.first.digest());
 					#[cfg(test)]
 					self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
 					crate::storage::sweeper::submit_tier_proposal(
@@ -872,13 +1057,13 @@ impl SlabManager {
 						allocation.first,
 					)
 					.await?;
-					Ok(Some(op))
+					Ok(Some((op, digest)))
 				}
 			}
 		}
 		.await;
-		let op = match submitted {
-			Ok(Some(op)) => op,
+		let (op, digest) = match submitted {
+			Ok(Some(applied)) => applied,
 			Ok(None) => {
 				self.record_tier_candidate_not_submitted(slab_id, &new_uri, length)
 					.await?;
@@ -899,6 +1084,9 @@ impl SlabManager {
 		};
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::AfterAcceptance)?;
+		#[cfg(test)]
+		self.certified_tier_hold(CertifiedTierCut::AfterAcceptance)
+			.await;
 		// Applied: the existing delivery path, unchanged.
 		let observed_epoch = self.capture_snapshot_epoch();
 		let (_, committed) = self.committed_certified_tier(slab_id).await?;
@@ -906,6 +1094,16 @@ impl SlabManager {
 			self.apply_tier_slab_at_snapshot_epoch(pointer, observed_epoch)
 				.await?;
 		}
+		// Wendelon ADR 0122 D4: counted once, here, from this op's own verified effect
+		// (installed here or by the observer first); superseded or unresolved, nothing.
+		self.record_aged_l2_if_applied(
+			slab_id,
+			op,
+			digest,
+			&AgedL2Effect::Tier(new_uri.clone()),
+			aged,
+		)
+		.await;
 		self.record_cleanup_replacement_published(slab_id, &job.source.l2_uri, &new_uri)
 			.await?;
 		#[cfg(test)]

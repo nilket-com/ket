@@ -37,6 +37,8 @@ pub struct CertifiedSelection {
 	job_fingerprint: [u8; 32],
 	/// The claimed inputs' durable rows digest (`lsm_input_rows_digest`).
 	input_rows_digest: [u8; 32],
+	/// Wendelon ADR 0122 D4: the members whose debt is labelled aged. Attribution only.
+	aged: std::collections::BTreeSet<CertifiedMemberKey>,
 }
 
 impl CertifiedSelection {
@@ -53,11 +55,14 @@ impl CertifiedSelection {
 				"the facts were not read for this job's versions",
 			));
 		}
+		let members = decide_members(job.entries(), job.frame_tables(), facts, evidence);
+		let aged = aged_members(&members, facts);
 		Ok(Self {
-			members: decide_members(job.entries(), job.frame_tables(), facts, evidence),
+			members,
 			active_gid: facts.active_gid(),
 			job_fingerprint: job.fingerprint(),
 			input_rows_digest: job.source_rows_digest(),
+			aged,
 		})
 	}
 
@@ -74,6 +79,12 @@ impl CertifiedSelection {
 	/// Whether the selection names this record's version.
 	pub(crate) fn selects(&self, record: &VersionEntry) -> bool {
 		self.members.contains_key(&member_key(record))
+	}
+
+	/// Wendelon ADR 0122 D4: whether the selection names this record's version and
+	/// its debt is labelled aged.
+	pub(crate) fn selects_aged(&self, record: &VersionEntry) -> bool {
+		self.aged.contains(&member_key(record))
 	}
 
 	/// The generation the facts were read under.
@@ -325,11 +336,13 @@ impl CertifiedSelection {
 			));
 		}
 		let members = decide_members(&job.entries, &job.frame_tables, facts, evidence);
+		let aged = aged_members(&members, facts);
 		Ok(Self {
 			members,
 			active_gid: facts.active_gid(),
 			job_fingerprint: job.fingerprint,
 			input_rows_digest: job.input_rows_digest,
+			aged,
 		})
 	}
 }
@@ -338,6 +351,31 @@ impl CertifiedSelection {
 /// tables), facts read for exactly their versions, and content evidence. See
 /// [`CertifiedSelection::decide`] for the rule. ADR 0704 applies it unchanged
 /// to a tiered slab's records.
+/// Wendelon ADR 0122 D4: the members whose debt (the one the member was decided on)
+/// is labelled aged.
+fn aged_members(
+	members: &BTreeMap<CertifiedMemberKey, TableObjectId>,
+	facts: &CoherentFacts,
+) -> std::collections::BTreeSet<CertifiedMemberKey> {
+	members
+		.keys()
+		.filter(|member| {
+			let reference = VersionRef {
+				tenant: member.0,
+				key_identity: *member.1.as_bytes(),
+				hlc: member.2,
+			};
+			facts
+				.candidates()
+				.binary_search(&reference)
+				.ok()
+				.and_then(|at| facts.get(at).debt.as_ref().map(|(_, debt)| debt.aged))
+				.unwrap_or(false)
+		})
+		.copied()
+		.collect()
+}
+
 pub(super) fn decide_members(
 	entries: &[VersionEntry],
 	frame_tables: &[FrameTable],
@@ -690,6 +728,22 @@ impl SlabManager {
 			)
 			.into());
 		}
+		// Wendelon ADR 0122 D4: the aged occurrences among the inputs the selection elides,
+		// recorded only once the install is Applied and delivered (an `Ok` outcome).
+		let (aged_data, aged_tombstone) =
+			job.entries
+				.iter()
+				.fold((0u64, 0u64), |(data, tombstone), entry| {
+					if selection.selects_aged(entry) {
+						if entry.location.is_tombstone {
+							(data, tombstone + 1)
+						} else {
+							(data + 1, tombstone)
+						}
+					} else {
+						(data, tombstone)
+					}
+				});
 		let LsmCertifiedJob {
 			mut plan,
 			_pins,
@@ -697,8 +751,19 @@ impl SlabManager {
 			..
 		} = job;
 		plan.elision = PlanElision::Certified(Arc::new(selection));
-		self.run_claimed_lsm_via_control_ring(worker, plan, committer, Some(context))
-			.await
+		let outcome = self
+			.run_claimed_lsm_via_control_ring(worker, plan, committer, Some(context))
+			.await;
+		if outcome.is_ok() && (aged_data > 0 || aged_tombstone > 0) {
+			self.observe_aged_rows_pruned(
+				super::certified_tier::AgedLevel::L1,
+				super::certified_tier::AgedRows {
+					data: aged_data,
+					tombstone: aged_tombstone,
+				},
+			);
+		}
+		outcome
 	}
 }
 
@@ -711,6 +776,7 @@ impl CertifiedSelection {
 			active_gid: 0,
 			job_fingerprint: [0; 32],
 			input_rows_digest: [0; 32],
+			aged: std::collections::BTreeSet::new(),
 		}
 	}
 }
@@ -826,6 +892,7 @@ mod tests {
 			active_gid: 1,
 			job_fingerprint: [1; 32],
 			input_rows_digest: [2; 32],
+			aged: std::collections::BTreeSet::new(),
 		}
 	}
 
@@ -1013,6 +1080,7 @@ mod tests {
 			gid: 1,
 			row_digest: [byte; 32],
 			source: DebtSource::RetiredIntent { rsv: 5, ordinal: 0 },
+			aged: false,
 		};
 		let mut evidence = Vec::new();
 		let facts: Vec<VersionFacts> = candidates
@@ -1076,6 +1144,7 @@ mod tests {
 			active_gid: 1,
 			job_fingerprint: [1; 32],
 			input_rows_digest: [2; 32],
+			aged: std::collections::BTreeSet::new(),
 		};
 		let dropped = apply_elision(entries, &PlanElision::Certified(Arc::new(selection)))
 			.into_iter()

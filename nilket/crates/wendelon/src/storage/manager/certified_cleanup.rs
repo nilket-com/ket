@@ -108,6 +108,8 @@ pub(crate) struct ReclamationPlan {
 	/// The active generation the facts were read under.
 	active_gid: u64,
 	reclaim: Vec<bool>,
+	/// Wendelon ADR 0122 D4: per record, whether it is reclaimed for aged debt.
+	aged: Vec<bool>,
 }
 
 impl ReclamationPlan {
@@ -154,12 +156,43 @@ impl ReclamationPlan {
 				});
 				!fact.owned && !protected_by_base && matched
 			})
+			.collect::<Vec<bool>>();
+		// Wendelon ADR 0122 D4: which reclaimed records carry aged debt (attribution).
+		let aged = job
+			.candidates
+			.iter()
+			.zip(&reclaim)
+			.map(|(candidate, reclaimed)| {
+				*reclaimed
+					&& facts
+						.candidates()
+						.binary_search(&candidate.version)
+						.ok()
+						.and_then(|at| facts.get(at).debt.as_ref().map(|(_, debt)| debt.aged))
+						.unwrap_or(false)
+			})
 			.collect();
 		Ok(Self {
 			slab_id: job.slab_id,
 			active_gid: facts.active_gid(),
 			reclaim,
+			aged,
 		})
+	}
+
+	/// Wendelon ADR 0122 D4: the aged records the plan reclaims, (data, tombstone).
+	pub(crate) fn aged_rows(&self, job_tombstones: &[bool]) -> (u64, u64) {
+		let mut rows = (0, 0);
+		for (aged, tombstone) in self.aged.iter().zip(job_tombstones) {
+			if *aged {
+				if *tombstone {
+					rows.1 += 1;
+				} else {
+					rows.0 += 1;
+				}
+			}
+		}
+		rows
 	}
 
 	/// How many records the plan reclaims.
@@ -301,9 +334,16 @@ impl SlabManager {
 		if index.base_meta().await?.active_gid != plan.active_gid {
 			return Ok(None);
 		}
+		// Wendelon ADR 0122 D4: recorded only once the rewrite is installed.
+		let tombstones: Vec<bool> = job
+			.candidates
+			.iter()
+			.map(|candidate| candidate.tombstone)
+			.collect();
+		let (aged_data, aged_tombstone) = plan.aged_rows(&tombstones);
 		let mut records = job.records;
 		plan.apply(job.slab_id, &mut records)?;
-		Ok(self
+		let installed = self
 			.compact_sealed_slab_records_with_authority(
 				job.slab_id,
 				job.slab,
@@ -316,7 +356,16 @@ impl SlabManager {
 				&job.counter_plan,
 				super::compaction::ReclaimAuthority::Certified(plan),
 			)
-			.await?
-			.map(|outcome| outcome.reclaimed_records))
+			.await?;
+		if installed.is_some() && (aged_data > 0 || aged_tombstone > 0) {
+			self.observe_aged_rows_pruned(
+				super::certified_tier::AgedLevel::L1,
+				super::certified_tier::AgedRows {
+					data: aged_data,
+					tombstone: aged_tombstone,
+				},
+			);
+		}
+		Ok(installed.map(|outcome| outcome.reclaimed_records))
 	}
 }

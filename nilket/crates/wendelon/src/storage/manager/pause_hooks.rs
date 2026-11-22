@@ -696,6 +696,17 @@ pub(super) struct TestHolds {
 	/// ADR 0704: ends the next certified tier step at this cut, as a crash would.
 	pub(super) certified_tier_cut:
 		std::sync::Mutex<Option<super::certified_tier::CertifiedTierCut>>,
+	/// Wendelon ADR 0122 (Codex 01a20151 R1): parks the next certified tier step at this cut
+	/// (signalling `reached`) until `release`, then lets it go on, as a slow worker would.
+	pub(super) certified_tier_hold: std::sync::Mutex<
+		Option<(
+			super::certified_tier::CertifiedTierCut,
+			Arc<tokio::sync::Semaphore>,
+			Arc<tokio::sync::Semaphore>,
+		)>,
+	>,
+	/// Wendelon ADR 0122 (Codex 01a20151 R3): the aged rows this store recorded, by level.
+	pub(super) aged_pruned: std::sync::Mutex<[super::certified_tier::AgedRows; 2]>,
 	/// ADR 0704 §5: the source objects (URI, bytes) the certified path retained.
 	pub(super) certified_retained: std::sync::Mutex<Vec<(String, u64)>>,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,

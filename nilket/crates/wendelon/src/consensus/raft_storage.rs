@@ -3484,7 +3484,11 @@ pub(crate) fn validate_assembled_state(state: &SmState) -> Result<(), String> {
 		.as_ref()
 		.and_then(|decisions| decisions.generations().pending.as_ref())
 	{
-		let expected = state.pd_survivor_policy_at(pending.target.t);
+		// Wendelon ADR 0122 D2: with the aged component its signed floor implies.
+		let expected = crate::consensus::decisions::generations::compose_survivor_policy(
+			state.pd_survivor_policy_at(pending.target.t),
+			pending.target.retention.floor_ms,
+		);
 		if pending.target.survivor_policy != expected {
 			return Err(format!(
 				"a pending generation carries survivor policy {} where its cut requires {expected}",

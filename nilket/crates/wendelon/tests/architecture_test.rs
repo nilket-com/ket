@@ -11454,8 +11454,9 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 		lease_callers,
 		vec![
 			// ADR 0704: the certified tier step's one read of committed state
-			// (`committed_certified_tier`), held for no I/O and no lock.
-			(PathBuf::from("src/storage/manager/certified_tier.rs"), 1),
+			// (`committed_certified_tier`); wendelon ADR 0122 D4: the aged count's proof of its
+			// own committed effect (`record_aged_l2_if_applied`). Each is held for no I/O and no lock.
+			(PathBuf::from("src/storage/manager/certified_tier.rs"), 2),
 			// The recovered Tier and Retire deliveries and the superseded handoff.
 			(PathBuf::from("src/storage/manager/op_recovery.rs"), 4),
 			// ADR 0704: verification with no deferred-snapshot retry judges each pending
@@ -12604,7 +12605,7 @@ const LIFECYCLE_PERMIT_CENSUS: &[(&str, &str, LifecyclePermitOwner)] = &[
 	),
 	(
 		"network/data_server/cleanup.rs",
-		"certified_tier_step",
+		"certified_tier_step_unpaused",
 		LifecyclePermitOwner::DrainedService("LSM compaction"),
 	),
 	(

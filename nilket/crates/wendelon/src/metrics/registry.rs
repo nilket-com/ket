@@ -4139,6 +4139,33 @@ impl MetricsRegistry {
 			.set(max_lag_seconds);
 	}
 
+	/// Wendelon ADR 0122 D4: aged rows a certified cleanup removed from the committed
+	/// active local inventory. Row counters only: the shared retention-lag gauge, the
+	/// byte and pair counters are left as they are.
+	pub fn observe_storage_table_retention_l1_rows_pruned(
+		&self,
+		data_rows: u64,
+		tombstone_rows: u64,
+	) {
+		self.storage_table_retention_l1_rows_pruned
+			.add(TableRetentionRowKind::Data, data_rows);
+		self.storage_table_retention_l1_rows_pruned
+			.add(TableRetentionRowKind::Tombstone, tombstone_rows);
+	}
+
+	/// Wendelon ADR 0122 D4: aged rows a certified tier job removed from the committed
+	/// active L2 inventory, on the delivery of its own Applied op. Row counters only.
+	pub fn observe_storage_table_retention_l2_rows_pruned(
+		&self,
+		data_rows: u64,
+		tombstone_rows: u64,
+	) {
+		self.storage_table_retention_l2_rows_pruned
+			.add(TableRetentionRowKind::Data, data_rows);
+		self.storage_table_retention_l2_rows_pruned
+			.add(TableRetentionRowKind::Tombstone, tombstone_rows);
+	}
+
 	pub fn set_storage_table_retention_policy_active_tables(
 		&self,
 		inherit: u64,
@@ -7511,6 +7538,63 @@ mod tests {
 			"{}{{reason=\"too_many_bytes\"}} 1",
 			namespaced_test_metric("storage_l2_column_fetch_fallback_total")
 		)));
+	}
+
+	/// Wendelon ADR 0122 D4 (Codex 01a20151 R3), on a registry of its own: both row kinds of
+	/// both levels are exported from zero; the aged-row recorders move only their own row
+	/// series, never bytes, pairs, ambiguous rows or the lag gauge.
+	#[test]
+	fn aged_row_recorders_move_only_their_row_series() {
+		let registry = MetricsRegistry::default();
+		let series = |rendered: &str, name: &str| -> Vec<String> {
+			rendered
+				.lines()
+				.filter(|line| line.starts_with(&namespaced_test_metric(name)))
+				.map(str::to_owned)
+				.collect()
+		};
+		let others = [
+			"storage_table_retention_l1_bytes_reclaimed_total",
+			"storage_table_retention_l2_bytes_reclaimed_total",
+			"storage_table_retention_pair_drops_total",
+			"storage_table_retention_ambiguous_rows_retained_total",
+			"storage_table_retention_lag_seconds",
+		];
+		let before = registry.render_prometheus();
+		for level in ["l1", "l2"] {
+			let name = format!("storage_table_retention_{level}_rows_pruned_total");
+			assert_eq!(
+				series(&before, &name),
+				vec![
+					format!("{}{{kind=\"data\"}} 0", namespaced_test_metric(&name)),
+					format!("{}{{kind=\"tombstone\"}} 0", namespaced_test_metric(&name)),
+				],
+				"both kinds exported from zero"
+			);
+		}
+		registry.observe_storage_table_retention_l1_rows_pruned(2, 1);
+		registry.observe_storage_table_retention_l2_rows_pruned(3, 4);
+		let after = registry.render_prometheus();
+		for (level, data, tombstone) in [("l1", 2, 1), ("l2", 3, 4)] {
+			let name = format!("storage_table_retention_{level}_rows_pruned_total");
+			assert_eq!(
+				series(&after, &name),
+				vec![
+					format!("{}{{kind=\"data\"}} {data}", namespaced_test_metric(&name)),
+					format!(
+						"{}{{kind=\"tombstone\"}} {tombstone}",
+						namespaced_test_metric(&name)
+					),
+				]
+			);
+		}
+		for name in others {
+			assert_eq!(
+				series(&after, name),
+				series(&before, name),
+				"{name} untouched"
+			);
+		}
 	}
 
 	#[test]

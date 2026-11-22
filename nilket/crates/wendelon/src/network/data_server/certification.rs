@@ -465,7 +465,13 @@ impl StoreCertification<'_> {
 				.await?
 			{
 				Ok(()) => return Ok(()),
-				Err(ActivateRefusal::NoMatchingCandidate | ActivateRefusal::StagedRowsMismatch) => {
+				// Wendelon ADR 0122 D3: inconsistent aged evidence is damaged staging
+				// too: nothing was installed, labelled or cleared.
+				Err(
+					ActivateRefusal::NoMatchingCandidate
+					| ActivateRefusal::StagedRowsMismatch
+					| ActivateRefusal::AgedEvidenceMismatch,
+				) => {
 					self.progress.behind.store(true, Ordering::Release);
 					return Ok(());
 				}
@@ -510,11 +516,18 @@ impl StoreCertification<'_> {
 				}
 				// Wendelon ADR 0115: a target is reported only with the policy the
 				// outcomes at its cut require; unadmitted, an excluding target never is.
-				if pending.target.survivor_policy != state.pd_survivor_policy_at(pending.target.t) {
+				// Wendelon ADR 0122 D2: and with exactly the aged component its cut implies;
+				// a policy this build does not know is never reported.
+				if pending.target.survivor_policy
+					!= crate::consensus::decisions::generations::compose_survivor_policy(
+						state.pd_survivor_policy_at(pending.target.t),
+						pending.target.retention.floor_ms,
+					) {
 					return None;
 				}
-				let excluding = pending.target.survivor_policy
-					== crate::consensus::decisions::generations::SURVIVOR_POLICY_EXCLUDING;
+				let excluding = crate::consensus::decisions::generations::policy_excludes_drops(
+					pending.target.survivor_policy,
+				);
 				let mut excluded: BTreeMap<(TenantId, TableObjectId), bool> = BTreeMap::new();
 				let mut children = Vec::new();
 				for body in decisions
@@ -581,9 +594,16 @@ impl StoreCertification<'_> {
 		let Some(Work { pending, children }) = work else {
 			return Ok(None);
 		};
-		let exclusion = (pending.target.survivor_policy
-			== crate::consensus::decisions::generations::SURVIVOR_POLICY_EXCLUDING)
-			.then_some(pending.target.t);
+		let exclusion = crate::consensus::decisions::generations::policy_excludes_drops(
+			pending.target.survivor_policy,
+		)
+		.then_some(pending.target.t);
+		// Wendelon ADR 0122 D1: the signed floor the build omits aged governed winners below.
+		let aged_floor = crate::consensus::decisions::generations::policy_omits_aged(
+			pending.target.survivor_policy,
+		)
+		.then(|| pending.target.retention.floor_hlc())
+		.flatten();
 		let meta = index.base_meta().await?;
 		if meta.active_gid != pending.target.predecessor_gid {
 			return Ok(None);
@@ -598,16 +618,29 @@ impl StoreCertification<'_> {
 				// mismatch fails closed: nothing is overwritten and nothing is
 				// reported. This holds whether or not its report is recorded.
 				if built.load(std::sync::atomic::Ordering::Acquire) != gid {
-					let entries = match self
-						.build_candidate(build, &index, &children, exclusion)
+					let (entries, aged) = match self
+						.build_candidate(build, &index, &children, exclusion, aged_floor)
 						.await
 					{
-						Ok(entries) => entries,
+						Ok(built) => built,
 						Err(refusal) => {
 							tracing::debug!(reason = %refusal.describe(), "a recovered candidate base is not proved");
 							return Ok(None);
 						}
 					};
+					// Wendelon ADR 0122 D3: the omission is signed evidence too; rebuilt,
+					// it must reproduce the staged aged evidence exactly.
+					let rebuilt_aged = aged_floor
+						.map(|_| crate::storage::index::certified_base::aged_evidence(&aged));
+					if rebuilt_aged != staged.aged {
+						tracing::warn!(
+							gid,
+							staged = ?staged.aged,
+							rebuilt = ?rebuilt_aged,
+							"a recovered candidate's aged evidence does not match its staged evidence"
+						);
+						return Ok(None);
+					}
 					// Wendelon ADR 0121 R2: the staged least visible row is signed
 					// evidence too; rebuilt under the frozen target, it must reproduce
 					// it, or nothing is restaged, reported or overwritten.
@@ -623,7 +656,7 @@ impl StoreCertification<'_> {
 						);
 						return Ok(None);
 					}
-					if let Err(refusal) = index.restage_base(staged.clone(), entries).await? {
+					if let Err(refusal) = index.restage_base(staged.clone(), entries, aged).await? {
 						tracing::warn!(
 							?refusal,
 							gid,
@@ -635,11 +668,11 @@ impl StoreCertification<'_> {
 				}
 			}
 			_ => {
-				let entries = match self
-					.build_candidate(build, &index, &children, exclusion)
+				let (entries, aged) = match self
+					.build_candidate(build, &index, &children, exclusion, aged_floor)
 					.await
 				{
-					Ok(entries) => entries,
+					Ok(built) => built,
 					Err(refusal) => {
 						tracing::debug!(reason = %refusal.describe(), "no candidate base for the pending generation");
 						return Ok(None);
@@ -654,8 +687,10 @@ impl StoreCertification<'_> {
 					predecessor_gid: meta.active_gid,
 					chunks: chunk_sums(&entries),
 					oldest_visible,
+					aged: aged_floor
+						.map(|_| crate::storage::index::certified_base::aged_evidence(&aged)),
 				};
-				if index.stage_base(candidate, entries).await?.is_err() {
+				if index.stage_base(candidate, entries, aged).await?.is_err() {
 					return Ok(None);
 				}
 				built.store(gid, std::sync::atomic::Ordering::Release);
@@ -776,7 +811,8 @@ impl StoreCertification<'_> {
 		index: &crate::storage::index::PersistentLocalIndex,
 		children: &[ClosedChild],
 		exclusion: Option<u64>,
-	) -> Result<Vec<BaseEntry>, BuildRefusal> {
+		aged_floor: Option<crate::schema::HybridTimestamp>,
+	) -> Result<(Vec<BaseEntry>, Vec<BaseEntry>), BuildRefusal> {
 		type Slot = (TenantId, TableObjectId, [u8; 32]);
 		let storage = |error: std::io::Error| BuildRefusal::Storage(error.to_string());
 		let unproved =
@@ -872,6 +908,19 @@ impl StoreCertification<'_> {
 				return Err(BuildRefusal::Policy);
 			}
 		}
+		// Wendelon ADR 0122 D1: only now, after every ordinary rule (exclusions, newest
+		// per key, the equal-HLC refusal), every governed winner strictly below the
+		// signed floor leaves the candidate, inherited or from a child, data or
+		// tombstone. Those omitted are the staged aged evidence (D3).
+		let mut aged = Vec::new();
+		if let Some(floor) = aged_floor {
+			let governed: BTreeSet<(TenantId, TableObjectId)> = winners
+				.keys()
+				.map(|(tenant, table, _)| (*tenant, *table))
+				.filter(|(tenant, table)| state.retention_governed(*tenant, *table))
+				.collect();
+			aged = omit_aged(&mut winners, &governed, floor);
+		}
 		// Prove every survivor that comes from a child; repair a child once.
 		let mut repaired = std::collections::BTreeSet::new();
 		for (entry, source) in winners.values_mut() {
@@ -928,7 +977,10 @@ impl StoreCertification<'_> {
 				super::coordinator::row_position(descriptor, locality).map_err(storage)?
 			};
 		}
-		Ok(winners.into_values().map(|(entry, _)| entry).collect())
+		Ok((
+			winners.into_values().map(|(entry, _)| entry).collect(),
+			aged,
+		))
 	}
 }
 
@@ -972,4 +1024,81 @@ pub(crate) async fn entry_is_stored(
 		}
 	}
 	Ok(())
+}
+
+/// Wendelon ADR 0122 D1: removes from the build's winners every one of a governed table strictly
+/// below `floor` (by full HLC: a winner at `floor` stays), inherited or from a child, data or
+/// tombstone, and returns them in key order: the staged aged evidence.
+fn omit_aged<K: Ord, S>(
+	winners: &mut BTreeMap<K, (BaseEntry, S)>,
+	governed: &BTreeSet<(TenantId, TableObjectId)>,
+	floor: crate::schema::HybridTimestamp,
+) -> Vec<BaseEntry> {
+	let mut aged = Vec::new();
+	winners.retain(|_, (entry, _)| {
+		let omit = governed.contains(&(entry.tenant, entry.table)) && entry.hlc < floor;
+		if omit {
+			aged.push(*entry);
+		}
+		!omit
+	});
+	aged
+}
+
+#[cfg(test)]
+mod aged_omission_tests {
+	use super::*;
+	use crate::schema::HybridTimestamp;
+
+	fn winner(table: u8, key: u8, hlc: HybridTimestamp, tombstone: bool) -> BaseEntry {
+		BaseEntry {
+			tenant: TenantId::ZERO,
+			table: TableObjectId::new([table; 16]),
+			key_identity: [key; 32],
+			hlc,
+			row_digest: [key; 32],
+			tombstone,
+			position: 0,
+		}
+	}
+
+	/// Wendelon ADR 0122 D1 (Codex 01a20151): F's exact boundary. A governed winner at F is kept;
+	/// one a logical tick or a node below F, or a millisecond below, is omitted, data or
+	/// tombstone, whether inherited or from a child; an ungoverned winner below F is kept.
+	#[test]
+	fn a_winner_at_the_floor_stays_and_every_governed_one_below_it_is_aged() {
+		let floor = HybridTimestamp {
+			physical_ms: 1_000,
+			logical: 5,
+			node_id: 7,
+		};
+		let at = |physical_ms, logical, node_id| HybridTimestamp {
+			physical_ms,
+			logical,
+			node_id,
+		};
+		let rows = [
+			(winner(1, 1, floor, false), None),              // at F: kept
+			(winner(1, 2, at(1_000, 5, 6), false), Some(0)), // a node below: aged
+			(winner(1, 3, at(1_000, 4, 9), true), None),     // a tick below, tombstone: aged
+			(winner(1, 4, at(999, 9, 9), false), Some(1)),   // a millisecond below: aged
+			(winner(1, 5, at(1_000, 5, 8), false), Some(0)), // above F: kept
+			(winner(2, 6, at(1, 0, 0), false), None),        // ungoverned below F: kept
+		];
+		let mut winners: BTreeMap<(TableObjectId, [u8; 32]), (BaseEntry, Option<usize>)> = rows
+			.iter()
+			.map(|(entry, source)| ((entry.table, entry.key_identity), (*entry, *source)))
+			.collect();
+		let governed = BTreeSet::from([(TenantId::ZERO, TableObjectId::new([1; 16]))]);
+		let aged = omit_aged(&mut winners, &governed, floor);
+		let keys = |entries: Vec<BaseEntry>| -> Vec<u8> {
+			entries.iter().map(|entry| entry.key_identity[0]).collect()
+		};
+		assert_eq!(keys(aged), vec![2, 3, 4], "strictly below F, governed only");
+		assert_eq!(
+			keys(winners.values().map(|(entry, _)| *entry).collect()),
+			vec![1, 5, 6],
+			"F itself, above F, and the ungoverned row stay"
+		);
+	}
 }
