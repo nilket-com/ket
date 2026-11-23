@@ -16,6 +16,7 @@ pub mod raft_storage;
 pub mod retention;
 pub mod slab_ops;
 pub mod timing;
+pub(crate) mod wal_append_trace;
 // ADR 0092 versioned-replay shadows: replay machinery, never an API. Only the
 // decode dispatch in `raft_storage` and the format-fixture controls may name
 // these modules.

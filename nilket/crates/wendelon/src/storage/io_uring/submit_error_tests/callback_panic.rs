@@ -57,6 +57,7 @@ fn a_panicking_receiver_cannot_free_other_kernel_buffers() {
 			observation: Some(registry.begin(WorkScope::Node, WorkKind::StoragePublication)),
 			owner: Some(owner.clone()),
 			permit: Some(owner.write_permit().unwrap()),
+			enqueued_at: None,
 		},
 	);
 	assert_eq!(ring.submit().unwrap(), 1);

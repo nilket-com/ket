@@ -521,6 +521,23 @@ impl CertifiedTierObserverSeries {
 
 /// DC-292: the lifecycle drain-timeout captures, one series per service and field; nothing when
 /// no drain has timed out.
+/// DC-287: the slowest completed WAL append batch so far, one series per field (rendered only once
+/// a batch completed).
+fn render_wal_append_slowest(
+	out: &mut String,
+	record: &crate::consensus::wal_append_trace::WalAppendRecord,
+) {
+	let family = "wendelon_storage_wal_append_slowest_batch";
+	render_gauge_family_header(
+		out,
+		family,
+		"The slowest completed WAL append batch so far: its identity, total and the time attributed across the same batch (admission, queued, dispatched, handoff for ring writes; untraced writes; rotation; replace), with the residual no measured span covers. Durations in microseconds.",
+	);
+	for (field, value) in record.fields() {
+		render_gauge_with_labels(out, family, &[("field", field)], value);
+	}
+}
+
 fn render_lifecycle_drain_timeouts(
 	out: &mut String,
 	captures: &std::collections::BTreeMap<&'static str, Vec<(&'static str, u64)>>,
@@ -3211,6 +3228,11 @@ pub struct MetricsRegistry {
 	/// DC-292: each lifecycle service's last drain-timeout capture, by service.
 	lifecycle_drain_timeouts:
 		std::sync::Mutex<std::collections::BTreeMap<&'static str, Vec<(&'static str, u64)>>>,
+	/// DC-287: the slowest completed WAL append batch so far, attributed, and its total in ns (the
+	/// fast path compares against it without the lock).
+	wal_append_slowest:
+		std::sync::Mutex<Option<crate::consensus::wal_append_trace::WalAppendRecord>>,
+	wal_append_slowest_ns: std::sync::atomic::AtomicU64,
 	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
 	pub storage_l2_superseded_objects_retained_total: Counter,
 	pub storage_supersession_metadata_degraded_total: Counter,
@@ -3572,6 +3594,8 @@ impl Default for MetricsRegistry {
 			decision_generation_targets_proposed: GenerationTargetReasonCounters::default(),
 			certified_tier_observer: CertifiedTierObserverSeries::default(),
 			lifecycle_drain_timeouts: Default::default(),
+			wal_append_slowest: Default::default(),
+			wal_append_slowest_ns: Default::default(),
 			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
 			storage_l2_superseded_objects_retained_total: Counter::default(),
 			storage_supersession_metadata_degraded_total: Counter::default(),
@@ -3816,6 +3840,28 @@ impl MetricsRegistry {
 	pub fn observe_wal_append_latency(&self, duration: Duration) {
 		self.storage_wal_append_latency_seconds
 			.observe_duration(duration);
+	}
+
+	/// DC-287 (Codex 01a207a1): keeps one coherent record, the slowest completed append batch so
+	/// far, so it survives the fast batches after it until a scrape reads it. One atomic load per
+	/// batch; the lock only when this batch is slower.
+	pub(crate) fn record_wal_append(
+		&self,
+		record: &crate::consensus::wal_append_trace::WalAppendRecord,
+	) {
+		use std::sync::atomic::Ordering;
+		let ns = u64::try_from(record.total.as_nanos()).unwrap_or(u64::MAX);
+		if ns <= self.wal_append_slowest_ns.load(Ordering::Relaxed) {
+			return;
+		}
+		let mut slowest = self
+			.wal_append_slowest
+			.lock()
+			.unwrap_or_else(|e| e.into_inner());
+		if slowest.is_none_or(|current| record.total > current.total) {
+			*slowest = Some(*record);
+			self.wal_append_slowest_ns.store(ns, Ordering::Relaxed);
+		}
 	}
 
 	pub fn observe_wal_fsync_latency(&self, duration: Duration) {
@@ -6455,6 +6501,13 @@ impl MetricsRegistry {
 				.lock()
 				.unwrap_or_else(|e| e.into_inner()),
 		);
+		if let Some(record) = *self
+			.wal_append_slowest
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+		{
+			render_wal_append_slowest(&mut out, &record);
+		}
 		self.decision_generation_targets_proposed.render(
 			&mut out,
 			"wendelon_decision_generation_targets_proposed_total",
@@ -8314,4 +8367,38 @@ mod tests {
 		assert!(rendered.contains("wendelon_storage_wal_append_latency_seconds_count 1"));
 		assert!(rendered.contains("wendelon_storage_wal_fsync_latency_seconds_count 1"));
 	}
+}
+
+/// DC-287 (Codex 01a207a1): the registry keeps one record, the slowest append batch so far; a
+/// faster batch never replaces it and a slower one does.
+#[cfg(test)]
+#[test]
+fn the_slowest_wal_append_record_is_kept_until_a_slower_one() {
+	use crate::consensus::wal_append_trace::WalAppendRecord;
+	let registry = isolated_for_test();
+	assert!(
+		!registry
+			.render_prometheus()
+			.contains("wendelon_storage_wal_append_slowest_batch"),
+		"nothing before the first batch"
+	);
+	let batch = |seq: u64, ms: u64| WalAppendRecord {
+		seq,
+		total: Duration::from_millis(ms),
+		..WalAppendRecord::default()
+	};
+	for record in [batch(1, 9_000), batch(2, 1), batch(3, 2_000)] {
+		registry.record_wal_append(&record);
+	}
+	let text = registry.render_prometheus();
+	assert!(text.contains("wendelon_storage_wal_append_slowest_batch{field=\"seq\"} 1\n"));
+	assert!(
+		text.contains("wendelon_storage_wal_append_slowest_batch{field=\"total_us\"} 9000000\n")
+	);
+	registry.record_wal_append(&batch(4, 10_000));
+	assert!(
+		registry
+			.render_prometheus()
+			.contains("wendelon_storage_wal_append_slowest_batch{field=\"seq\"} 4\n")
+	);
 }

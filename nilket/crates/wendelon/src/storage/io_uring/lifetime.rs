@@ -60,6 +60,7 @@ impl Drop for InFlightRequests {
 			let _ = reply.send(IoCompletion {
 				buf: None,
 				result: -self.failure_errno.unwrap_or(libc::EIO),
+				timing: None,
 			});
 		}
 	}
@@ -152,6 +153,7 @@ pub(super) fn fail_ring(
 		let _ = request.reply.send(IoCompletion {
 			buf: request.buf,
 			result: -errno,
+			timing: None,
 		});
 	}
 	if !in_flight.is_empty() {

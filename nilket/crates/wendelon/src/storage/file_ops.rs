@@ -56,6 +56,27 @@ pub struct DirectoryEntry {
 	pub is_file: bool,
 }
 
+/// DC-287 (Codex 01a207a1): one write's measured time. `phases` partitions `total` when the
+/// implementation measures them (see [`WritePhases`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteTiming {
+	pub total: std::time::Duration,
+	pub phases: Option<WritePhases>,
+}
+
+/// DC-287: one io_uring write, between measured boundaries (see `crate::storage::io_uring::IoTiming`):
+/// the call began → handed to the channel (`admission`: the reserve, the admission mutex, any
+/// owner permit) → the ring thread entered `push_request` with it (`queued`) → its completion
+/// observed while reaping (`dispatched`: SQE insertion, submission, kernel, device and reaping,
+/// not separable here) → the caller resumed (`handoff`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WritePhases {
+	pub admission: std::time::Duration,
+	pub queued: std::time::Duration,
+	pub dispatched: std::time::Duration,
+	pub handoff: std::time::Duration,
+}
+
 #[async_trait]
 pub trait AsyncFileOps: Send + Sync {
 	/// Return a backend whose writes use this owner's admission gate.
@@ -103,6 +124,25 @@ pub trait AsyncFileOps: Send + Sync {
 		offset: u64,
 		buf: AlignedBuf,
 	) -> std::io::Result<(usize, AlignedBuf)>;
+
+	/// DC-287 (Codex 01a207a1): `write_at`, with the boundaries this implementation can measure.
+	/// The default measures the whole call only (`phases: None`).
+	async fn write_at_timed(
+		&self,
+		handle: &FileHandle,
+		offset: u64,
+		buf: AlignedBuf,
+	) -> std::io::Result<((usize, AlignedBuf), WriteTiming)> {
+		let started = std::time::Instant::now();
+		let written = self.write_at(handle, offset, buf).await?;
+		Ok((
+			written,
+			WriteTiming {
+				total: started.elapsed(),
+				phases: None,
+			},
+		))
+	}
 
 	async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()>;
 
@@ -235,6 +275,42 @@ impl IoUringFileOps {
 	}
 }
 
+impl IoUringFileOps {
+	/// The ordinary ring write, shared by `write_at` and `write_at_timed`: one submission,
+	/// completion and error path. `timed` opts this request alone into the ring's timing
+	/// (DC-287); an untimed request reads no clock.
+	async fn ring_write(
+		&self,
+		handle: &FileHandle,
+		offset: u64,
+		buf: AlignedBuf,
+		timed: bool,
+	) -> std::io::Result<(
+		(usize, AlignedBuf),
+		Option<crate::storage::io_uring::IoTiming>,
+	)> {
+		let reply = if timed {
+			self.io
+				.submit_timed(IoOp::Write, &handle.file, buf, offset)
+				.await?
+		} else {
+			self.io
+				.submit(IoOp::Write, &handle.file, buf, offset)
+				.await?
+		};
+		let completion = reply
+			.await
+			.map_err(|_| Error::new(ErrorKind::BrokenPipe, "io_uring reply channel closed"))?;
+		if completion.result < 0 {
+			return Err(Error::from_raw_os_error(-completion.result));
+		}
+		let buf = completion.buf.ok_or_else(|| {
+			Error::other("io_uring write completion missing aligned buffer payload")
+		})?;
+		Ok(((completion.result as usize, buf), completion.timing))
+	}
+}
+
 #[async_trait]
 impl AsyncFileOps for IoUringFileOps {
 	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
@@ -337,20 +413,35 @@ impl AsyncFileOps for IoUringFileOps {
 		offset: u64,
 		buf: AlignedBuf,
 	) -> std::io::Result<(usize, AlignedBuf)> {
-		let reply = self
-			.io
-			.submit(IoOp::Write, &handle.file, buf, offset)
-			.await?;
-		let completion = reply
+		self.ring_write(handle, offset, buf, false)
 			.await
-			.map_err(|_| Error::new(ErrorKind::BrokenPipe, "io_uring reply channel closed"))?;
-		if completion.result < 0 {
-			return Err(Error::from_raw_os_error(-completion.result));
-		}
-		let buf = completion.buf.ok_or_else(|| {
-			Error::other("io_uring write completion missing aligned buffer payload")
-		})?;
-		Ok((completion.result as usize, buf))
+			.map(|(written, _)| written)
+	}
+
+	async fn write_at_timed(
+		&self,
+		handle: &FileHandle,
+		offset: u64,
+		buf: AlignedBuf,
+	) -> std::io::Result<((usize, AlignedBuf), WriteTiming)> {
+		let started = std::time::Instant::now();
+		let (written, timing) = self.ring_write(handle, offset, buf, true).await?;
+		let resumed = std::time::Instant::now();
+		// The boundaries are causally ordered on one monotonic clock, so the phases partition
+		// the call; saturation only guards the type.
+		let phases = timing.map(|t| WritePhases {
+			admission: t.enqueued_at.saturating_duration_since(started),
+			queued: t.picked_up_at.saturating_duration_since(t.enqueued_at),
+			dispatched: t.cqe_observed_at.saturating_duration_since(t.picked_up_at),
+			handoff: resumed.saturating_duration_since(t.cqe_observed_at),
+		});
+		Ok((
+			written,
+			WriteTiming {
+				total: resumed.saturating_duration_since(started),
+				phases,
+			},
+		))
 	}
 
 	async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {

@@ -169,6 +169,9 @@ struct QueuedIoRequest {
 	observation: Option<crate::storage::finality_observation::WorkToken>,
 	owner: Option<DataDirectoryOwner>,
 	permit: Option<WritePermit>,
+	/// DC-287: for a timed write only, when the caller handed it to the channel (after reserve,
+	/// admission and permit). `None` for every other request, which reads no clock.
+	enqueued_at: Option<std::time::Instant>,
 }
 
 enum IoMessage {
@@ -219,6 +222,24 @@ pub struct IoCompletion {
 	pub buf: Option<AlignedBuf>,
 	/// Kernel return value: bytes transferred if >= 0, negative errno otherwise.
 	pub result: i32,
+	/// DC-287: when a timed write moved through the ring (`None` for any other request, and on a
+	/// failure path).
+	pub timing: Option<IoTiming>,
+}
+
+/// DC-287 (Codex 01a207a1): the measured boundaries of one ring request, all from the monotonic
+/// clock. `enqueued_at`: the caller handed it to the channel (after its reserve, the admission
+/// mutex and any write permit). `picked_up_at`: the ring thread entered `push_request` with it,
+/// before its SQE is inserted (the insertion, and the submission at the thread's next enter, fall
+/// in the dispatch interval that follows).
+/// `cqe_observed_at`: the ring thread observed its completion while reaping, before replying. A
+/// late observed completion alone does not separate the device from the ring's scheduling or
+/// reaping.
+#[derive(Clone, Copy, Debug)]
+pub struct IoTiming {
+	pub enqueued_at: std::time::Instant,
+	pub picked_up_at: std::time::Instant,
+	pub cqe_observed_at: std::time::Instant,
 }
 
 struct InFlightRequest {
@@ -230,6 +251,8 @@ struct InFlightRequest {
 	op: IoOp,
 	buf: Option<AlignedBuf>,
 	reply: oneshot::Sender<IoCompletion>,
+	enqueued_at: Option<std::time::Instant>,
+	picked_up_at: Option<std::time::Instant>,
 }
 
 // ============================================================
@@ -261,12 +284,17 @@ struct SubmitFault {
 type SubmitFaultSlot = Arc<std::sync::Mutex<Option<SubmitFault>>>;
 
 #[cfg(test)]
+mod cost_report_tests;
+#[cfg(test)]
 mod submit_error_tests;
 
 #[derive(Clone)]
 pub struct IoRingHandle {
 	#[cfg(test)]
 	cqe_gate: ObservationCompletionGate,
+	/// Test-only (DC-287): signalled once, right after the next request is handed to the channel.
+	#[cfg(test)]
+	enqueue_signal: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
 	#[cfg(test)]
 	submit_fault: SubmitFaultSlot,
 	worker: Arc<RingWorker>,
@@ -298,6 +326,29 @@ impl IoRingHandle {
 		self.owner.clone()
 	}
 
+	/// Test-only (DC-287): `ready` fires once the next request has been handed to the channel.
+	#[cfg(test)]
+	pub(crate) fn signal_next_enqueue_for_test(&self) -> std::sync::mpsc::Receiver<()> {
+		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+		*self.enqueue_signal.lock().unwrap() = Some(ready_tx);
+		ready_rx
+	}
+
+	/// Test-only (DC-287): parks the ring thread at its next observed completion, before it replies:
+	/// `ready` fires when it is parked, and a send on `release` lets it continue.
+	#[cfg(test)]
+	pub(crate) fn hold_next_completion_for_test(
+		&self,
+	) -> (
+		std::sync::mpsc::Receiver<()>,
+		std::sync::mpsc::SyncSender<()>,
+	) {
+		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+		let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+		*self.cqe_gate.lock().unwrap() = Some((ready_tx, release_rx));
+		(ready_rx, release_tx)
+	}
+
 	pub(crate) fn ensure_open(&self) -> std::io::Result<()> {
 		if self.worker.closed.load(Ordering::SeqCst) {
 			return Err(closed_error());
@@ -320,6 +371,29 @@ impl IoRingHandle {
 		file: &Arc<std::fs::File>,
 		buf: AlignedBuf,
 		offset: u64,
+	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		self.submit_with(op, file, buf, offset, false).await
+	}
+
+	/// DC-287 (Codex 01a207d0): [`Self::submit`], with the ring's timing recorded for this request
+	/// alone (`IoCompletion::timing`). Every other request reads no clock.
+	pub(crate) async fn submit_timed(
+		&self,
+		op: IoOp,
+		file: &Arc<std::fs::File>,
+		buf: AlignedBuf,
+		offset: u64,
+	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		self.submit_with(op, file, buf, offset, true).await
+	}
+
+	async fn submit_with(
+		&self,
+		op: IoOp,
+		file: &Arc<std::fs::File>,
+		buf: AlignedBuf,
+		offset: u64,
+		timed: bool,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
 		let fd = file.as_raw_fd();
 		self.ensure_open()?;
@@ -353,8 +427,13 @@ impl IoRingHandle {
 			observation: crate::storage::finality_observation::current_work(),
 			owner: self.owner.clone(),
 			permit,
+			enqueued_at: timed.then(std::time::Instant::now),
 		};
 		slot.send(IoMessage::Request(req));
+		#[cfg(test)]
+		if let Some(signal) = self.enqueue_signal.lock().unwrap().take() {
+			let _ = signal.send(());
+		}
 		Ok(reply_rx)
 	}
 
@@ -412,6 +491,7 @@ impl IoRingHandle {
 			observation: crate::storage::finality_observation::current_work(),
 			owner: self.owner.clone(),
 			permit,
+			enqueued_at: None,
 		};
 		slot.send(IoMessage::Request(req));
 		Ok(reply_rx)
@@ -479,6 +559,8 @@ pub fn spawn_io_thread_named_for_class(
 	Ok(IoRingHandle {
 		#[cfg(test)]
 		cqe_gate,
+		#[cfg(test)]
+		enqueue_signal: Default::default(),
 		#[cfg(test)]
 		submit_fault,
 		worker: Arc::new(RingWorker {
@@ -632,6 +714,9 @@ fn io_thread_loop(
 		span.record("cq_ready", cq.len() as i64);
 		while let Some(cqe) = cq.next() {
 			if let Some(mut request) = in_flight.remove(&cqe.user_data()) {
+				// DC-287: a timed write's completion, observed while reaping, before any reply (and
+				// before the test gate). No other request reads the clock.
+				let cqe_observed_at = request.enqueued_at.map(|_| std::time::Instant::now());
 				#[cfg(test)]
 				{
 					let gate = cqe_gate
@@ -657,6 +742,16 @@ fn io_thread_loop(
 				let _ = request.reply.send(IoCompletion {
 					buf: request.buf,
 					result: cqe.result(),
+					timing: match (request.enqueued_at, request.picked_up_at, cqe_observed_at) {
+						(Some(enqueued_at), Some(picked_up_at), Some(cqe_observed_at)) => {
+							Some(IoTiming {
+								enqueued_at,
+								picked_up_at,
+								cqe_observed_at,
+							})
+						}
+						_ => None,
+					},
 				});
 			}
 		}
@@ -723,7 +818,10 @@ fn push_request(
 		observation,
 		owner,
 		permit,
+		enqueued_at,
 	} = req;
+	// DC-287: a timed write entered `push_request`, before its SQE is built and inserted below.
+	let picked_up_at = enqueued_at.map(|_| std::time::Instant::now());
 	let IoRequest {
 		op,
 		fd,
@@ -767,6 +865,8 @@ fn push_request(
 			reply,
 			_owner: owner,
 			_permit: permit,
+			enqueued_at,
+			picked_up_at,
 			observation: InFlightObservation {
 				token: observation,
 				completed: false,
@@ -886,6 +986,7 @@ mod adr629_p2b_observed_ring_tests {
 		let (tx, mut rx) = mpsc::channel(1);
 		let handle = IoRingHandle {
 			cqe_gate: Arc::new(std::sync::Mutex::new(None)),
+			enqueue_signal: Default::default(),
 			submit_fault: Arc::new(std::sync::Mutex::new(None)),
 			worker: Arc::new(RingWorker {
 				tx,
@@ -1051,5 +1152,172 @@ mod adr629_p2b_observed_ring_tests {
 		drop(file);
 		drop(handle);
 		std::fs::remove_file(path).unwrap();
+	}
+}
+
+/// DC-287 (Codex 01a207a1): the measured boundaries of a ring write.
+#[cfg(test)]
+mod write_timing_tests {
+	use super::*;
+	use crate::storage::{AsyncFileOps, FileHandle, IoUringFileOps, WritePhases};
+	use std::time::Duration;
+
+	const HOLD: Duration = Duration::from_millis(300);
+
+	fn scratch_file(tag: &str) -> (std::path::PathBuf, FileHandle) {
+		let dir = std::env::temp_dir().join(format!("{tag}-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir(&dir).unwrap();
+		let file = std::fs::OpenOptions::new()
+			.create_new(true)
+			.read(true)
+			.write(true)
+			.open(dir.join("data"))
+			.unwrap();
+		(dir, FileHandle::new(file))
+	}
+
+	fn page(byte: u8) -> AlignedBuf {
+		let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
+		buf.as_mut_slice().fill(byte);
+		buf
+	}
+
+	fn sum(p: WritePhases) -> Duration {
+		p.admission + p.queued + p.dispatched + p.handoff
+	}
+
+	/// The ring thread is parked after observing write A's completion, before replying, and write
+	/// B is handed to the channel while it is parked. A's hold shows as its **handoff** (not its
+	/// dispatch); B's wait shows as its **queued** time, though its reserve succeeded at once. In
+	/// each write the phases partition the whole call.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_held_completion_is_handoff_and_its_follower_waits_queued() {
+		let handle = spawn_io_thread(8).unwrap();
+		let ops = Arc::new(IoUringFileOps::new(handle.clone()));
+		let (dir, file) = scratch_file("dc287-ring-timing");
+		let file = Arc::new(file);
+		let bound = Duration::from_secs(30);
+		let (ready, release) = handle.hold_next_completion_for_test();
+		let a = {
+			let (ops, file) = (ops.clone(), file.clone());
+			tokio::spawn(async move { ops.write_at_timed(&file, 0, page(0x61)).await })
+		};
+		tokio::task::spawn_blocking(move || ready.recv_timeout(bound))
+			.await
+			.unwrap()
+			.expect("the ring thread parked at A's completion");
+		let enqueued = handle.signal_next_enqueue_for_test();
+		let b = {
+			let (ops, file) = (ops.clone(), file.clone());
+			tokio::spawn(async move {
+				ops.write_at_timed(&file, DIRECT_IO_ALIGN as u64, page(0x62))
+					.await
+			})
+		};
+		// B has been handed to the channel (signalled after its send) before the hold is timed.
+		tokio::task::spawn_blocking(move || enqueued.recv_timeout(bound))
+			.await
+			.unwrap()
+			.expect("B was handed to the channel");
+		tokio::time::sleep(HOLD).await;
+		release.send(()).unwrap();
+		let ((written_a, _), timing_a) = tokio::time::timeout(bound, a)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		let ((written_b, _), timing_b) = tokio::time::timeout(bound, b)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!((written_a, written_b), (DIRECT_IO_ALIGN, DIRECT_IO_ALIGN));
+		let (pa, pb) = (timing_a.phases.unwrap(), timing_b.phases.unwrap());
+		eprintln!(
+			"DC287 ring A {pa:?} total {:?}; B {pb:?} total {:?}",
+			timing_a.total, timing_b.total
+		);
+		assert!(pa.handoff >= HOLD, "A's held completion is handoff: {pa:?}");
+		assert!(pb.queued >= HOLD, "B waited in the channel: {pb:?}");
+		assert_eq!(sum(pa), timing_a.total, "A's phases partition its call");
+		assert_eq!(sum(pb), timing_b.total, "B's phases partition its call");
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// Codex 01a207d0 R2: only a timed write reads the ring's clocks. A plain write, a read and a
+	/// sync bypass it and carry no timing; a timed write carries all three boundaries.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn untimed_requests_carry_no_timing() {
+		let handle = spawn_io_thread(8).unwrap();
+		let (dir, _) = scratch_file("dc287-ring-bypass");
+		let file = Arc::new(
+			std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(dir.join("data"))
+				.unwrap(),
+		);
+		let write = handle
+			.submit(IoOp::Write, &file, page(0x65), 0)
+			.await
+			.unwrap()
+			.await
+			.unwrap();
+		let read = handle
+			.submit(IoOp::Read, &file, AlignedBuf::new(DIRECT_IO_ALIGN), 0)
+			.await
+			.unwrap()
+			.await
+			.unwrap();
+		let sync = handle.submit_fdatasync(&file).await.unwrap().await.unwrap();
+		let timed = handle
+			.submit_timed(IoOp::Write, &file, page(0x66), 0)
+			.await
+			.unwrap()
+			.await
+			.unwrap();
+		assert!(write.result >= 0 && read.result >= 0 && sync.result >= 0 && timed.result >= 0);
+		assert!(write.timing.is_none(), "a plain write bypasses the timing");
+		assert!(read.timing.is_none(), "a read bypasses the timing");
+		assert!(sync.timing.is_none(), "a sync bypasses the timing");
+		let t = timed.timing.expect("a timed write carries its boundaries");
+		assert!(t.enqueued_at <= t.picked_up_at && t.picked_up_at <= t.cqe_observed_at);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// Measurement overhead, reported (not asserted beyond sanity): untimed and timed writes
+	/// alternate on one ring and file, and the bare cost of the five clock reads a timed write
+	/// adds is measured too.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn write_timing_overhead_is_reported() {
+		const N: usize = 2_000;
+		let handle = spawn_io_thread(8).unwrap();
+		let ops = IoUringFileOps::new(handle);
+		let (dir, file) = scratch_file("dc287-ring-overhead");
+		let (mut plain, mut timed) = (Duration::ZERO, Duration::ZERO);
+		for i in 0..N {
+			let offset = (i % 64 * DIRECT_IO_ALIGN) as u64;
+			let started = std::time::Instant::now();
+			ops.write_at(&file, offset, page(0x63)).await.unwrap();
+			plain += started.elapsed();
+			let started = std::time::Instant::now();
+			ops.write_at_timed(&file, offset, page(0x64)).await.unwrap();
+			timed += started.elapsed();
+		}
+		let clock = {
+			let started = std::time::Instant::now();
+			for _ in 0..(5 * N) {
+				std::hint::black_box(std::time::Instant::now());
+			}
+			started.elapsed()
+		};
+		eprintln!(
+			"DC287 overhead: plain {:?}/write, timed {:?}/write, five clock reads {:?}/write ({N} each)",
+			plain / N as u32,
+			timed / N as u32,
+			clock / N as u32
+		);
+		assert!(plain > Duration::ZERO && timed > Duration::ZERO);
+		std::fs::remove_dir_all(dir).unwrap();
 	}
 }

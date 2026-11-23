@@ -120,6 +120,7 @@ fn pending_read(
 		owner: Some(owner.clone()),
 		// Also exercise the write-permit lifetime, independently of this read.
 		permit: Some(owner.write_permit().unwrap()),
+		enqueued_at: None,
 	};
 	let mut ring = IoUring::new(8).unwrap();
 	let mut pending = InFlightRequests::default();

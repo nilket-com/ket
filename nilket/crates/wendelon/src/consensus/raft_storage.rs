@@ -521,6 +521,27 @@ fn report_deferred(inner: &LogStoreInner) {
 	metrics().set_control_wal_deferred(segments, bytes);
 }
 
+/// Test-only (DC-287): see [`WendelonLogStore::hold_next_append_publication_for_test`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct AppendPublicationHold {
+	pub(crate) entered: Arc<tokio::sync::Semaphore>,
+	pub(crate) release: Arc<tokio::sync::Semaphore>,
+	pub(crate) witness:
+		Arc<std::sync::Mutex<Option<crate::consensus::wal_append_trace::WalAppendRecord>>>,
+}
+
+#[cfg(test)]
+impl Default for AppendPublicationHold {
+	fn default() -> Self {
+		Self {
+			entered: Arc::new(tokio::sync::Semaphore::new(0)),
+			release: Arc::new(tokio::sync::Semaphore::new(0)),
+			witness: Default::default(),
+		}
+	}
+}
+
 /// The store's side of snapshot publication, called by the publisher after a snapshot is
 /// durable, and at open.
 #[async_trait::async_trait]
@@ -586,6 +607,14 @@ pub struct WendelonLogStore {
 	/// failed WAL write does.
 	#[cfg(test)]
 	fail_appends: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-287): once a control arms it, every completed append batch's record, in order.
+	#[cfg(test)]
+	append_records:
+		Arc<std::sync::Mutex<Option<Vec<crate::consensus::wal_append_trace::WalAppendRecord>>>>,
+	/// Test-only (DC-287): a one-shot hold between an append record's endpoint and its publication,
+	/// with the slot the frozen record is witnessed in at the hold's entry.
+	#[cfg(test)]
+	append_publication_hold: Arc<std::sync::Mutex<Option<AppendPublicationHold>>>,
 }
 
 impl WendelonLogStore {
@@ -594,6 +623,37 @@ impl WendelonLogStore {
 	#[cfg(test)]
 	pub(crate) fn fail_appends_for_test(&self) -> Arc<std::sync::atomic::AtomicBool> {
 		self.fail_appends.clone()
+	}
+
+	/// Test-only (DC-287): from now on, keeps every completed append batch's record.
+	#[cfg(test)]
+	pub(crate) fn record_appends_for_test(&self) {
+		self.append_records
+			.lock()
+			.unwrap()
+			.get_or_insert_with(Vec::new);
+	}
+
+	/// Test-only (DC-287): the records kept since [`Self::record_appends_for_test`], in order.
+	#[cfg(test)]
+	pub(crate) fn append_records_for_test(
+		&self,
+	) -> Vec<crate::consensus::wal_append_trace::WalAppendRecord> {
+		self.append_records
+			.lock()
+			.unwrap()
+			.clone()
+			.unwrap_or_default()
+	}
+
+	/// Test-only (DC-287): arms a one-shot hold after the next append record's endpoint, before it
+	/// is published. The frozen record is put in `witness` at the hold's entry, then `entered`
+	/// gets a permit; the append continues when `release` gets one.
+	#[cfg(test)]
+	pub(crate) fn hold_next_append_publication_for_test(&self) -> AppendPublicationHold {
+		let hold = AppendPublicationHold::default();
+		*self.append_publication_hold.lock().unwrap() = Some(hold.clone());
+		hold
 	}
 
 	/// Arms the one-shot hold after a rebuild's first publication observation: `entered` gets a
@@ -655,6 +715,10 @@ impl WendelonLogStore {
 			backup_after_wal_read_hold: Default::default(),
 			#[cfg(test)]
 			rebuild_after_observation_hold: Default::default(),
+			#[cfg(test)]
+			append_records: Default::default(),
+			#[cfg(test)]
+			append_publication_hold: Default::default(),
 			#[cfg(test)]
 			fail_appends: Default::default(),
 			recovered_artifact_hash: None,
@@ -1058,6 +1122,10 @@ impl WendelonLogStore {
 			backup_after_wal_read_hold: Default::default(),
 			#[cfg(test)]
 			rebuild_after_observation_hold: Default::default(),
+			#[cfg(test)]
+			append_records: Default::default(),
+			#[cfg(test)]
+			append_publication_hold: Default::default(),
 			#[cfg(test)]
 			fail_appends: Default::default(),
 		};
@@ -2248,6 +2316,12 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		let mut touched_segments: Vec<(u64, FileHandle)> = Vec::new();
 		let mut pending = Vec::with_capacity(batch.len());
 		let wal_append_started = Instant::now();
+		// DC-287: this batch's time, attributed across its spans (observation only).
+		let mut trace = crate::consensus::wal_append_trace::WalAppendTrace::begin(
+			batch.first().map_or(0, |entry| entry.log_id.index),
+			batch.last().map_or(0, |entry| entry.log_id.index),
+			batch.len(),
+		);
 		for (entry, page) in batch.iter().zip(pages) {
 			let index = entry.log_id.index;
 			if page.len() as u64 > segment_bytes {
@@ -2326,6 +2400,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				};
 				replacement.push(page);
 				effects = true;
+				let replace_started = std::time::Instant::now();
 				let (handle, len) = match replace_checkpoint_only_segment(
 					file_ops.as_ref(),
 					&artifact_paths.wal,
@@ -2341,6 +2416,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 						return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
 					}
 				};
+				trace.replace(replace_started);
 				let last = wal_segments.last_mut().expect("checkpoint-only segment");
 				last.len_bytes = len;
 				last.end_log_index = Some(index);
@@ -2358,6 +2434,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				continue;
 			}
 			if needs_rotation {
+				let rotation_started = std::time::Instant::now();
 				let (segment_path, segment_handle) =
 					match create_wal_segment(file_ops.as_ref(), &artifact_paths.wal, index).await {
 						Ok(created) => created,
@@ -2366,6 +2443,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 							return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
 						}
 					};
+				trace.rotation(rotation_started);
 				wal_segments.push(WalSegmentMeta {
 					path: segment_path,
 					start_index: index,
@@ -2380,8 +2458,14 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				.last_mut()
 				.expect("active wal segment metadata");
 			effects = true;
-			let (written, _page) = match file_ops.write_at(&active_handle, wal_cursor, page).await {
-				Ok(result) => result,
+			let (written, _page) = match file_ops
+				.write_at_timed(&active_handle, wal_cursor, page)
+				.await
+			{
+				Ok((result, timing)) => {
+					trace.ordinary(timing);
+					result
+				}
 				Err(e) => {
 					let e = self.poison("append", "write", e).await;
 					callback
@@ -2417,7 +2501,25 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			active_segment.len_bytes = wal_cursor;
 			active_segment.end_log_index = Some(index);
 		}
-		metrics().observe_wal_append_latency(wal_append_started.elapsed());
+		// DC-287: the entry-write loop's endpoint. The record is frozen here, its total and its
+		// completion time read together, before any registry access (publication may wait).
+		let record = trace.finish();
+		let wal_append_elapsed = wal_append_started.elapsed();
+		#[cfg(test)]
+		{
+			let hold = self.append_publication_hold.lock().unwrap().take();
+			if let Some(hold) = hold {
+				*hold.witness.lock().unwrap() = Some(record);
+				hold.entered.add_permits(1);
+				hold.release.acquire().await.unwrap().forget();
+			}
+		}
+		metrics().observe_wal_append_latency(wal_append_elapsed);
+		metrics().record_wal_append(&record);
+		#[cfg(test)]
+		if let Some(records) = self.append_records.lock().unwrap().as_mut() {
+			records.push(record);
+		}
 
 		let wal_fsync_started = Instant::now();
 		for (_, handle) in &touched_segments {
@@ -17654,6 +17756,247 @@ mod recovery_tests {
 			.map(|entry| entry.log_id.index)
 			.collect::<Vec<_>>();
 		assert_eq!(indexes, vec![1, 2, 3]);
+	}
+
+	/// DC-287 (Codex 01a207a1): a batch that rotates attributes each rotation to `rotation` and
+	/// each entry's write to the ring phases. Nothing is untraced or replaced, and the measured
+	/// spans never exceed the batch.
+	#[tokio::test]
+	async fn an_append_record_attributes_rotations_and_ring_writes() {
+		let dir = tempdir("dc287-rotate-record");
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		store.record_appends_for_test();
+		let before = named_segment_paths(&dir).len();
+		store
+			.blocking_append(vec![
+				lease_entry(1, 0, 9, 1),
+				lease_entry(2, 10, 19, 2),
+				lease_entry(3, 20, 29, 3),
+			])
+			.await
+			.unwrap();
+		let created = (named_segment_paths(&dir).len() - before) as u64;
+		let records = store.append_records_for_test();
+		let [record] = records.as_slice() else {
+			panic!("one batch, one record: {records:?}");
+		};
+		assert_eq!(
+			(record.first_index, record.last_index, record.entries),
+			(1, 3, 3)
+		);
+		assert_eq!(
+			(
+				record.ordinary_writes,
+				record.untraced_writes,
+				record.replaces
+			),
+			(3, 0, 0)
+		);
+		assert!(created >= 2, "premise: the batch rotated: {created}");
+		assert_eq!(record.rotations, created, "{record:?}");
+		assert!(record.rotation > std::time::Duration::ZERO, "{record:?}");
+		assert!(record.dispatched > std::time::Duration::ZERO, "{record:?}");
+		assert!(record.attributed() <= record.total, "{record:?}");
+		assert_eq!(record.attributed() + record.residual(), record.total);
+	}
+
+	/// DC-287: the checkpoint-only replace writes the entry inside the replace, so the batch counts
+	/// one replace and no ordinary write: its nested writes and syncs are not counted twice.
+	#[tokio::test]
+	async fn an_append_record_counts_a_replace_once_with_its_nested_writes() {
+		let dir = tempdir("dc287-replace-record");
+		let page = DIRECT_IO_ALIGN as u64;
+		let mut store = try_open_store_with_segment_bytes(&dir, page).await.unwrap();
+		store.record_appends_for_test();
+		store
+			.blocking_append(vec![finalize_entry(1, 111)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 1))).await.unwrap();
+		assert_eq!(
+			segment_metadata(&store).await,
+			vec![(1, Some(1), page), (2, None, page)],
+			"premise: a checkpoint-only active segment"
+		);
+		store
+			.blocking_append(vec![finalize_entry(2, 222)])
+			.await
+			.unwrap();
+		let records = store.append_records_for_test();
+		let record = records.last().unwrap();
+		assert_eq!((record.first_index, record.entries), (2, 1));
+		assert_eq!(
+			(
+				record.replaces,
+				record.ordinary_writes,
+				record.untraced_writes,
+				record.rotations
+			),
+			(1, 0, 0, 0),
+			"{record:?}"
+		);
+		assert!(record.replace > std::time::Duration::ZERO, "{record:?}");
+		assert_eq!(record.attributed() + record.residual(), record.total);
+	}
+
+	/// Codex 01a207d0 R1 and 01a20812: the record is frozen at the entry-write loop's endpoint. A
+	/// slow entry write inside the loop (its completion held 200 ms) is retained; a delay between
+	/// the endpoint and the publication (held 300 ms) is excluded. The frozen record is witnessed
+	/// at the publication hold's entry and the published record equals it exactly, total and
+	/// completion time. No upper bound is placed on real I/O; every wait is bounded.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_delayed_publication_leaves_the_append_record_unchanged() {
+		const IN_LOOP: std::time::Duration = std::time::Duration::from_millis(200);
+		const PUBLICATION: std::time::Duration = std::time::Duration::from_millis(300);
+		let bound = std::time::Duration::from_secs(30);
+		let dir = tempdir("dc287-frozen-record");
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let (wal, vote, snapshot) = artifact_paths(&dir);
+		let mut store = WendelonLogStore::open_with_file_ops_and_options(
+			&wal,
+			&vote,
+			&snapshot,
+			Arc::new(crate::storage::IoUringFileOps::new(io.clone())),
+			WalOptions::default(),
+		)
+		.await
+		.unwrap();
+		store.record_appends_for_test();
+		let hold = store.hold_next_append_publication_for_test();
+		let (ready, release_write) = io.hold_next_completion_for_test();
+		let probe = store.clone();
+		let appending = tokio::spawn(async move {
+			store
+				.blocking_append(vec![lease_entry(1, 0, 9, 1)])
+				.await
+				.unwrap();
+			store
+		});
+		// The entry write's completion is held inside the loop.
+		tokio::task::spawn_blocking(move || ready.recv_timeout(bound))
+			.await
+			.unwrap()
+			.expect("the entry write's completion is held");
+		tokio::time::sleep(IN_LOOP).await;
+		release_write.send(()).unwrap();
+		// Then the endpoint's publication is held.
+		tokio::time::timeout(bound, hold.entered.acquire())
+			.await
+			.expect("the append reached its publication")
+			.unwrap()
+			.forget();
+		let held_at_unix_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let witness = hold
+			.witness
+			.lock()
+			.unwrap()
+			.expect("the frozen record is witnessed at the hold");
+		assert!(
+			probe.append_records_for_test().is_empty(),
+			"not published while held"
+		);
+		tokio::time::sleep(PUBLICATION).await;
+		hold.release.add_permits(1);
+		let store = tokio::time::timeout(bound, appending)
+			.await
+			.expect("the append finished")
+			.unwrap();
+		let records = store.append_records_for_test();
+		let [record] = records.as_slice() else {
+			panic!("one record: {records:?}");
+		};
+		assert_eq!(
+			*record, witness,
+			"the published record is the one frozen at the endpoint"
+		);
+		assert!(
+			witness.total >= IN_LOOP && witness.handoff >= IN_LOOP,
+			"the delay inside the loop is retained: {witness:?}"
+		);
+		assert!(
+			witness.completed_unix_ms <= held_at_unix_ms,
+			"completion time read at the endpoint, before the publication hold: {witness:?} vs {held_at_unix_ms}"
+		);
+	}
+
+	/// DC-287: one long batch, then fast ones. The long batch's record is coherent (its spans and
+	/// residual add up to its total, and its held completion shows as handoff). The registry keeps
+	/// it, one record, through the faster batches after it.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_slowest_append_record_is_coherent_and_survives_faster_batches() {
+		const HOLD: std::time::Duration = std::time::Duration::from_millis(300);
+		let dir = tempdir("dc287-retained-record");
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let (wal, vote, snapshot) = artifact_paths(&dir);
+		let mut store = WendelonLogStore::open_with_file_ops_and_options(
+			&wal,
+			&vote,
+			&snapshot,
+			Arc::new(crate::storage::IoUringFileOps::new(io.clone())),
+			WalOptions::default(),
+		)
+		.await
+		.unwrap();
+		store.record_appends_for_test();
+		let (ready, release) = io.hold_next_completion_for_test();
+		let held = tokio::spawn(async move {
+			store
+				.blocking_append(vec![lease_entry(1, 0, 9, 1)])
+				.await
+				.unwrap();
+			store
+		});
+		tokio::task::spawn_blocking(move || ready.recv().unwrap())
+			.await
+			.unwrap();
+		tokio::time::sleep(HOLD).await;
+		release.send(()).unwrap();
+		let mut store = held.await.unwrap();
+		for i in 2..=4u64 {
+			store
+				.blocking_append(vec![lease_entry(i, i * 10, i * 10 + 9, i as u32)])
+				.await
+				.unwrap();
+		}
+		let records = store.append_records_for_test();
+		assert_eq!(records.len(), 4);
+		let slow = records[0];
+		assert_eq!((slow.first_index, slow.ordinary_writes), (1, 1));
+		assert!(slow.total >= HOLD && slow.handoff >= HOLD, "{slow:?}");
+		assert_eq!(slow.attributed() + slow.residual(), slow.total);
+		assert!(records[1..].iter().all(|r| r.total < slow.total));
+		let registry = crate::metrics::isolated_for_test();
+		for record in &records {
+			registry.record_wal_append(record);
+		}
+		let text = registry.render_prometheus();
+		let series = |field: &str| {
+			format!("wendelon_storage_wal_append_slowest_batch{{field=\"{field}\"}} ")
+		};
+		let value = |field: &str| -> u64 {
+			text.lines()
+				.find_map(|line| line.strip_prefix(&series(field)))
+				.unwrap_or_else(|| panic!("missing {field}"))
+				.parse()
+				.unwrap()
+		};
+		assert_eq!(
+			value("seq"),
+			slow.seq,
+			"the slow batch survives the fast ones"
+		);
+		assert_eq!(value("first_index"), 1);
+		assert!(value("total_us") >= HOLD.as_micros() as u64);
+		assert!(value("handoff_us") >= HOLD.as_micros() as u64);
+		assert_eq!(
+			text.matches("wendelon_storage_wal_append_slowest_batch{")
+				.count(),
+			18,
+			"one coherent record"
+		);
 	}
 
 	#[tokio::test]
