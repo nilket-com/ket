@@ -45,6 +45,11 @@ impl AttemptGate {
 		}
 	}
 
+	/// The caller's deadline, if it named one (wendelon ADR 0126 D3 bounds a holder's wait by it).
+	pub(super) fn deadline(&self) -> Option<Instant> {
+		self.deadline
+	}
+
 	/// Claims the gate for the attempt, unless its deadline has passed on the
 	/// clock or has already expired the gate. The clock is read and the gate
 	/// taken with nothing awaited between them, so a deadline that passed

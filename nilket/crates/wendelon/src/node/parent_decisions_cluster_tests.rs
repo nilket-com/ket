@@ -6815,6 +6815,8 @@ mod debt_before_append;
 mod drop_exclusion;
 #[path = "parent_decisions_cluster_tests/drop_prepare.rs"]
 mod drop_prepare;
+#[path = "parent_decisions_cluster_tests/holder_retirement_wait_tests.rs"]
+mod holder_retirement_wait;
 #[path = "parent_decisions_cluster_tests/maintenance_step.rs"]
 mod maintenance_step;
 #[path = "parent_decisions_cluster_tests/multi_row_delete.rs"]

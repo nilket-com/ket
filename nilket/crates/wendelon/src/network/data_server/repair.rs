@@ -500,6 +500,7 @@ pub(crate) async fn repair_child_in(
 				#[cfg(test)]
 				before_sign: None,
 			},
+			crate::storage::manager::tier_authority::RetirementWait::NONE,
 		)
 		.await
 		{

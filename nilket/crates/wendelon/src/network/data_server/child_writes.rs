@@ -13,6 +13,7 @@
 use super::*;
 use crate::schema::ClientWriteId;
 use crate::storage::index::parent_intents::OwnedVersion;
+use crate::storage::manager::tier_authority::RetirementWait;
 
 /// Stripes of the per-parent lock. A fixed set: no entry is created or freed
 /// per request, so nothing leaks and one `rsv` always maps to one mutex.
@@ -1096,6 +1097,36 @@ pub(crate) async fn verify_owned_rows(
 	intent: &crate::storage::index::parent_intents::ParentIntent,
 	descriptor: &TableSchemaDescriptor,
 ) -> Result<(), ChildRefusal> {
+	verify_owned_rows_waiting(slab, index, intent, descriptor, RetirementWait::NONE).await
+}
+
+/// One owned version's stored rows. With a wait, a holder's own read, whose location-list
+/// admission waits out a logged retirement fence until the wait's end (wendelon ADR 0126 D3).
+async fn stored_rows(
+	slab: &SlabManager,
+	tenant: TenantId,
+	version: &crate::storage::index::parent_intents::OwnedVersion,
+	wait: RetirementWait,
+) -> std::io::Result<Vec<RecordBatch>> {
+	let key = Identity::new(version.key_identity);
+	if wait == RetirementWait::NONE {
+		slab.stored_rows_at_version(tenant, key, version.hlc, None)
+			.await
+	} else {
+		slab.stored_rows_at_version_for_holder(tenant, key, version.hlc, wait)
+			.await
+	}
+}
+
+/// [`verify_owned_rows`], its stored-row reads waiting out a logged retirement fence until
+/// `wait`'s end (wendelon ADR 0126; a holder's own child only).
+pub(crate) async fn verify_owned_rows_waiting(
+	slab: &SlabManager,
+	index: &crate::storage::index::PersistentLocalIndex,
+	intent: &crate::storage::index::parent_intents::ParentIntent,
+	descriptor: &TableSchemaDescriptor,
+	wait: RetirementWait,
+) -> Result<(), ChildRefusal> {
 	let unverified = |detail: String| ChildRefusal::Unverified(detail);
 	for version in &intent.manifest {
 		// ADR 0699 S4b: a typed tombstone is proved by its stored tombstone
@@ -1129,13 +1160,7 @@ pub(crate) async fn verify_owned_rows(
 				"a manifest version is not owned by this child".into(),
 			));
 		}
-		let rows = slab
-			.stored_rows_at_version(
-				intent.tenant,
-				Identity::new(version.key_identity),
-				version.hlc,
-				None,
-			)
+		let rows = stored_rows(slab, intent.tenant, version, wait)
 			.await
 			.map_err(|error| unverified(error.to_string()))?;
 		if rows.is_empty() {
@@ -1241,10 +1266,34 @@ pub(crate) async fn persist_child(
 	crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
 	ChildRefusal,
 > {
+	persist_child_waiting(
+		slab,
+		state_machine,
+		locks,
+		plan,
+		authority,
+		RetirementWait::NONE,
+	)
+	.await
+}
+
+/// [`persist_child`], a holder's own reads waiting out a logged retirement fence until `wait`'s
+/// end (wendelon ADR 0126 D3). Every other role ignores the wait.
+pub(crate) async fn persist_child_waiting(
+	slab: Arc<SlabManager>,
+	state_machine: WendelonStateMachine,
+	locks: Arc<ParentLocks>,
+	plan: AdmittedPlan,
+	authority: ChildAuthority,
+	wait: RetirementWait,
+) -> Result<
+	crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
+	ChildRefusal,
+> {
 	if authority.role == ChildRole::Repair {
 		return Err(ChildRefusal::WrongSender);
 	}
-	persist_locked(slab, state_machine, locks, plan, authority)
+	persist_locked(slab, state_machine, locks, plan, authority, wait)
 		.await?
 		.ok_or(ChildRefusal::WrongSender)
 }
@@ -1257,6 +1306,7 @@ pub(super) async fn persist_locked(
 	locks: Arc<ParentLocks>,
 	admitted: AdmittedPlan,
 	authority: ChildAuthority,
+	wait: RetirementWait,
 ) -> Result<
 	Option<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>>,
 	ChildRefusal,
@@ -1264,6 +1314,12 @@ pub(super) async fn persist_locked(
 	use crate::consensus::decisions::ParentStatus;
 	use crate::storage::index::parent_intents::ParentIntentState::{Complete, Intent, Refused};
 	let AdmittedPlan { plan, admission } = admitted;
+	// Wendelon ADR 0126 D3: only a holder's own child waits; every other role reads as before.
+	let wait = if authority.role == ChildRole::Holder {
+		wait
+	} else {
+		RetirementWait::NONE
+	};
 	// Lock order: the index admission guard (taken with the plan), then the
 	// parent lock. Both move into the spawned work, which a cancelled caller
 	// does not stop, so neither is released before that work ends.
@@ -1369,13 +1425,7 @@ pub(super) async fn persist_locked(
 				.enumerate()
 				.filter(|_| plan.tombstone.is_none())
 			{
-				let stored = slab
-					.stored_rows_at_version(
-						plan.intent.tenant,
-						Identity::new(version.key_identity),
-						version.hlc,
-						None,
-					)
+				let stored = stored_rows(&slab, plan.intent.tenant, version, wait)
 					.await
 					.map_err(storage)?;
 				if stored.is_empty() {
@@ -1401,7 +1451,7 @@ pub(super) async fn persist_locked(
 			}
 		}
 		// The proof the acknowledgement attests, for a new and a retried Complete.
-		verify_owned_rows(&slab, &index, &plan.intent, &plan.descriptor).await?;
+		verify_owned_rows_waiting(&slab, &index, &plan.intent, &plan.descriptor, wait).await?;
 		if !recorded_complete {
 			index
 				.set_parent_intent_state(rsv, ordinal, &[Intent], Complete)
@@ -2045,13 +2095,14 @@ impl WendelonDataServer {
 		batch: RecordBatch,
 		rows: Arc<Vec<u8>>,
 		trailing: Arc<Vec<u8>>,
+		wait: RetirementWait,
 	) -> Result<
 		Vec<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>>,
 		ChildRefusal,
 	> {
 		let given = GivenKeys::of_section(&trailing);
 		match self
-			.child_write_keyed(sender, ChildRole::Holder, meta.clone(), batch, given)
+			.child_write_keyed(sender, ChildRole::Holder, meta.clone(), batch, given, wait)
 			.await
 		{
 			Ok(own) => {
@@ -2271,6 +2322,7 @@ impl WendelonDataServer {
 		meta: ChildWriteMeta,
 		batch: RecordBatch,
 		given: GivenKeys,
+		wait: RetirementWait,
 	) -> Result<
 		crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
 		ChildRefusal,
@@ -2333,7 +2385,7 @@ impl WendelonDataServer {
 			)
 		})
 		.await?;
-		persist_child(
+		persist_child_waiting(
 			self.slab.clone(),
 			self.state_machine.clone(),
 			self.decisions.locks.clone(),
@@ -2345,6 +2397,7 @@ impl WendelonDataServer {
 				#[cfg(test)]
 				before_sign: None,
 			},
+			wait,
 		)
 		.await
 	}
@@ -2427,7 +2480,10 @@ impl WendelonDataServer {
 			Err(reason) => ChildWriteResponse::Refused(reason),
 			Ok((meta, batch)) if role == ChildRole::Holder => {
 				let rows = Arc::new(rows.unwrap_or_default().to_vec());
-				match self.holder_write(sender, meta, batch, rows, trailing).await {
+				match self
+					.holder_write(sender, meta, batch, rows, trailing, RetirementWait::NONE)
+					.await
+				{
 					Ok(acks) => ChildWriteResponse::Acked(acks),
 					Err(_) => {
 						ChildWriteResponse::Refused("the holder could not write its child".into())
@@ -2435,7 +2491,14 @@ impl WendelonDataServer {
 				}
 			}
 			Ok((meta, batch)) => match self
-				.child_write_keyed(sender, role, meta, batch, GivenKeys::of_section(&trailing))
+				.child_write_keyed(
+					sender,
+					role,
+					meta,
+					batch,
+					GivenKeys::of_section(&trailing),
+					RetirementWait::NONE,
+				)
 				.await
 			{
 				Err(refusal) => ChildWriteResponse::Refused(format!("{refusal:?}")),

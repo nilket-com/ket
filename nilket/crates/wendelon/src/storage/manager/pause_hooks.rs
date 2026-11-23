@@ -206,11 +206,103 @@ impl SlabManager {
 		self.tier_authority.clear_retirement(slab_id, Some(1));
 	}
 
+	/// DC-287: whether the store-wide retirement fence stands now (a witness, not a decision).
+	pub(crate) fn retirement_fence_stands_for_test(&self) -> bool {
+		self.tier_authority.retirement_fence_stands()
+	}
+
 	/// A refusal that does not clear by itself, as an unresolved operation's fence is.
 	pub(crate) fn fence_unresolved_op_for_test(&self) {
 		self.tier_authority
 			.unresolved_op_fence
 			.store(true, Ordering::Release);
+	}
+
+	/// ADR 0126: the retirement class, one load (`RETIRING_*` bits; 0 is no fence).
+	pub(crate) fn retirement_class_for_test(&self) -> u8 {
+		self.tier_authority
+			.readiness_blocks()
+			.retirement_class_for_test()
+	}
+
+	/// ADR 0126: the real retirement mark and clear, with any index (`None` is unindexed).
+	pub(crate) fn mark_retirement_for_test(&self, slab_id: SlabId, index: Option<u64>) {
+		self.tier_authority.mark_retirement(slab_id, index);
+	}
+
+	pub(crate) fn clear_retirement_for_test(&self, slab_id: SlabId, index: Option<u64>) {
+		self.tier_authority.clear_retirement(slab_id, index);
+	}
+
+	pub(crate) fn mark_snapshot_retirement_for_test(&self, slab_id: SlabId, epoch: u64) {
+		self.tier_authority
+			.mark_snapshot_retirement(slab_id, epoch, None);
+	}
+
+	pub(crate) fn clear_snapshot_retirement_for_test(&self, slab_id: SlabId, epoch: u64) {
+		self.tier_authority
+			.clear_snapshot_retirement(slab_id, epoch);
+	}
+
+	/// ADR 0126: how many holder reads began an eligible retirement wait on this store.
+	pub(crate) fn holder_retirement_waits_for_test(&self) -> usize {
+		self.tier_authority
+			.holder_retirement_waits_for_test
+			.load(Ordering::Acquire)
+	}
+
+	/// ADR 0126: until at least `n` holder reads have begun an eligible retirement wait.
+	pub(crate) async fn holder_retirement_wait_began_for_test(&self, n: usize) {
+		loop {
+			let began = self
+				.tier_authority
+				.holder_retirement_wait_began_for_test
+				.notified();
+			tokio::pin!(began);
+			began.as_mut().enable();
+			if self.holder_retirement_waits_for_test() >= n {
+				return;
+			}
+			began.await;
+		}
+	}
+
+	/// ADR 0126 R1: how many wake registrations holder reads made on this store.
+	pub(crate) fn holder_retirement_registrations_for_test(&self) -> usize {
+		self.tier_authority
+			.holder_retirement_registrations_for_test
+			.load(Ordering::Acquire)
+	}
+
+	/// ADR 0126 R2: the end the last eligible holder wait on this store was forwarded.
+	pub(crate) fn holder_retirement_wait_end_for_test(&self) -> Option<tokio::time::Instant> {
+		*self
+			.tier_authority
+			.holder_retirement_wait_end_for_test
+			.lock()
+			.unwrap()
+	}
+
+	/// ADR 0126 R1: holds the next holder read between its first eligible refusal and its first
+	/// arm; returns (reached, release).
+	pub(crate) fn hold_holder_first_refusal_for_test(
+		&self,
+	) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+		let pair = (
+			Arc::new(tokio::sync::Notify::new()),
+			Arc::new(tokio::sync::Notify::new()),
+		);
+		*self
+			.tier_authority
+			.holder_first_refusal_hold_for_test
+			.lock()
+			.unwrap() = Some(pair.clone());
+		pair
+	}
+
+	/// ADR 0126: close the tier authority, as a stopping store does.
+	pub(crate) fn stop_tier_authority_for_test(&self) {
+		self.tier_authority.stop();
 	}
 
 	pub(super) fn take_append_refusal_for_test(&self) -> bool {

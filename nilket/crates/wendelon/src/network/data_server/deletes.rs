@@ -610,7 +610,14 @@ impl WendelonDataServer {
 		// Locked persistence runs in its own task and finishes if this ends.
 		let Some((acks, _)) = bounded(
 			deadline,
-			self.write_children(&claim, rsv, &descriptor, &batch, &indices),
+			self.write_children(
+				&claim,
+				rsv,
+				&descriptor,
+				&batch,
+				&indices,
+				crate::storage::manager::tier_authority::RetirementWait::NONE,
+			),
 		)
 		.await
 		else {

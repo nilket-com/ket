@@ -24,6 +24,7 @@ use crate::network::decision_proposals::{
 	CutResponse, ForwardedDecision, LookupRequest, LookupResponse, ProposalOutcome,
 	ProposalResponse,
 };
+use crate::storage::manager::tier_authority::RetirementWait;
 use std::collections::BTreeMap;
 
 /// Test-only trace of why a coordinated write stopped.
@@ -974,8 +975,29 @@ impl WendelonDataServer {
 				}
 			}
 		};
+		// Wendelon ADR 0126 D3: one absolute end for this attempt's discretionary waiting at its
+		// local holders' own reads, shared by every child: an ordinary table write only (not KV, not
+		// a CTAS chunk), and never past the caller's deadline.
+		let retirement_wait =
+			if matches!(namespace, ParentNamespace::Table(_)) && dispatch.is_none() {
+				let cap = tokio::time::Instant::now()
+					+ crate::storage::manager::tier_authority::HOLDER_RETIREMENT_WAIT;
+				let end = gate.deadline().map_or(cap, |deadline| {
+					cap.min(tokio::time::Instant::from_std(deadline))
+				});
+				RetirementWait::until(end)
+			} else {
+				RetirementWait::NONE
+			};
 		let (acks, holder) = self
-			.write_children(&claim, rsv, &descriptor, batch, &child_rows)
+			.write_children(
+				&claim,
+				rsv,
+				&descriptor,
+				batch,
+				&child_rows,
+				retirement_wait,
+			)
 			.await;
 		let carried = acks.len();
 		#[cfg(test)]
@@ -1029,6 +1051,7 @@ impl WendelonDataServer {
 		descriptor: &TableSchemaDescriptor,
 		batch: &RecordBatch,
 		child_rows: &[Vec<u32>],
+		retirement_wait: RetirementWait,
 	) -> (Vec<Signed<ChildAckBody>>, HolderSeen) {
 		let digest = crate::consensus::decisions::claim_digest(claim);
 		let mut acks = Vec::new();
@@ -1071,6 +1094,7 @@ impl WendelonDataServer {
 						sub,
 						Arc::new(rows_bytes),
 						trailing,
+						retirement_wait,
 					)
 					.await
 				{

@@ -1136,6 +1136,10 @@ struct AgedL2 {
 	cluster: Cluster,
 	leader: u32,
 	append: TableSchemaDescriptor,
+	/// The cluster's primary-key table (DC-287's holder-fence baseline writes one row to it).
+	pk: TableSchemaDescriptor,
+	/// The decision floor this fixture jumped to: a later write's identity must lie above it.
+	floor: u64,
 	s1: crate::schema::SlabId,
 	s2: crate::schema::SlabId,
 	a1: crate::schema::Identity,
@@ -1146,7 +1150,7 @@ struct AgedL2 {
 async fn aged_l2() -> AgedL2 {
 	use std::sync::atomic::Ordering::Release;
 	let time = TestTime::new();
-	let (cluster, leader, _, append) = windowed_with_l2(&time).await;
+	let (cluster, leader, pk, append) = windowed_with_l2(&time).await;
 	let server = cluster.node(leader).data_server.clone();
 	server
 		.decision_peer_for_test()
@@ -1233,6 +1237,8 @@ async fn aged_l2() -> AgedL2 {
 		cluster,
 		leader,
 		append,
+		pk,
+		floor: floor1 + 60_000,
 		s1,
 		s2,
 		a1: identity_of(&a1, 0),
@@ -4115,4 +4121,282 @@ async fn sustained_pressure_releases_by_committed_generations_and_backpressures_
 		);
 	}
 	shut_down(cluster, &time).await;
+}
+
+/// DC-287 (Codex 01a209a9): the holder-fence BASELINE on the public path. One in-process call
+/// through `table_write` on the leader of this RF3 cluster: a local holder read, not an RF1 run,
+/// and no fence attribution for the Section 8 failures. The leader's own holder child is paused
+/// after its intent begins; a real certified Retire of S2 is held after its commit, with the
+/// store-wide fence standing; the holder is released into its pre-append scan. On the base the
+/// scan refuses at once: the persist work ends and the coordinator reaches Finalize while the
+/// Retire is still held. Only then is the Retire released (the fence clears); the absence of an
+/// append is read passively after the clear, and the write's actual answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "DC-287: drives a real certified Retire; runs only on a ruling"]
+async fn holder_fence_baseline_the_leaders_scan_refuses_while_a_real_retirement_is_held() {
+	use super::write_deadline::until_reached;
+	use crate::storage::index::parent_intents::ParentIntentState;
+	let fx = Arc::new(aged_l2().await);
+	let leader = fx.leader;
+	let slab = fx.slab();
+	let server = fx.cluster.node(leader).data_server.clone();
+	// A primary-key row whose primary is the leader: its holder child is the leader's own.
+	let mut chosen = None;
+	for id in 1..200i64 {
+		let primary = server
+			.primary_for_test(TenantId::ZERO, &fx.pk, &rows(&fx.pk, &[id]))
+			.await
+			.expect("every position is leased");
+		if primary == leader {
+			chosen = Some(id);
+			break;
+		}
+	}
+	let id = chosen.expect("a row whose primary is the leader");
+	let meta = write_meta(&fx.pk, 1, uuid_v7_at(fx.floor + 1_000));
+	let after = crate::network::data_server::child_writes::persist_pause::arm_after_begin(
+		&slab,
+		fx.pk.table_object_id,
+	);
+	let (finalize_reached, finalize_release) =
+		server.pause_coordinator_for_test(PauseStage::BeforeFinalize);
+	let finalize_held = ReleaseOnDrop(finalize_release);
+	let write = {
+		let server = server.clone();
+		let batch = rows(&fx.pk, &[id]);
+		tokio::spawn(async move { server.table_write_for_test(meta, batch).await })
+	};
+	// The Reserve is applied and the intent begun (its index write lock released).
+	until_reached("the holder after its begin", &after.reached).await;
+
+	// A real certified Retire of S2, held after its commit: the store-wide fence stands.
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*slab
+		.persistent_index()
+		.unwrap()
+		.retirement_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let step = {
+		let fx = fx.clone();
+		tokio::spawn(async move { fx.step().await })
+	};
+	tokio::time::timeout(BOUND, tokio::task::spawn_blocking(move || entered.wait()))
+		.await
+		.expect("the Retire reached its hold")
+		.unwrap();
+	assert!(
+		slab.retirement_fence_stands_for_test(),
+		"the real fence stands"
+	);
+	assert!(
+		slab.require_tier_authority_ready().is_err(),
+		"authority reads refuse under it"
+	);
+
+	// The holder into its scan. On the base it refuses at once: its work ends and the coordinator
+	// reaches Finalize while the Retire is still held (so it cannot be waiting on that hold's
+	// index write lock).
+	after.release.notify_one();
+	until_reached("the holder's work ended", &after.ended).await;
+	until_reached("the coordinator before Finalize", &finalize_reached).await;
+	assert!(
+		slab.retirement_fence_stands_for_test(),
+		"still under the held Retire"
+	);
+
+	// The Retire released: the fence clears.
+	tokio::time::timeout(BOUND, tokio::task::spawn_blocking(move || release.wait()))
+		.await
+		.unwrap()
+		.unwrap();
+	let stepped = tokio::time::timeout(BOUND, step).await.unwrap().unwrap();
+	assert!(
+		matches!(stepped, Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2),
+		"S2's retirement: {stepped:?}"
+	);
+	assert!(
+		!slab.retirement_fence_stands_for_test(),
+		"the fence cleared"
+	);
+
+	// After the clear, passively: nothing was appended, and the intent is still Intent.
+	let rsv = record_of(&fx.cluster, key_of(&fx.pk, &meta))
+		.await
+		.expect("reserved")
+		.rsv;
+	let intent = slab
+		.persistent_index()
+		.unwrap()
+		.parent_intent(rsv, 0)
+		.await
+		.unwrap()
+		.map(|intent| intent.state);
+	let appended = after.manifest().iter().any(|version| {
+		slab.version_in_memory_index(
+			TenantId::ZERO,
+			crate::schema::Identity::new(version.key_identity),
+			version.hlc,
+		)
+	});
+	drop(finalize_held);
+	let (answer, _) = tokio::time::timeout(BOUND, write)
+		.await
+		.expect("the write answers")
+		.unwrap()
+		.unwrap();
+	eprintln!(
+		"DC287 holder baseline: id {id}, rsv {rsv}: status {:?}, knowledge {:?}; intent {intent:?}; appended {appended}",
+		answer.write.status,
+		answer.write.mutation_commit_knowledge()
+	);
+	assert_eq!(
+		intent,
+		Some(ParentIntentState::Intent),
+		"no ack, no completion"
+	);
+	assert!(!appended, "the refused scan appended nothing");
+	let fx = Arc::try_unwrap(fx).unwrap_or_else(|_| panic!("the fixture is no longer shared"));
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0126, the CANDIDATE on the public path (the baseline's ordering, the candidate's
+/// synchronisation): one in-process call through `table_write` on the leader of this RF3 cluster.
+/// The leader's holder is paused after its begin; a real certified Retire of S2 is held after its
+/// commit (the fence standing); the holder is released into its scan, and its eligible wait is
+/// witnessed. The Retire is then released at once (the fence clears), and only then are the
+/// holder's end and Finalize awaited, so the hold spends none of the budget under test. Expected:
+/// the same write commits, its holder's intent Complete and its versions indexed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "ADR 0126: drives a real certified Retire; runs only on a ruling"]
+async fn holder_fence_candidate_the_leaders_scan_waits_out_a_real_retirement_and_commits() {
+	use super::write_deadline::until_reached;
+	use crate::storage::index::parent_intents::ParentIntentState;
+	let fx = Arc::new(aged_l2().await);
+	let leader = fx.leader;
+	let slab = fx.slab();
+	let server = fx.cluster.node(leader).data_server.clone();
+	let mut chosen = None;
+	for id in 1..200i64 {
+		let primary = server
+			.primary_for_test(TenantId::ZERO, &fx.pk, &rows(&fx.pk, &[id]))
+			.await
+			.expect("every position is leased");
+		if primary == leader {
+			chosen = Some(id);
+			break;
+		}
+	}
+	let id = chosen.expect("a row whose primary is the leader");
+	let meta = write_meta(&fx.pk, 1, uuid_v7_at(fx.floor + 1_000));
+	let after = crate::network::data_server::child_writes::persist_pause::arm_after_begin(
+		&slab,
+		fx.pk.table_object_id,
+	);
+	let (finalize_reached, finalize_release) =
+		server.pause_coordinator_for_test(PauseStage::BeforeFinalize);
+	let finalize_held = ReleaseOnDrop(finalize_release);
+	let write = {
+		let server = server.clone();
+		let batch = rows(&fx.pk, &[id]);
+		tokio::spawn(async move { server.table_write_for_test(meta, batch).await })
+	};
+	until_reached("the holder after its begin", &after.reached).await;
+
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*slab
+		.persistent_index()
+		.unwrap()
+		.retirement_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let step = {
+		let fx = fx.clone();
+		tokio::spawn(async move { fx.step().await })
+	};
+	tokio::time::timeout(BOUND, tokio::task::spawn_blocking(move || entered.wait()))
+		.await
+		.expect("the Retire reached its hold")
+		.unwrap();
+	assert!(
+		slab.retirement_fence_stands_for_test(),
+		"the real fence stands"
+	);
+	let waits_before = slab.holder_retirement_waits_for_test();
+
+	// The holder into its scan: its eligible wait is witnessed while the Retire is held.
+	after.release.notify_one();
+	tokio::time::timeout(
+		BOUND,
+		slab.holder_retirement_wait_began_for_test(waits_before + 1),
+	)
+	.await
+	.expect("the holder's scan entered its eligible wait");
+	// Release the Retire at once: the fence clears.
+	tokio::time::timeout(BOUND, tokio::task::spawn_blocking(move || release.wait()))
+		.await
+		.unwrap()
+		.unwrap();
+	until_reached("the holder's work ended", &after.ended).await;
+	until_reached("the coordinator before Finalize", &finalize_reached).await;
+	let stepped = tokio::time::timeout(BOUND, step).await.unwrap().unwrap();
+	assert!(
+		matches!(stepped, Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2),
+		"S2's retirement: {stepped:?}"
+	);
+	assert!(!slab.retirement_fence_stands_for_test());
+
+	let rsv = record_of(&fx.cluster, key_of(&fx.pk, &meta))
+		.await
+		.expect("reserved")
+		.rsv;
+	let intent = slab
+		.persistent_index()
+		.unwrap()
+		.parent_intent(rsv, 0)
+		.await
+		.unwrap()
+		.map(|intent| intent.state);
+	let indexed = after.manifest().iter().all(|version| {
+		slab.version_in_memory_index(
+			TenantId::ZERO,
+			crate::schema::Identity::new(version.key_identity),
+			version.hlc,
+		)
+	});
+	drop(finalize_held);
+	let (answer, _) = tokio::time::timeout(BOUND, write)
+		.await
+		.expect("the write answers")
+		.unwrap()
+		.unwrap();
+	let recorded = record_of(&fx.cluster, key_of(&fx.pk, &meta))
+		.await
+		.expect("recorded");
+	eprintln!(
+		"ADR0126 candidate: id {id}, rsv {rsv}: status {:?}, knowledge {:?}; intent {intent:?}; indexed {indexed}; record {:?}; wait turns {}",
+		answer.write.status,
+		answer.write.mutation_commit_knowledge(),
+		recorded.status,
+		slab.holder_retirement_waits_for_test() - waits_before
+	);
+	assert_eq!(
+		intent,
+		Some(ParentIntentState::Complete),
+		"the holder acknowledged"
+	);
+	assert!(indexed, "its versions are indexed");
+	assert!(
+		matches!(
+			recorded.status,
+			crate::consensus::decisions::ParentStatus::Accepted { .. }
+		),
+		"Finalize accepted: {:?}",
+		recorded.status
+	);
+	assert_eq!(answer.write.status, WriteStatus::OK, "{answer:?}");
+	let fx = Arc::try_unwrap(fx).unwrap_or_else(|_| panic!("the fixture is no longer shared"));
+	shut_down(fx.cluster, &fx.time).await;
 }

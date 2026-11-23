@@ -2354,3 +2354,764 @@ fn a_parent_decisions_append_only_table_admits_only_its_declared_column_types() 
 		assert!(admitted.is_ok(), "{data_type}: admitted: {admitted:?}");
 	}
 }
+
+// ============================================================
+//  DC-287 (Codex 01a20985): a holder's own reads under the store-wide retirement fence
+// ============================================================
+
+/// A local holder mechanism (`reserved_append_only` plans three members), not an RF1 cluster run.
+/// One append-only child of two rows (one physical child frame), retried with the same parent lock
+/// registry, child identity and store. The fence is the real store-wide retirement fence, raised
+/// for a slab other than the rows' (the store's active slab), and only once a hook is witnessed.
+/// Every refusal produces no acknowledgement; a final acknowledgement is witnessed to need no
+/// append (the store's L1 bytes are unchanged, and every append is refused while it runs).
+mod holder_retirement_fence {
+	use super::*;
+	use crate::schema::SlabId;
+
+	const FENCE: u64 = 0x7700;
+
+	struct Holder {
+		_dir: crate::test_support::TestDir,
+		r: Reserved,
+		slab: Arc<SlabManager>,
+		machine: WendelonStateMachine,
+		locks: Arc<ParentLocks>,
+	}
+
+	async fn holder(sequence_no: u64) -> Arc<Holder> {
+		let r = reserved_append_only(&[(1, "a"), (2, "b")], sequence_no);
+		let (dir, slab) = manager().await;
+		let machine = machine(&r.state).await;
+		Arc::new(Holder {
+			_dir: dir,
+			r,
+			slab,
+			machine,
+			locks: Arc::new(ParentLocks::new()),
+		})
+	}
+
+	/// One attempt of the same child: its plan admitted afresh, persisted under the same locks.
+	async fn attempt(
+		h: Arc<Holder>,
+	) -> Result<
+		crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
+		ChildRefusal,
+	> {
+		let planned = AdmittedPlan::admit(&h.slab, &h.machine, |state| {
+			plan_child_keyed(
+				state,
+				h.r.holder,
+				h.r.holder.node,
+				ChildRole::Holder,
+				&h.r.meta,
+				h.r.batch.clone(),
+				section(encode_ordinals(&[0, 1])),
+				|_, _| true,
+			)
+		})
+		.await
+		.unwrap();
+		persist_child(
+			h.slab.clone(),
+			h.machine.clone(),
+			h.locks.clone(),
+			planned,
+			authority(&h.r, ChildRole::Holder),
+		)
+		.await
+	}
+
+	/// Arms the one-shot hold after this store's next durable child frame (before verification).
+	fn hold_after_append(
+		slab: &SlabManager,
+	) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+		let (reached, release) = (
+			Arc::new(tokio::sync::Notify::new()),
+			Arc::new(tokio::sync::Notify::new()),
+		);
+		crate::network::data_server::PAUSE_BEFORE_INDEX_BUFFER
+			.lock()
+			.unwrap()
+			.insert(
+				slab.data_dir().to_path_buf(),
+				(reached.clone(), release.clone()),
+			);
+		(reached, release)
+	}
+
+	/// The refusal's variant and its detail text.
+	fn detail(
+		result: &Result<
+			crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
+			ChildRefusal,
+		>,
+	) -> (&'static str, String) {
+		match result {
+			Ok(_) => ("acknowledged", String::new()),
+			Err(ChildRefusal::Unverified(text)) => ("Unverified", text.clone()),
+			Err(ChildRefusal::Storage(text)) => ("Storage", text.clone()),
+			Err(other) => ("other", format!("{other:?}")),
+		}
+	}
+
+	async fn bounded<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+		tokio::time::timeout(std::time::Duration::from_secs(30), f)
+			.await
+			.unwrap_or_else(|_| panic!("{what}: timed out"))
+	}
+
+	/// A: the stable comparator (the same hold, no fence) acknowledges after one append; and the
+	/// append witness is shown to catch a child append (a fresh child is refused while it is armed).
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_stable_comparator_acknowledges_and_the_append_witness_catches_a_child_append() {
+		let h = holder(1).await;
+		let before = h.slab.local_l1_bytes().await;
+		let (reached, release) = hold_after_append(&h.slab);
+		let write = tokio::spawn(attempt(h.clone()));
+		bounded("the hold after the append", reached.notified()).await;
+		let appended = h.slab.local_l1_bytes().await;
+		release.notify_one();
+		let result = bounded("the comparator", write).await.unwrap();
+		eprintln!(
+			"DC287 holder control A: {:?}; L1 {before} -> {appended}; intent {:?}",
+			detail(&result),
+			intent_state(&h.slab, h.r.rsv).await
+		);
+		assert!(result.is_ok(), "{:?}", detail(&result));
+		assert!(appended > before, "one child frame was appended");
+		assert_eq!(h.slab.local_l1_bytes().await, appended, "and nothing more");
+
+		let fresh = holder(2).await;
+		let before = fresh.slab.local_l1_bytes().await;
+		fresh.slab.refuse_append_after_for_test(0);
+		let refused = bounded("the witness control", attempt(fresh.clone())).await;
+		fresh.slab.clear_append_refusal_for_test();
+		eprintln!("DC287 holder control A witness: {:?}", detail(&refused));
+		assert_eq!(
+			detail(&refused).0,
+			"Storage",
+			"the armed witness refuses a child append"
+		);
+		assert_eq!(fresh.slab.local_l1_bytes().await, before);
+	}
+
+	/// B: the fence raised after the durable child frame refuses verification (Unverified); the same
+	/// child retried with the fence up meets it at the pre-append scan (Storage, the same text), with
+	/// no append; once cleared, the same child acknowledges from its stored rows with no new append.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_fence_after_the_append_refuses_verification_then_the_scan_and_clears_without_a_new_append()
+	 {
+		let h = holder(1).await;
+		let fence = SlabId::new(FENCE);
+		assert_ne!(
+			h.slab.active_slab_id().await,
+			fence,
+			"a slab other than the rows'"
+		);
+		let before = h.slab.local_l1_bytes().await;
+		let (reached, release) = hold_after_append(&h.slab);
+		let write = tokio::spawn(attempt(h.clone()));
+		// The witness: the hook fired after the one durable child frame.
+		bounded("the hold after the append", reached.notified()).await;
+		let appended = h.slab.local_l1_bytes().await;
+		assert!(appended > before, "the child frame is durable");
+		h.slab.raise_retirement_fence_for_test(fence);
+		release.notify_one();
+		let first = bounded("attempt 1", write).await.unwrap();
+		let first_intent = intent_state(&h.slab, h.r.rsv).await;
+		eprintln!(
+			"DC287 holder control B attempt 1: {:?}; intent {first_intent:?}",
+			detail(&first)
+		);
+
+		let second = bounded("attempt 2", attempt(h.clone())).await;
+		let second_intent = intent_state(&h.slab, h.r.rsv).await;
+		let after_second = h.slab.local_l1_bytes().await;
+		eprintln!(
+			"DC287 holder control B attempt 2: {:?}; intent {second_intent:?}; L1 {appended} -> {after_second}",
+			detail(&second)
+		);
+
+		h.slab.clear_retirement_fence_for_test(fence);
+		h.slab.refuse_append_after_for_test(0);
+		let third = bounded("attempt 3", attempt(h.clone())).await;
+		h.slab.clear_append_refusal_for_test();
+		let third_intent = intent_state(&h.slab, h.r.rsv).await;
+		eprintln!(
+			"DC287 holder control B attempt 3 (fence cleared): {:?}; intent {third_intent:?}; L1 {}",
+			detail(&third),
+			h.slab.local_l1_bytes().await
+		);
+
+		let (kind, text) = detail(&first);
+		assert_eq!(kind, "Unverified", "attempt 1: {text}");
+		assert!(text.contains("fenced"), "attempt 1: {text}");
+		assert_eq!(first_intent, Some(ParentIntentState::Intent));
+		let (kind2, text2) = detail(&second);
+		assert_eq!(kind2, "Storage", "attempt 2: {text2}");
+		assert_eq!(text2, text, "the same fenced read error at the scan");
+		assert_eq!(after_second, appended, "attempt 2 appended nothing");
+		assert!(third.is_ok(), "attempt 3: {:?}", detail(&third));
+		assert_eq!(
+			h.slab.local_l1_bytes().await,
+			appended,
+			"attempt 3 appended nothing"
+		);
+		assert_eq!(third_intent, Some(ParentIntentState::Complete));
+	}
+
+	/// C: the fence raised after the begin and before the pre-append scan refuses fresh rows at the
+	/// scan (Storage), before any append.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_fence_before_the_scan_refuses_fresh_rows_at_the_scan_before_any_append() {
+		let h = holder(1).await;
+		let fence = SlabId::new(FENCE);
+		let before = h.slab.local_l1_bytes().await;
+		let probe = persist_pause::arm_after_begin(&h.slab, h.r.descriptor.table_object_id);
+		let write = tokio::spawn(attempt(h.clone()));
+		bounded("the hold after the begin", probe.reached.notified()).await;
+		h.slab.raise_retirement_fence_for_test(fence);
+		probe.release.notify_one();
+		let result = bounded("the attempt", write).await.unwrap();
+		h.slab.clear_retirement_fence_for_test(fence);
+		eprintln!(
+			"DC287 holder control C: {:?}; intent {:?}",
+			detail(&result),
+			intent_state(&h.slab, h.r.rsv).await
+		);
+		let (kind, text) = detail(&result);
+		assert_eq!(kind, "Storage", "{text}");
+		assert!(text.contains("fenced"), "{text}");
+		assert_eq!(
+			h.slab.local_l1_bytes().await,
+			before,
+			"nothing was appended"
+		);
+	}
+
+	/// D: with the fence clear, a version made absent after its durable frame and before
+	/// verification reads as not stored (an empty answer), distinct from a fenced read.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn an_absent_version_at_verification_reads_as_not_stored_not_fenced() {
+		let h = holder(1).await;
+		let versions = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions;
+		let gone = versions[0];
+		let (reached, release) = hold_after_append(&h.slab);
+		let write = tokio::spawn(attempt(h.clone()));
+		bounded("the hold after the append", reached.notified()).await;
+		h.slab.forget_version_for_test(
+			TENANT,
+			crate::schema::Identity::new(gone.key_identity),
+			gone.hlc,
+		);
+		release.notify_one();
+		let result = bounded("the attempt", write).await.unwrap();
+		eprintln!(
+			"DC287 holder control D: {:?}; intent {:?}",
+			detail(&result),
+			intent_state(&h.slab, h.r.rsv).await
+		);
+		let (kind, text) = detail(&result);
+		assert_eq!(kind, "Unverified", "{text}");
+		assert_eq!(text, "a manifest version is not stored");
+	}
+
+	// ============================================================
+	//  Wendelon ADR 0126: the holder's own reads wait out a logged retirement fence
+	// ============================================================
+
+	use crate::storage::manager::tier_authority::{
+		HolderAdmission, RETIRING_LOG_INDEXED, RETIRING_SNAPSHOT, RETIRING_UNINDEXED,
+		RetirementWait,
+	};
+
+	/// The same child as [`attempt`], with the coordinated attempt's wait.
+	async fn attempt_waiting(
+		h: Arc<Holder>,
+		wait: RetirementWait,
+	) -> Result<
+		crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
+		ChildRefusal,
+	> {
+		let planned = AdmittedPlan::admit(&h.slab, &h.machine, |state| {
+			plan_child_keyed(
+				state,
+				h.r.holder,
+				h.r.holder.node,
+				ChildRole::Holder,
+				&h.r.meta,
+				h.r.batch.clone(),
+				section(encode_ordinals(&[0, 1])),
+				|_, _| true,
+			)
+		})
+		.await
+		.unwrap();
+		persist_child_waiting(
+			h.slab.clone(),
+			h.machine.clone(),
+			h.locks.clone(),
+			planned,
+			authority(&h.r, ChildRole::Holder),
+			wait,
+		)
+		.await
+	}
+
+	fn wait_for(duration: std::time::Duration) -> RetirementWait {
+		RetirementWait::until(tokio::time::Instant::now() + duration)
+	}
+
+	/// What the holder admission answers: admitted, or the refusal's text and eligibility.
+	fn admission(slab: &SlabManager) -> Result<(), (String, bool)> {
+		match slab.holder_location_admission() {
+			HolderAdmission::Admitted => Ok(()),
+			HolderAdmission::Refused { error, eligible } => Err((error.to_string(), eligible)),
+		}
+	}
+
+	/// D1: the class follows today's map transitions exactly, with no map scan by its readers.
+	#[tokio::test]
+	async fn the_retirement_class_follows_the_existing_map_transitions() {
+		let (_dir, slab) = manager().await;
+		let class = || slab.retirement_class_for_test();
+		let (a, b, c, d, e) = (
+			SlabId::new(0x7701),
+			SlabId::new(0x7702),
+			SlabId::new(0x7703),
+			SlabId::new(0x7704),
+			SlabId::new(0x7705),
+		);
+		assert_eq!(class(), 0);
+		// An indexed mark advances only to a newer index; a stale clear removes nothing.
+		slab.mark_retirement_for_test(b, Some(3));
+		slab.mark_retirement_for_test(b, Some(2));
+		slab.clear_retirement_for_test(b, Some(2));
+		assert_eq!(
+			class(),
+			RETIRING_LOG_INDEXED,
+			"an older mark and a stale clear"
+		);
+		slab.mark_retirement_for_test(b, Some(7));
+		slab.clear_retirement_for_test(b, Some(3));
+		assert_eq!(class(), RETIRING_LOG_INDEXED, "the entry advanced to 7");
+		slab.clear_retirement_for_test(b, Some(7));
+		assert_eq!(class(), 0, "the matching clear");
+		// A None-only mark is unindexed; an incoming Some leaves an occupied None.
+		slab.mark_retirement_for_test(a, None);
+		slab.mark_retirement_for_test(a, Some(5));
+		slab.clear_retirement_for_test(a, Some(5));
+		assert_eq!(
+			class(),
+			RETIRING_UNINDEXED,
+			"None stays None; the clear is stale"
+		);
+		// Some -> None replaces, and a stale clear of the old index leaves the fence.
+		slab.mark_retirement_for_test(c, Some(4));
+		assert_eq!(class(), RETIRING_UNINDEXED | RETIRING_LOG_INDEXED);
+		slab.mark_retirement_for_test(c, None);
+		slab.clear_retirement_for_test(c, Some(4));
+		assert_eq!(
+			class(),
+			RETIRING_UNINDEXED,
+			"the replaced entry survives the stale clear"
+		);
+		// A snapshot retirement adds its class; clearing it removes only it.
+		let (_dir2, slab2) = manager().await;
+		slab2.mark_retirement_for_test(d, Some(1));
+		slab2.mark_snapshot_retirement_for_test(e, 9);
+		assert_eq!(
+			slab2.retirement_class_for_test(),
+			RETIRING_LOG_INDEXED | RETIRING_SNAPSHOT
+		);
+		slab2.clear_snapshot_retirement_for_test(e, 9);
+		assert_eq!(slab2.retirement_class_for_test(), RETIRING_LOG_INDEXED);
+		slab2.clear_retirement_for_test(d, Some(1));
+		assert_eq!(slab2.retirement_class_for_test(), 0);
+	}
+
+	/// D1: a handoff that marks the next retirement before clearing the prior one keeps the fence
+	/// standing throughout, and one load never reads it clear.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_mark_before_clear_handoff_never_reads_clear() {
+		let (_dir, slab) = manager().await;
+		slab.mark_retirement_for_test(SlabId::new(1), Some(1));
+		use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+		let done = Arc::new(AtomicBool::new(false));
+		let reads = Arc::new(AtomicU64::new(0));
+		let reader = {
+			let (slab, done, reads) = (slab.clone(), done.clone(), reads.clone());
+			std::thread::spawn(move || {
+				while !done.load(Ordering::Acquire) {
+					assert_ne!(
+						slab.retirement_class_for_test(),
+						0,
+						"read clear mid-handoff"
+					);
+					reads.fetch_add(1, Ordering::Release);
+				}
+			})
+		};
+		// The handoffs run until they have overlapped the reader's loop (a scheduled reader is
+		// the premise, not a given under load), bounded in wall time.
+		let started = std::time::Instant::now();
+		let mut i = 1u64;
+		while i < 2_000 || reads.load(Ordering::Acquire) < 2_000 {
+			assert!(
+				started.elapsed() < std::time::Duration::from_secs(30),
+				"premise: the reader overlapped the handoffs ({} reads, {i} handoffs)",
+				reads.load(Ordering::Acquire)
+			);
+			slab.mark_retirement_for_test(SlabId::new(i + 1), Some(i + 1));
+			slab.clear_retirement_for_test(SlabId::new(i), Some(i));
+			i += 1;
+		}
+		done.store(true, Ordering::Release);
+		reader
+			.join()
+			.expect("the reader never read the fence clear");
+		assert_eq!(slab.retirement_class_for_test(), RETIRING_LOG_INDEXED);
+		slab.clear_retirement_for_test(SlabId::new(i), Some(i));
+		assert_eq!(slab.retirement_class_for_test(), 0);
+	}
+
+	/// D2: the admission is unchanged, and only a sole log-indexed retirement at the fallback is
+	/// eligible; every refusal is today's error.
+	#[tokio::test]
+	async fn only_a_sole_log_indexed_retirement_is_eligible_and_every_error_is_todays() {
+		let fenced = "stale location in slab 0: fenced".to_owned();
+		let (_dir, slab) = manager().await;
+		assert_eq!(admission(&slab), Ok(()));
+		slab.mark_retirement_for_test(SlabId::new(FENCE), Some(1));
+		assert_eq!(admission(&slab), Err((fenced.clone(), true)));
+		assert_eq!(
+			slab.require_tier_authority_ready()
+				.map_err(|e| e.to_string()),
+			Err(fenced.clone()),
+			"the same error on the unchanged path"
+		);
+		slab.mark_snapshot_retirement_for_test(SlabId::new(FENCE + 1), 3);
+		assert_eq!(admission(&slab), Err((fenced.clone(), false)), "mixed");
+		let (_dir2, unindexed) = manager().await;
+		unindexed.mark_retirement_for_test(SlabId::new(FENCE), None);
+		assert_eq!(
+			admission(&unindexed),
+			Err((fenced.clone(), false)),
+			"unindexed"
+		);
+		// Unresolved-op alone admits on both paths; with a log-indexed retirement it keeps its
+		// error and priority and is not eligible.
+		let (_dir3, op) = manager().await;
+		op.fence_unresolved_op_for_test();
+		assert_eq!(admission(&op), Ok(()));
+		assert!(op.require_tier_authority_ready().is_ok());
+		op.mark_retirement_for_test(SlabId::new(FENCE), Some(1));
+		assert_eq!(
+			admission(&op),
+			Err(("UnresolvedOpIntent".to_owned(), false))
+		);
+		assert_eq!(
+			op.require_tier_authority_ready().map_err(|e| e.to_string()),
+			Err("UnresolvedOpIntent".to_owned())
+		);
+	}
+
+	/// R1: a ready store's holder reads, at the scan and at verification, register no wake.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn ready_holder_reads_make_no_wake_registration() {
+		let h = holder(1).await;
+		let wait = wait_for(std::time::Duration::from_secs(10));
+		let result = bounded("the write", attempt_waiting(h.clone(), wait)).await;
+		assert!(result.is_ok(), "{:?}", detail(&result));
+		assert_eq!(
+			intent_state(&h.slab, h.r.rsv).await,
+			Some(ParentIntentState::Complete),
+			"the scan and the verification ran"
+		);
+		let version = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions[0];
+		let rows = h
+			.slab
+			.stored_rows_at_version_for_holder(
+				TENANT,
+				crate::schema::Identity::new(version.key_identity),
+				version.hlc,
+				wait,
+			)
+			.await
+			.unwrap();
+		assert_eq!(rows.len(), 1);
+		assert_eq!(h.slab.holder_retirement_registrations_for_test(), 0);
+		assert_eq!(h.slab.holder_retirement_waits_for_test(), 0);
+	}
+
+	/// R1: a clear that lands between the first (unregistered) eligible refusal and the first
+	/// arm, its wake lost, is still seen: the armed recheck admits, and no wait begins.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_clear_between_the_first_refusal_and_the_armed_recheck_still_progresses() {
+		let h = holder(1).await;
+		assert!(bounded("the write", attempt(h.clone())).await.is_ok());
+		let version = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions[0];
+		let fence = SlabId::new(FENCE);
+		h.slab.raise_retirement_fence_for_test(fence);
+		let (reached, release) = h.slab.hold_holder_first_refusal_for_test();
+		let read = {
+			let slab = h.slab.clone();
+			tokio::spawn(async move {
+				slab.stored_rows_at_version_for_holder(
+					TENANT,
+					crate::schema::Identity::new(version.key_identity),
+					version.hlc,
+					wait_for(std::time::Duration::from_secs(10)),
+				)
+				.await
+			})
+		};
+		bounded("the first eligible refusal", reached.notified()).await;
+		assert_eq!(h.slab.holder_retirement_registrations_for_test(), 0);
+		h.slab.clear_retirement_fence_for_test(fence);
+		release.notify_one();
+		let rows = bounded("the read", read).await.unwrap().unwrap();
+		assert_eq!(rows.len(), 1);
+		assert_eq!(
+			h.slab.holder_retirement_registrations_for_test(),
+			1,
+			"one arm"
+		);
+		assert_eq!(
+			h.slab.holder_retirement_waits_for_test(),
+			0,
+			"no wait began"
+		);
+	}
+
+	/// D3: an eligible holder read waits (witnessed), and reads once the fence clears.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn an_eligible_holder_read_waits_then_reads_once_the_fence_clears() {
+		let h = holder(1).await;
+		assert!(bounded("the write", attempt(h.clone())).await.is_ok());
+		let version = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions[0];
+		let fence = SlabId::new(FENCE);
+		h.slab.raise_retirement_fence_for_test(fence);
+		let read = {
+			let slab = h.slab.clone();
+			tokio::spawn(async move {
+				slab.stored_rows_at_version_for_holder(
+					TENANT,
+					crate::schema::Identity::new(version.key_identity),
+					version.hlc,
+					wait_for(std::time::Duration::from_secs(10)),
+				)
+				.await
+			})
+		};
+		bounded(
+			"the eligible wait",
+			h.slab.holder_retirement_wait_began_for_test(1),
+		)
+		.await;
+		assert!(!read.is_finished(), "it waits while the fence stands");
+		h.slab.clear_retirement_fence_for_test(fence);
+		let rows = bounded("the read", read).await.unwrap().unwrap();
+		assert_eq!(rows.len(), 1, "the stored copy, read after the clear");
+	}
+
+	/// D3: a refusal that is not eligible is answered at once, with no wait, whatever the budget.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn an_ineligible_refusal_is_answered_at_once() {
+		let h = holder(1).await;
+		assert!(bounded("the write", attempt(h.clone())).await.is_ok());
+		let version = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions[0];
+		h.slab.mark_retirement_for_test(SlabId::new(FENCE), None);
+		let started = std::time::Instant::now();
+		let read = h
+			.slab
+			.stored_rows_at_version_for_holder(
+				TENANT,
+				crate::schema::Identity::new(version.key_identity),
+				version.hlc,
+				wait_for(std::time::Duration::from_secs(10)),
+			)
+			.await;
+		assert_eq!(
+			read.map(|rows| rows.len()).map_err(|e| e.to_string()),
+			Err("stale location in slab 0: fenced".to_owned())
+		);
+		assert!(started.elapsed() < std::time::Duration::from_secs(5));
+		assert_eq!(
+			h.slab.holder_retirement_waits_for_test(),
+			0,
+			"no wait began"
+		);
+	}
+
+	/// D3: a fence that outlives the wait gives today's refusal at the wait's end; a close during
+	/// a wait ends it promptly.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_persistent_fence_refuses_at_the_end_and_a_close_ends_the_wait() {
+		let h = holder(1).await;
+		assert!(bounded("the write", attempt(h.clone())).await.is_ok());
+		let version = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions[0];
+		let key = crate::schema::Identity::new(version.key_identity);
+		h.slab.raise_retirement_fence_for_test(SlabId::new(FENCE));
+		let budget = std::time::Duration::from_millis(300);
+		let started = std::time::Instant::now();
+		let read = h
+			.slab
+			.stored_rows_at_version_for_holder(TENANT, key, version.hlc, wait_for(budget))
+			.await;
+		let elapsed = started.elapsed();
+		assert_eq!(
+			read.map(|rows| rows.len()).map_err(|e| e.to_string()),
+			Err("stale location in slab 0: fenced".to_owned())
+		);
+		assert!(elapsed >= budget, "it waited the budget: {elapsed:?}");
+		assert!(h.slab.holder_retirement_waits_for_test() > 0);
+		// A close while waiting.
+		let read = {
+			let slab = h.slab.clone();
+			tokio::spawn(async move {
+				slab.stored_rows_at_version_for_holder(
+					TENANT,
+					key,
+					version.hlc,
+					wait_for(std::time::Duration::from_secs(10)),
+				)
+				.await
+			})
+		};
+		let before = h.slab.holder_retirement_waits_for_test();
+		bounded(
+			"the eligible wait",
+			h.slab.holder_retirement_wait_began_for_test(before + 1),
+		)
+		.await;
+		let closed = std::time::Instant::now();
+		h.slab.stop_tier_authority_for_test();
+		let answer = bounded("the closed read", read).await.unwrap();
+		assert!(answer.is_err(), "a closed authority refuses");
+		assert!(
+			closed.elapsed() < std::time::Duration::from_secs(2),
+			"promptly, not at the wait's end"
+		);
+	}
+
+	/// D3 through the persist path: a self-clearing fence after the durable frame (verification),
+	/// with the append witness armed: the FIRST attempt acknowledges, with no re-append.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_self_clearing_fence_at_verification_lets_the_first_attempt_acknowledge() {
+		let h = holder(1).await;
+		let fence = SlabId::new(FENCE);
+		let before = h.slab.local_l1_bytes().await;
+		let (reached, release) = hold_after_append(&h.slab);
+		let write = tokio::spawn(attempt_waiting(
+			h.clone(),
+			wait_for(std::time::Duration::from_secs(10)),
+		));
+		bounded("the hold after the append", reached.notified()).await;
+		let appended = h.slab.local_l1_bytes().await;
+		assert!(appended > before);
+		h.slab.raise_retirement_fence_for_test(fence);
+		h.slab.refuse_append_after_for_test(0);
+		release.notify_one();
+		bounded(
+			"the eligible wait",
+			h.slab.holder_retirement_wait_began_for_test(1),
+		)
+		.await;
+		h.slab.clear_retirement_fence_for_test(fence);
+		let result = bounded("the attempt", write).await.unwrap();
+		h.slab.clear_append_refusal_for_test();
+		eprintln!(
+			"ADR0126 verification: {:?}; intent {:?}",
+			detail(&result),
+			intent_state(&h.slab, h.r.rsv).await
+		);
+		assert!(result.is_ok(), "{:?}", detail(&result));
+		assert_eq!(
+			intent_state(&h.slab, h.r.rsv).await,
+			Some(ParentIntentState::Complete)
+		);
+		assert_eq!(h.slab.local_l1_bytes().await, appended, "no re-append");
+	}
+
+	/// D3 through the persist path: a resumed child (its frame durable from a refused attempt)
+	/// meets the fence at its scan, waits, and acknowledges with no new append.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_resumed_child_waits_at_its_scan_and_acknowledges_without_a_new_append() {
+		let h = holder(1).await;
+		let fence = SlabId::new(FENCE);
+		let (reached, release) = hold_after_append(&h.slab);
+		let first = tokio::spawn(attempt(h.clone()));
+		bounded("the hold after the append", reached.notified()).await;
+		let appended = h.slab.local_l1_bytes().await;
+		h.slab.raise_retirement_fence_for_test(fence);
+		release.notify_one();
+		let first = bounded("attempt 1 (no wait)", first).await.unwrap();
+		assert_eq!(detail(&first).0, "Unverified");
+		h.slab.refuse_append_after_for_test(0);
+		let resumed = tokio::spawn(attempt_waiting(
+			h.clone(),
+			wait_for(std::time::Duration::from_secs(10)),
+		));
+		bounded(
+			"the eligible wait",
+			h.slab.holder_retirement_wait_began_for_test(1),
+		)
+		.await;
+		h.slab.clear_retirement_fence_for_test(fence);
+		let resumed = bounded("the resumed attempt", resumed).await.unwrap();
+		h.slab.clear_append_refusal_for_test();
+		eprintln!(
+			"ADR0126 scan: {:?}; intent {:?}",
+			detail(&resumed),
+			intent_state(&h.slab, h.r.rsv).await
+		);
+		assert!(resumed.is_ok(), "{:?}", detail(&resumed));
+		assert_eq!(
+			intent_state(&h.slab, h.r.rsv).await,
+			Some(ParentIntentState::Complete)
+		);
+		assert_eq!(h.slab.local_l1_bytes().await, appended, "no new append");
+	}
+
+	/// D3: with a wait, a missing version still reads as not stored, at once.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn with_a_wait_a_missing_version_still_reads_as_not_stored() {
+		let h = holder(1).await;
+		let gone = plan_keyed(&h.r, section(encode_ordinals(&[0, 1])))
+			.unwrap()
+			.row_versions[0];
+		let (reached, release) = hold_after_append(&h.slab);
+		let write = tokio::spawn(attempt_waiting(
+			h.clone(),
+			wait_for(std::time::Duration::from_secs(10)),
+		));
+		bounded("the hold after the append", reached.notified()).await;
+		h.slab.forget_version_for_test(
+			TENANT,
+			crate::schema::Identity::new(gone.key_identity),
+			gone.hlc,
+		);
+		release.notify_one();
+		let result = bounded("the attempt", write).await.unwrap();
+		assert_eq!(
+			detail(&result),
+			("Unverified", "a manifest version is not stored".to_owned())
+		);
+		assert_eq!(h.slab.holder_retirement_waits_for_test(), 0);
+	}
+}

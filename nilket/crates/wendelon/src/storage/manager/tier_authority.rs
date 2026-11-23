@@ -2,7 +2,7 @@
 use super::*;
 use crate::storage::ownership::StorageWorker;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 use std::sync::{OnceLock, Weak};
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -98,7 +98,14 @@ pub(super) struct TierAuthority {
 	integrity_failures: DashMap<SlabId, u64>,
 	epoch: AtomicU64,
 	ready: AtomicBool,
-	retirement_fence: AtomicBool,
+	/// ADR 0126 D1: the store-wide retirement fence as one class, 0 when no retirement stands:
+	/// [`RETIRING_LOG_INDEXED`], [`RETIRING_UNINDEXED`], [`RETIRING_SNAPSHOT`]. Written only under
+	/// `status`; every reader makes one acquire load.
+	retirement_class: AtomicU8,
+	/// ADR 0126 D1: the entries behind `retirement_class`, changed only under `status`.
+	log_indexed_retirements: AtomicUsize,
+	unindexed_retirements: AtomicUsize,
+	snapshot_retirement_entries: AtomicUsize,
 	snapshot_fences: SnapshotFences,
 	/// The newest control index a begun comparison has read: delivered owner
 	/// evidence at or below it is covered, whatever that comparison's outcome,
@@ -151,6 +158,22 @@ pub(super) struct TierAuthority {
 	#[cfg(test)]
 	pub(super) wait_before_attempt_check_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// ADR 0126: holder reads that began an eligible retirement wait, and a wake per one.
+	#[cfg(test)]
+	pub(super) holder_retirement_waits_for_test: AtomicUsize,
+	#[cfg(test)]
+	pub(super) holder_retirement_wait_began_for_test: Notify,
+	/// ADR 0126 R1: each wake registration (`enable`) a holder read made, and the end each wait
+	/// was forwarded (the last one).
+	#[cfg(test)]
+	pub(super) holder_retirement_registrations_for_test: AtomicUsize,
+	#[cfg(test)]
+	pub(super) holder_retirement_wait_end_for_test: std::sync::Mutex<Option<TokioInstant>>,
+	/// ADR 0126 R1: a one-shot hold between a holder's first eligible refusal and its first arm
+	/// (reached, release).
+	#[cfg(test)]
+	pub(super) holder_first_refusal_hold_for_test:
+		std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 #[derive(Default)]
@@ -209,7 +232,10 @@ impl TierAuthority {
 			integrity_failures: DashMap::new(),
 			epoch: AtomicU64::new(1),
 			ready: AtomicBool::new(false),
-			retirement_fence: AtomicBool::new(false),
+			retirement_class: AtomicU8::new(0),
+			log_indexed_retirements: AtomicUsize::new(0),
+			unindexed_retirements: AtomicUsize::new(0),
+			snapshot_retirement_entries: AtomicUsize::new(0),
 			snapshot_fences: SnapshotFences::default(),
 			comparison_read_index: std::sync::RwLock::new(None),
 			unresolved_op_fence: AtomicBool::new(false),
@@ -242,6 +268,16 @@ impl TierAuthority {
 			verification_waits_for_test: AtomicUsize::new(0),
 			#[cfg(test)]
 			wait_before_attempt_check_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			holder_retirement_waits_for_test: AtomicUsize::new(0),
+			#[cfg(test)]
+			holder_retirement_wait_began_for_test: Notify::new(),
+			#[cfg(test)]
+			holder_retirement_registrations_for_test: AtomicUsize::new(0),
+			#[cfg(test)]
+			holder_retirement_wait_end_for_test: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			holder_first_refusal_hold_for_test: std::sync::Mutex::new(None),
 		})
 	}
 
@@ -507,28 +543,80 @@ impl TierAuthority {
 	fn is_ready(&self) -> bool {
 		// An admission that sees the clear flag precedes the pre-mutation hook.
 		// Its operation may finish against that earlier control state.
-		self.integrity_failures.is_empty()
-			&& !self.retirement_fence.load(Ordering::Acquire)
-			&& self.snapshot_fences.load(Ordering::Acquire) == 0
-			&& self.ready.load(Ordering::Acquire)
-			&& !self.closed.load(Ordering::Acquire)
+		self.readiness_blocks().is_clear()
+	}
+
+	/// ADR 0126 D2: what the readiness evaluation finds blocking, each atomic read once (the
+	/// retirement fence as one load of its class).
+	pub(super) fn readiness_blocks(&self) -> ReadinessBlocks {
+		ReadinessBlocks {
+			integrity: !self.integrity_failures.is_empty(),
+			retirement_class: self.retirement_class.load(Ordering::Acquire),
+			snapshot_fence: self.snapshot_fences.load(Ordering::Acquire) != 0,
+			not_ready: !self.ready.load(Ordering::Acquire),
+			closed: self.closed.load(Ordering::Acquire),
+		}
+	}
+
+	/// Whether the store-wide retirement fence stands (any retirement class).
+	pub(super) fn retirement_fence_stands_now(&self) -> bool {
+		self.retirement_class.load(Ordering::Acquire) != 0
+	}
+
+	/// ADR 0126 D1: one entry of `retirements` added (`+1`) or removed (`-1`), by its kind.
+	fn count_retirement(&self, index: Option<u64>, added: bool) {
+		let count = match index {
+			Some(_) => &self.log_indexed_retirements,
+			None => &self.unindexed_retirements,
+		};
+		if added {
+			count.fetch_add(1, Ordering::Relaxed);
+		} else {
+			count.fetch_sub(1, Ordering::Relaxed);
+		}
+	}
+
+	/// ADR 0126 D1: the exact class from the counts, stored after a mutation (a removed class
+	/// clears only here, after its matching removal). Called under `status`.
+	fn publish_retirement_class(&self) {
+		let mut class = 0;
+		if self.log_indexed_retirements.load(Ordering::Relaxed) > 0 {
+			class |= RETIRING_LOG_INDEXED;
+		}
+		if self.unindexed_retirements.load(Ordering::Relaxed) > 0 {
+			class |= RETIRING_UNINDEXED;
+		}
+		if self.snapshot_retirement_entries.load(Ordering::Relaxed) > 0 {
+			class |= RETIRING_SNAPSHOT;
+		}
+		self.retirement_class.store(class, Ordering::Release);
 	}
 
 	pub(super) fn mark_retirement(&self, slab_id: SlabId, index: Option<u64>) {
 		let _status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-		self.retirement_fence.store(true, Ordering::Release);
+		// ADR 0126 D1: the added class is published before the mutation, as the fence was.
+		let added = if index.is_some() {
+			RETIRING_LOG_INDEXED
+		} else {
+			RETIRING_UNINDEXED
+		};
+		self.retirement_class.fetch_or(added, Ordering::Release);
 		match self.retirements.entry(slab_id) {
 			dashmap::mapref::entry::Entry::Vacant(entry) => {
 				entry.insert(index);
+				self.count_retirement(index, true);
 			}
 			dashmap::mapref::entry::Entry::Occupied(mut entry) => {
 				let prior = *entry.get();
 				if index.is_none() || matches!((prior, index), (Some(old), Some(new)) if new > old)
 				{
 					entry.insert(index);
+					self.count_retirement(prior, false);
+					self.count_retirement(index, true);
 				}
 			}
 		}
+		self.publish_retirement_class();
 		self.changed.notify_waiters();
 	}
 
@@ -537,56 +625,68 @@ impl TierAuthority {
 		if let dashmap::mapref::entry::Entry::Occupied(entry) = self.retirements.entry(slab_id) {
 			if index.is_some() && *entry.get() == index {
 				entry.remove();
+				self.count_retirement(index, false);
 			}
 		}
-		if self.retirements.is_empty() && self.snapshot_retirements.is_empty() {
-			self.retirement_fence.store(false, Ordering::Release);
-		}
+		self.publish_retirement_class();
 		self.changed.notify_waiters();
 	}
 
 	pub(super) fn mark_snapshot_retirement(&self, slab_id: SlabId, epoch: u64, index: Option<u64>) {
 		let _status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-		self.retirement_fence.store(true, Ordering::Release);
-		self.snapshot_retirements
-			.entry(slab_id)
-			.and_modify(|value| {
-				if (epoch, index) > *value {
-					*value = (epoch, index);
+		self.retirement_class
+			.fetch_or(RETIRING_SNAPSHOT, Ordering::Release);
+		match self.snapshot_retirements.entry(slab_id) {
+			dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+				if (epoch, index) > *entry.get() {
+					entry.insert((epoch, index));
 				}
-			})
-			.or_insert((epoch, index));
+			}
+			dashmap::mapref::entry::Entry::Vacant(entry) => {
+				entry.insert((epoch, index));
+				self.snapshot_retirement_entries
+					.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+		self.publish_retirement_class();
+		self.changed.notify_waiters();
+	}
+
+	/// One snapshot retirement removed (`removed` from `remove_if`), then the exact class.
+	fn snapshot_retirement_removed(&self, removed: bool) {
+		if removed {
+			self.snapshot_retirement_entries
+				.fetch_sub(1, Ordering::Relaxed);
+		}
+		self.publish_retirement_class();
 		self.changed.notify_waiters();
 	}
 
 	pub(super) fn clear_snapshot_retirement(&self, slab_id: SlabId, epoch: u64) {
 		let _status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-		self.snapshot_retirements
-			.remove_if(&slab_id, |_, value| value.0 == epoch);
-		if self.retirements.is_empty() && self.snapshot_retirements.is_empty() {
-			self.retirement_fence.store(false, Ordering::Release);
-		}
-		self.changed.notify_waiters();
+		let removed = self
+			.snapshot_retirements
+			.remove_if(&slab_id, |_, value| value.0 == epoch)
+			.is_some();
+		self.snapshot_retirement_removed(removed);
 	}
 
 	pub(super) fn cancel_snapshot_retirement_before_control(&self, slab_id: SlabId, index: u64) {
 		let _status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-		self.snapshot_retirements
-			.remove_if(&slab_id, |_, value| value.1.is_none_or(|old| index > old));
-		if self.retirements.is_empty() && self.snapshot_retirements.is_empty() {
-			self.retirement_fence.store(false, Ordering::Release);
-		}
-		self.changed.notify_waiters();
+		let removed = self
+			.snapshot_retirements
+			.remove_if(&slab_id, |_, value| value.1.is_none_or(|old| index > old))
+			.is_some();
+		self.snapshot_retirement_removed(removed);
 	}
 
 	fn cancel_older_snapshot_retirement(&self, slab_id: SlabId, epoch: u64) {
 		let _status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-		self.snapshot_retirements
-			.remove_if(&slab_id, |_, value| value.0 < epoch);
-		if self.retirements.is_empty() && self.snapshot_retirements.is_empty() {
-			self.retirement_fence.store(false, Ordering::Release);
-		}
-		self.changed.notify_waiters();
+		let removed = self
+			.snapshot_retirements
+			.remove_if(&slab_id, |_, value| value.0 < epoch)
+			.is_some();
+		self.snapshot_retirement_removed(removed);
 	}
 
 	fn expose_read_scope_if_ready(&self, slabs: &[SlabId]) -> bool {
@@ -607,7 +707,7 @@ impl TierAuthority {
 
 	#[cfg(test)]
 	pub(super) fn retirement_fence_stands(&self) -> bool {
-		self.retirement_fence.load(Ordering::Acquire)
+		self.retirement_fence_stands_now()
 	}
 
 	pub(super) fn note_deferred_retirement(&self, slab_id: SlabId, index: u64) {
@@ -629,18 +729,23 @@ impl TierAuthority {
 	}
 
 	fn expose_if_ready(&self) -> bool {
+		self.expose_if_ready_blocks().is_clear()
+	}
+
+	/// ADR 0126 D2: `expose_if_ready`, reporting what its one readiness evaluation found blocking.
+	fn expose_if_ready_blocks(&self) -> ReadinessBlocks {
 		if self.exposed.load(Ordering::Acquire) {
-			return self.is_ready();
+			return self.readiness_blocks();
 		}
 		let _status = self
 			.status
 			.lock()
 			.unwrap_or_else(|error| error.into_inner());
-		if !self.is_ready() {
-			return false;
+		let blocks = self.readiness_blocks();
+		if blocks.is_clear() {
+			self.exposed.store(true, Ordering::Release);
 		}
-		self.exposed.store(true, Ordering::Release);
-		true
+		blocks
 	}
 
 	fn begin_staging(
@@ -1138,7 +1243,7 @@ impl TierAuthority {
 				}
 			}
 			if !self.integrity_failures.is_empty()
-				|| self.retirement_fence.load(Ordering::Acquire)
+				|| self.retirement_fence_stands_now()
 				|| self.snapshot_fences.load(Ordering::Acquire) != 0
 			{
 				changed.await;
@@ -1597,7 +1702,7 @@ impl TierAuthority {
 		let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
 		if !self.current(epoch)
 			|| self.staging.load(Ordering::Acquire) != 0
-			|| self.retirement_fence.load(Ordering::Acquire)
+			|| self.retirement_fence_stands_now()
 			|| self.snapshot_fences.load(Ordering::Acquire) != 0
 		{
 			return Err(obsolete_verification());
@@ -1613,6 +1718,103 @@ impl TierAuthority {
 		self.clear_completed_snapshot_reconciliation();
 		self.changed.notify_waiters();
 		Ok(())
+	}
+}
+
+/// ADR 0126 D1: a log-indexed retirement (a committed Retire's apply marks it `Some(index)`).
+pub(crate) const RETIRING_LOG_INDEXED: u8 = 1;
+/// ADR 0126 D1: an unindexed retirement mark (`None`, e.g. local tiers absent from committed).
+pub(crate) const RETIRING_UNINDEXED: u8 = 2;
+/// ADR 0126 D1: a snapshot retirement.
+pub(crate) const RETIRING_SNAPSHOT: u8 = 4;
+
+/// ADR 0126 D2: what one readiness evaluation found blocking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadinessBlocks {
+	integrity: bool,
+	retirement_class: u8,
+	snapshot_fence: bool,
+	not_ready: bool,
+	closed: bool,
+}
+
+impl ReadinessBlocks {
+	pub(crate) fn is_clear(&self) -> bool {
+		!self.integrity
+			&& self.retirement_class == 0
+			&& !self.snapshot_fence
+			&& !self.not_ready
+			&& !self.closed
+	}
+
+	#[cfg(test)]
+	pub(crate) fn retirement_class_for_test(&self) -> u8 {
+		self.retirement_class
+	}
+
+	/// Nothing but a log-indexed retirement was blocking.
+	pub(crate) fn only_log_indexed_retirement(&self) -> bool {
+		!self.integrity
+			&& self.retirement_class == RETIRING_LOG_INDEXED
+			&& !self.snapshot_fence
+			&& !self.not_ready
+			&& !self.closed
+	}
+}
+
+/// ADR 0126 D2: which branch of the authority refusal was selected (its error is unchanged).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalBranch {
+	OwnerFence,
+	UnresolvedOp,
+	Integrity,
+	AwaitingCluster,
+	IndexUnavailable,
+	OrphanedPublications,
+	OrphanedLsm,
+	Closed,
+	Fallback,
+}
+
+/// ADR 0126 D2: a holder's location-list admission.
+#[derive(Debug)]
+pub(crate) enum HolderAdmission {
+	Admitted,
+	/// Today's refusal; `eligible` only for a sole log-indexed retirement at the fallback.
+	Refused {
+		error: Error,
+		eligible: bool,
+	},
+}
+
+/// ADR 0126 D3: the most one coordinated attempt waits, in all, for logged retirement fences
+/// at its local holders' own reads. A cap on discretionary waiting, not on the attempt.
+#[cfg(not(test))]
+pub(crate) const HOLDER_RETIREMENT_WAIT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+pub(crate) const HOLDER_RETIREMENT_WAIT: Duration = Duration::from_millis(1_000);
+/// A missed wake costs at most this much.
+const HOLDER_RETIREMENT_RECHECK: Duration = Duration::from_millis(50);
+
+/// ADR 0126 D3: one coordinated attempt's optional wait for logged retirement fences at its
+/// holders' own reads: one absolute end shared by every child, or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetirementWait {
+	until: Option<TokioInstant>,
+}
+
+impl RetirementWait {
+	/// No waiting: every refusal is answered at once.
+	pub(crate) const NONE: Self = Self { until: None };
+
+	/// Waiting allowed until `at`.
+	pub(crate) fn until(at: TokioInstant) -> Self {
+		Self { until: Some(at) }
+	}
+
+	/// The absolute end, if the attempt may wait at all.
+	pub(crate) fn end(&self) -> Option<TokioInstant> {
+		self.until
 	}
 }
 
@@ -1759,36 +1961,63 @@ impl SlabManager {
 	}
 
 	fn tier_authority_refusal(&self) -> Error {
+		self.tier_authority_refusal_with_branch().1
+	}
+
+	/// The refusal and the branch that selected it (ADR 0126 D2). The error and its priority are
+	/// exactly `tier_authority_refusal`'s.
+	fn tier_authority_refusal_with_branch(&self) -> (RefusalBranch, Error) {
 		if let Some(reason) = self.owner_authority_fence.get() {
-			return Error::new(ErrorKind::WouldBlock, *reason);
+			return (
+				RefusalBranch::OwnerFence,
+				Error::new(ErrorKind::WouldBlock, *reason),
+			);
 		}
 		if self
 			.tier_authority
 			.unresolved_op_fence
 			.load(Ordering::Acquire)
 		{
-			return Error::new(ErrorKind::WouldBlock, "UnresolvedOpIntent");
+			return (
+				RefusalBranch::UnresolvedOp,
+				Error::new(ErrorKind::WouldBlock, "UnresolvedOpIntent"),
+			);
 		}
 		if let Some(error) = self.tier_authority.integrity_error() {
-			return error;
+			return (RefusalBranch::Integrity, error);
 		}
 		if self.awaiting_cluster.load(Ordering::Acquire) {
-			return Error::new(ErrorKind::WouldBlock, "TierAuthorityAwaitingCluster");
+			return (
+				RefusalBranch::AwaitingCluster,
+				Error::new(ErrorKind::WouldBlock, "TierAuthorityAwaitingCluster"),
+			);
 		}
 		if self.index_authority_unavailable.load(Ordering::Acquire) {
-			return Error::new(ErrorKind::WouldBlock, IndexAuthorityUnavailable);
+			return (
+				RefusalBranch::IndexUnavailable,
+				Error::new(ErrorKind::WouldBlock, IndexAuthorityUnavailable),
+			);
 		}
 		if self.has_orphaned_index_publications() {
-			return Error::new(
-				ErrorKind::WouldBlock,
-				"TierAuthorityPublicationPending(RestartRequired)",
+			return (
+				RefusalBranch::OrphanedPublications,
+				Error::new(
+					ErrorKind::WouldBlock,
+					"TierAuthorityPublicationPending(RestartRequired)",
+				),
 			);
 		}
 		if self.has_orphaned_lsm_intents() {
-			return Error::new(ErrorKind::WouldBlock, LsmInstallUnresolved);
+			return (
+				RefusalBranch::OrphanedLsm,
+				Error::new(ErrorKind::WouldBlock, LsmInstallUnresolved),
+			);
 		}
 		if self.tier_authority.closed.load(Ordering::Acquire) {
-			return crate::storage::ownership::closed_error();
+			return (
+				RefusalBranch::Closed,
+				crate::storage::ownership::closed_error(),
+			);
 		}
 		let slab_id = self
 			.tier_authority
@@ -1803,7 +2032,10 @@ impl SlabManager {
 					.min()
 			})
 			.unwrap_or(SlabId::ZERO);
-		stale_location_error(slab_id, StaleLocationReason::Fenced)
+		(
+			RefusalBranch::Fallback,
+			stale_location_error(slab_id, StaleLocationReason::Fenced),
+		)
 	}
 
 	pub(super) fn tier_authority_is_ready(&self) -> bool {
@@ -1937,18 +2169,111 @@ impl SlabManager {
 	/// Synchronous answer paths refuse rather than turn unverified authority
 	/// into an empty candidate list or an authoritative negative answer.
 	pub(crate) fn require_tier_authority_ready(&self) -> std::io::Result<()> {
-		if !self.awaiting_cluster.load(Ordering::Acquire)
+		if self.manager_authority_terms_clear() && self.tier_authority.expose_if_ready() {
+			return Ok(());
+		}
+		self.tier_authority.start();
+		Err(self.tier_authority_refusal())
+	}
+
+	/// The manager-level terms of the authority admission, in their short-circuit order; shared
+	/// by [`Self::require_tier_authority_ready`] and [`Self::holder_location_admission`].
+	fn manager_authority_terms_clear(&self) -> bool {
+		!self.awaiting_cluster.load(Ordering::Acquire)
 			&& !self.index_authority_unavailable.load(Ordering::Acquire)
 			&& !self.has_orphaned_lsm_intents()
 			&& !self.tier_authority.deferred_open.load(Ordering::Acquire)
 			&& !self.has_orphaned_index_publications()
 			&& self.unapplied_tier_pointers.is_empty()
-			&& self.tier_authority.expose_if_ready()
-		{
-			return Ok(());
+	}
+
+	/// ADR 0126 D2: a holder's location-list admission. The same predicate, order, fast path,
+	/// publication and verifier start as [`Self::require_tier_authority_ready`]; a refusal also
+	/// says whether it is eligible for the holder's bounded wait: only when the deciding
+	/// evaluation found nothing but a log-indexed retirement and the selector chose its fallback.
+	pub(crate) fn holder_location_admission(&self) -> HolderAdmission {
+		if self.manager_authority_terms_clear() {
+			let blocks = self.tier_authority.expose_if_ready_blocks();
+			if blocks.is_clear() {
+				return HolderAdmission::Admitted;
+			}
+			self.tier_authority.start();
+			let (branch, error) = self.tier_authority_refusal_with_branch();
+			return HolderAdmission::Refused {
+				error,
+				eligible: blocks.only_log_indexed_retirement() && branch == RefusalBranch::Fallback,
+			};
 		}
 		self.tier_authority.start();
-		Err(self.tier_authority_refusal())
+		HolderAdmission::Refused {
+			error: self.tier_authority_refusal(),
+			eligible: false,
+		}
+	}
+
+	/// ADR 0126 D3: the holder's admission, waiting out an eligible refusal until `wait`'s end.
+	/// The first check registers nothing, so an admitted read costs what it did. Only after an
+	/// eligible refusal with time left is the wake armed, before each recheck; any other refusal,
+	/// or the end, is today's answer.
+	pub(crate) async fn holder_location_admission_waiting(
+		&self,
+		wait: RetirementWait,
+	) -> std::io::Result<()> {
+		let (mut error, mut eligible) = match self.holder_location_admission() {
+			HolderAdmission::Admitted => return Ok(()),
+			HolderAdmission::Refused { error, eligible } => (error, eligible),
+		};
+		let Some(end) = wait.end() else {
+			return Err(error);
+		};
+		#[cfg(test)]
+		if eligible {
+			let hold = self
+				.tier_authority
+				.holder_first_refusal_hold_for_test
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.take();
+			if let Some((reached, release)) = hold {
+				reached.notify_one();
+				release.notified().await;
+			}
+		}
+		loop {
+			if !eligible || TokioInstant::now() >= end {
+				return Err(error);
+			}
+			let changed = self.tier_authority.changed.notified();
+			tokio::pin!(changed);
+			changed.as_mut().enable();
+			#[cfg(test)]
+			self.tier_authority
+				.holder_retirement_registrations_for_test
+				.fetch_add(1, Ordering::AcqRel);
+			(error, eligible) = match self.holder_location_admission() {
+				HolderAdmission::Admitted => return Ok(()),
+				HolderAdmission::Refused { error, eligible } => (error, eligible),
+			};
+			if !eligible || TokioInstant::now() >= end {
+				return Err(error);
+			}
+			#[cfg(test)]
+			{
+				*self
+					.tier_authority
+					.holder_retirement_wait_end_for_test
+					.lock()
+					.unwrap_or_else(|e| e.into_inner()) = Some(end);
+				self.tier_authority
+					.holder_retirement_waits_for_test
+					.fetch_add(1, Ordering::AcqRel);
+				self.tier_authority
+					.holder_retirement_wait_began_for_test
+					.notify_waiters();
+			}
+			let at = end.min(TokioInstant::now() + HOLDER_RETIREMENT_RECHECK);
+			let _ = tokio::time::timeout_at(at, changed).await;
+		}
 	}
 
 	pub(crate) fn require_tier_read_scope(&self, slabs: &[SlabId]) -> std::io::Result<()> {
@@ -1996,7 +2321,7 @@ impl SlabManager {
 			{
 				return Err(self.tier_authority_refusal());
 			}
-			if self.tier_authority.retirement_fence.load(Ordering::Acquire)
+			if self.tier_authority.retirement_fence_stands_now()
 				|| self.tier_authority.snapshot_fences.load(Ordering::Acquire) != 0
 			{
 				return Err(self.tier_authority_refusal());
@@ -2101,7 +2426,7 @@ impl SlabManager {
 		if self.tier_authority.closed.load(Ordering::Acquire) {
 			return Some("TierAuthorityClosed".into());
 		}
-		if self.tier_authority.retirement_fence.load(Ordering::Acquire)
+		if self.tier_authority.retirement_fence_stands_now()
 			|| self.tier_authority.snapshot_fences.load(Ordering::Acquire) != 0
 		{
 			return Some("TierAuthorityFenced".into());

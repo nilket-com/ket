@@ -151,8 +151,17 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 	) -> std::io::Result<Vec<RecordLocation>> {
 		self.require_tier_authority_ready()?;
-		Ok(self
-			.key_index
+		Ok(self.same_hlc_locations_admitted(tenant_id, key_identity, hlc))
+	}
+
+	/// The locations themselves, once an authority admission has admitted the read.
+	fn same_hlc_locations_admitted(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) -> Vec<RecordLocation> {
+		self.key_index
 			.get(&(tenant_id, key_identity))
 			.map(|chain| {
 				chain
@@ -161,7 +170,7 @@ impl SlabManager {
 					.copied()
 					.collect()
 			})
-			.unwrap_or_default())
+			.unwrap_or_default()
 	}
 
 	/// Refuse a payload that differs from an indexed version with the same
@@ -764,8 +773,33 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		tails: Option<&QueryTails>,
 	) -> std::io::Result<Vec<RecordBatch>> {
+		let locations = self.same_hlc_locations(tenant_id, key_identity, hlc)?;
+		self.rows_at_locations(locations, tails).await
+	}
+
+	/// ADR 0126 D3: `stored_rows_at_version` for a holder's own child. Its location-list admission
+	/// waits out a sole log-indexed retirement fence until `wait`'s end, then lists the locations
+	/// and runs the same reads; every other answer is today's.
+	pub(crate) async fn stored_rows_at_version_for_holder(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		wait: super::tier_authority::RetirementWait,
+	) -> std::io::Result<Vec<RecordBatch>> {
+		self.holder_location_admission_waiting(wait).await?;
+		let locations = self.same_hlc_locations_admitted(tenant_id, key_identity, hlc);
+		self.rows_at_locations(locations, None).await
+	}
+
+	/// Each location's one-row batch, read and decoded.
+	async fn rows_at_locations(
+		&self,
+		locations: Vec<RecordLocation>,
+		tails: Option<&QueryTails>,
+	) -> std::io::Result<Vec<RecordBatch>> {
 		let mut rows = Vec::new();
-		for location in self.same_hlc_locations(tenant_id, key_identity, hlc)? {
+		for location in locations {
 			let stored = self.read_reusing(location, tails).await?;
 			let batch = decode_record_batch(&stored)?;
 			let row = location.record_row_index.get() as usize;
