@@ -70305,3 +70305,208 @@ impl SlabManager {
 		lease.applied_op_digest(op)
 	}
 }
+
+/// Codex 01a20599 (F1): the shared-frame copy reader returns exactly what the per-copy reader
+/// returns, version by version and copy by copy, and fails exactly where it fails: single copies,
+/// an identical duplicate copy, and a conflicting duplicate (whose reads refuse) alongside good
+/// versions.
+#[tokio::test]
+async fn shared_frame_copies_equal_the_per_copy_reads() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("shared-frame-copies").await;
+	let batch = |value: i64| {
+		let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+		RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+	};
+	let active = mgr.state.lock().await.active.clone();
+	let single = [
+		(id(0x7a01), hlc(10), 1),
+		(id(0x7a02), hlc(11), 2),
+		(id(0x7a03), hlc(12), 3),
+	];
+	for (key, at, value) in single {
+		active
+			.append(tenant(), key, at, &encode_test_batch(&batch(value)))
+			.await
+			.unwrap();
+	}
+	let duplicate = (id(0x7a04), hlc(13));
+	for _ in 0..2 {
+		active
+			.append(
+				tenant(),
+				duplicate.0,
+				duplicate.1,
+				&encode_test_batch(&batch(4)),
+			)
+			.await
+			.unwrap();
+	}
+	let conflicting = (id(0x7a05), hlc(14));
+	for value in [5, 6] {
+		active
+			.append(
+				tenant(),
+				conflicting.0,
+				conflicting.1,
+				&encode_test_batch(&batch(value)),
+			)
+			.await
+			.unwrap();
+	}
+	drop(active);
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let good: Vec<_> = single
+		.iter()
+		.map(|(key, at, _)| (tenant(), *key, *at))
+		.chain([(tenant(), duplicate.0, duplicate.1)])
+		.collect();
+	let listed = |versions: &[(TenantId, Identity, HybridTimestamp)]| {
+		versions
+			.iter()
+			.map(|(tenant_id, key, at)| mgr.version_locations(*tenant_id, *key, *at).unwrap())
+			.collect::<Vec<_>>()
+	};
+	let mut per_copy = Vec::new();
+	for (tenant_id, key, at) in &good {
+		per_copy.push(
+			mgr.stored_rows_at_version(*tenant_id, *key, *at, None)
+				.await
+				.unwrap(),
+		);
+	}
+	assert_eq!(
+		per_copy[3].len(),
+		2,
+		"premise: the duplicate has two copies"
+	);
+	let (shared, stats) = mgr
+		.stored_copies_reusing_frames(&listed(&good), |_, _, _, row| row.clone())
+		.await;
+	assert_eq!(shared, Some(per_copy), "exactly the per-copy rows");
+	assert_eq!(stats.reads + stats.reused, 5, "every copy is visited once");
+	assert!(
+		mgr.stored_rows_at_version(tenant(), conflicting.0, conflicting.1, None)
+			.await
+			.is_err(),
+		"premise: the conflicting duplicate's per-copy read refuses"
+	);
+	let mut all = good.clone();
+	all.insert(1, (tenant(), conflicting.0, conflicting.1));
+	assert_eq!(
+		mgr.stored_copies_reusing_frames(&listed(&all), |_, _, _, row| row.clone())
+			.await
+			.0,
+		None,
+		"so does the shared read, alongside good versions"
+	);
+}
+
+/// Codex 01a205cd: the shared-frame reader really reuses a frame. Six versions written as one
+/// multi-row frame in a slab that is then tiered (a tombstone row cannot share a frame with user
+/// columns, so kinds here are rows; tombstone copies are covered by the cluster cleanup lanes): one physical read serves all
+/// six copies, every copy is still verified against its own version (the tiered rule), and the
+/// rows and kinds are exactly the per-copy reads'. A later copy on the held frame whose version
+/// check fails (its HLC is not its row's) refuses the whole read, from the held frame, as its
+/// per-copy read refuses.
+#[tokio::test]
+async fn shared_frame_copies_hit_one_tiered_frame_and_refuse_a_failing_copy() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("shared-frame-hits").await;
+	let rows: Vec<_> = (0..6u64)
+		.map(|n| (id(0x7b00 + n), Locality::new(7), hlc(100 + n), n, false))
+		.collect();
+	let frame = encode_test_multirow_storage_frame_with_tombstones(&rows);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("a multi-row frame");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let l2_uri = l2
+		.put(
+			&format!("shared-frame-hits/slab_{slab_id:016x}.wnd"),
+			&encrypted.bytes,
+		)
+		.await
+		.unwrap();
+	mgr.apply_tier_slab(TieredSlabPointer {
+		slab_id,
+		l2_uri,
+		payload_hash: crate::hash::content::digest(&encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(encrypted.tenant_id),
+		tenant_kek_id: Some(encrypted.tenant_kek_id),
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	})
+	.await
+	.unwrap();
+	assert!(mgr.tier_pointer(slab_id).await.is_some(), "premise: tiered");
+	let listed: Vec<Vec<RecordLocation>> = rows
+		.iter()
+		.map(|(key, _, at, _, _)| mgr.version_locations(tenant(), *key, *at).unwrap())
+		.collect();
+	assert!(
+		listed.iter().all(|copies| copies.len() == 1),
+		"premise: one copy each"
+	);
+	let offsets: std::collections::BTreeSet<_> =
+		listed.iter().map(|copies| copies[0].offset).collect();
+	assert_eq!(offsets.len(), 1, "premise: one physical frame");
+	let mut per_copy = Vec::new();
+	for (key, _, at, _, _) in &rows {
+		per_copy.push(
+			mgr.stored_rows_at_version(tenant(), *key, *at, None)
+				.await
+				.unwrap(),
+		);
+	}
+	let (shared, stats) = mgr
+		.stored_copies_reusing_frames(&listed, |_, _, location, row| {
+			(location.is_tombstone, row.clone())
+		})
+		.await;
+	let shared = shared.expect("every copy reads");
+	assert_eq!(
+		(stats.reads, stats.reused, stats.index_parses),
+		(1, 5, 1),
+		"one read and one index parse serve six copies: {stats:?}"
+	);
+	for (version, copies) in shared.iter().enumerate() {
+		assert_eq!(copies.len(), 1);
+		let (tombstone, row) = &copies[0];
+		assert_eq!(*tombstone, listed[version][0].is_tombstone);
+		assert!(!*tombstone, "every copy is a row");
+		assert_eq!(row, &per_copy[version][0], "version {version}'s row");
+	}
+	assert!(
+		stats.peak_index_bytes > 0 && stats.peak_frame_bytes > 0,
+		"{stats:?}"
+	);
+	// A copy on the same frame naming another HLC than its row's: its per-copy read refuses
+	// (the version check), and so does the shared read, on the held frame.
+	let mut forged = listed[4][0];
+	forged.hlc = hlc(999);
+	assert!(
+		mgr.read_reusing(forged, None).await.is_err(),
+		"premise: the per-copy read refuses it"
+	);
+	let mut with_forged = listed.clone();
+	with_forged.push(vec![forged]);
+	let (refused, stats) = mgr
+		.stored_copies_reusing_frames(&with_forged, |_, _, _, row| row.clone())
+		.await;
+	assert_eq!(refused, None, "the shared read refuses too");
+	assert_eq!(
+		stats.reads, 1,
+		"from the held frame, not a new read: {stats:?}"
+	);
+	assert!(stats.reused >= 1, "{stats:?}");
+}

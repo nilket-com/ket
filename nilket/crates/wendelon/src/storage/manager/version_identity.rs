@@ -780,3 +780,65 @@ impl SlabManager {
 		Ok(rows)
 	}
 }
+
+impl SlabManager {
+	/// Certified content evidence (Codex 01a20599 and 01a205cd): every given copy, each version's
+	/// copies being its indexed locations as the caller listed them (`version_locations`, scope
+	/// checked), read with one physical frame shared at a time ([`super::lsm_driver::FrameReuse`]).
+	/// Copies are visited in location order, so a frame's copies meet its one read and decode.
+	/// `each(version, copy, location, row)` sees every copy's own location and one-row slice and
+	/// keeps only what it returns; the slice (and the frame buffers it shares) is released when it
+	/// returns. Each copy is read exactly as [`SlabManager::stored_rows_at_version`] reads it, and
+	/// the call is `None` where that would fail.
+	pub(crate) async fn stored_copies_reusing_frames<T>(
+		&self,
+		versions: &[Vec<RecordLocation>],
+		mut each: impl FnMut(usize, usize, RecordLocation, &RecordBatch) -> T,
+	) -> (Option<Vec<Vec<T>>>, super::lsm_driver::FrameReuseStats) {
+		let mut reuse = super::lsm_driver::FrameReuse::default();
+		let mut work: Vec<(RecordLocation, usize, usize)> =
+			Vec::with_capacity(versions.iter().map(Vec::len).sum());
+		let mut out: Vec<Vec<Option<T>>> = Vec::with_capacity(versions.len());
+		for (version, locations) in versions.iter().enumerate() {
+			out.push(locations.iter().map(|_| None).collect());
+			work.extend(
+				locations
+					.iter()
+					.enumerate()
+					.map(|(copy, location)| (*location, version, copy)),
+			);
+		}
+		reuse.stats.scratch_bytes = (work.capacity()
+			* std::mem::size_of::<(RecordLocation, usize, usize)>()
+			+ out.capacity() * std::mem::size_of::<Vec<Option<T>>>()
+			+ out
+				.iter()
+				.map(|copies| copies.capacity() * std::mem::size_of::<Option<T>>())
+				.sum::<usize>()) as u64;
+		work.sort_by_key(|(location, version, copy)| {
+			(
+				location.slab_id,
+				location.offset,
+				location.record_row_index.get(),
+				*version,
+				*copy,
+			)
+		});
+		for (location, version, copy) in work {
+			match self.stored_row_reusing_frame(location, &mut reuse).await {
+				Ok(row) => out[version][copy] = Some(each(version, copy, location, &row)),
+				Err(_) => return (None, reuse.stats),
+			}
+		}
+		let copies = out
+			.into_iter()
+			.map(|copies| {
+				copies
+					.into_iter()
+					.map(|copy| copy.expect("every listed copy was visited"))
+					.collect()
+			})
+			.collect();
+		(Some(copies), reuse.stats)
+	}
+}

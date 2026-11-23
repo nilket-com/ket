@@ -20,8 +20,21 @@ pub(super) fn verify_frame_names_version(
 	target: RecordLocation,
 	expected: ExpectedVersion,
 ) -> std::io::Result<()> {
+	let entries = storage_multirow_index_entries_from_frame(frame)?;
+	verify_entries_name_version(header, entries.as_deref(), target, expected)
+}
+
+/// [`verify_frame_names_version`] over the frame's multi-row index entries already parsed
+/// (`None`: not a multi-row frame), so a caller holding one frame for many copies parses its
+/// index once. The check itself is the same.
+pub(super) fn verify_entries_name_version(
+	header: &SlabRecordHeader,
+	entries: Option<&[MultiRowIndexEntry]>,
+	target: RecordLocation,
+	expected: ExpectedVersion,
+) -> std::io::Result<()> {
 	let superseded = || stale_location_error(target.slab_id, StaleLocationReason::Superseded);
-	let (key_identity, hlc) = match storage_multirow_index_entries_from_frame(frame)? {
+	let (key_identity, hlc) = match entries {
 		Some(entries) => {
 			let entry = entries
 				.iter()
@@ -5025,5 +5038,261 @@ impl SlabManager {
 				format!("slab {} is delete-pending for LSM GC", location.slab_id),
 			)
 		})
+	}
+}
+
+/// Certified content evidence (Codex 01a20599, after DECIDING-ATTRIBUTION): one caller's reuse of
+/// a physical frame across the version copies it reads, as ADR 0097 shares one frame read across
+/// an LSM plan's rows. A frame read for one copy serves a later copy only when that copy's own
+/// read resolved (its redirects, its pin, its snapshot) to the SAME backing generation and the
+/// SAME frame; every copy is still resolved, pinned and verified against its own target, and its
+/// row bounds checked. At most ONE frame (its bytes and its decoded batch) is held: a caller
+/// visits copies in location order so a frame's copies meet its one read, and any other order
+/// only reads more often.
+#[derive(Default)]
+pub(crate) struct FrameReuse {
+	held: Option<HeldFrame>,
+	pub(crate) stats: FrameReuseStats,
+}
+
+/// What a [`FrameReuse`] did: physical frame reads (each decoded once), copies served by a held
+/// frame, rows its decodes produced, and multi-row index parses for verification.
+///
+/// Retained data, measured at the moment the most was held: the held frame's bytes (capacity),
+/// its decoded batch (Arrow array memory) and its parsed index entries (capacity times entry
+/// size), and their sum. The previous frame is released before the next is read, so this is one
+/// frame's. NOT counted (temporary, released before the step returns): the read's own buffers
+/// beyond the frame, and the index parse's internal decode. `scratch_bytes` is the grouping
+/// scratch of [`SlabManager::stored_copies_reusing_frames`] (one location, version and copy per
+/// copy, and the per-version result spine), at capacity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameReuseStats {
+	pub(crate) reads: u64,
+	pub(crate) reused: u64,
+	pub(crate) rows_decoded: u64,
+	pub(crate) index_parses: u64,
+	pub(crate) peak_held_bytes: u64,
+	pub(crate) peak_frame_bytes: u64,
+	pub(crate) peak_batch_bytes: u64,
+	pub(crate) peak_index_bytes: u64,
+	pub(crate) scratch_bytes: u64,
+}
+
+impl FrameReuseStats {
+	/// Notes the held frame's retained data, keeping the largest total and its parts.
+	fn note_held(&mut self, held: &HeldFrame) {
+		let frame = held.frame.capacity() as u64;
+		let batch = held.batch.get_array_memory_size() as u64;
+		let index = held
+			.entries
+			.as_ref()
+			.and_then(Option::as_ref)
+			.map_or(0, |entries| {
+				(entries.capacity() * std::mem::size_of::<MultiRowIndexEntry>()) as u64
+			});
+		if frame + batch + index > self.peak_held_bytes {
+			self.peak_held_bytes = frame + batch + index;
+			self.peak_frame_bytes = frame;
+			self.peak_batch_bytes = batch;
+			self.peak_index_bytes = index;
+		}
+	}
+}
+
+struct HeldFrame {
+	backing: HeldBacking,
+	target: RecordLocation,
+	header: SlabRecordHeader,
+	frame: Vec<u8>,
+	batch: RecordBatch,
+	/// The frame's multi-row index entries, parsed once when a copy first needs verifying.
+	entries: Option<Option<Vec<MultiRowIndexEntry>>>,
+}
+
+/// The backing generation a frame was read from. A local store and a rehydrated copy are the
+/// same `Arc` (held, so the identity cannot be reused); an L2 object is its exact pointer.
+enum HeldBacking {
+	Local(Arc<LocalSlabStore>),
+	Rehydrated(
+		Arc<LocalSlabStore>,
+		crate::consensus::slab_ops::TierGeneration,
+	),
+	L2(TieredSlabPointer),
+}
+
+impl HeldBacking {
+	fn of(backing: &SlabBacking) -> Option<Self> {
+		match backing {
+			SlabBacking::Local(slab) => Some(Self::Local(slab.clone())),
+			SlabBacking::Rehydrated(copy) => Some(Self::Rehydrated(
+				copy.store.clone(),
+				copy.generation.clone(),
+			)),
+			SlabBacking::L2(pointer) => Some(Self::L2(pointer.clone())),
+			SlabBacking::Missing => None,
+		}
+	}
+
+	fn is(&self, backing: &SlabBacking) -> bool {
+		match (self, backing) {
+			(Self::Local(held), SlabBacking::Local(slab)) => Arc::ptr_eq(held, slab),
+			(Self::Rehydrated(held, generation), SlabBacking::Rehydrated(copy)) => {
+				Arc::ptr_eq(held, &copy.store) && *generation == copy.generation
+			}
+			(Self::L2(held), SlabBacking::L2(pointer)) => held == pointer,
+			_ => false,
+		}
+	}
+}
+
+impl HeldFrame {
+	/// Whether this frame is the one `target` resolves to on `backing`.
+	fn serves(&self, backing: &SlabBacking, target: RecordLocation) -> bool {
+		self.backing.is(backing)
+			&& self.target.slab_id == target.slab_id
+			&& self.target.offset == target.offset
+			&& self.target.length == target.length
+	}
+}
+
+impl SlabManager {
+	/// One stored copy of a version at `location`, as the one-row batch its frame holds at its
+	/// record index: [`SlabManager::read_reusing`] (no tails, no named version) followed by the
+	/// whole-frame decode and row slice of [`SlabManager::stored_rows_at_version`], with the
+	/// frame shared through `reuse`. The read path's resolution, pin, per-backing verification,
+	/// missing-slab handling and one L2 not-found re-resolution are the same; only a frame
+	/// already held for the same backing generation and frame is not read and decoded again.
+	pub(crate) async fn stored_row_reusing_frame(
+		&self,
+		location: RecordLocation,
+		reuse: &mut FrameReuse,
+	) -> std::io::Result<RecordBatch> {
+		let mut attempts = 0;
+		loop {
+			attempts += 1;
+			let ReadTarget {
+				backing,
+				location: target,
+				tiered,
+				_pin,
+			} = self.resolve_read_target(location, true).await?;
+			// As `read_expected_version_once` with no named version: a local frame is verified
+			// when its slab is tiered; a rehydrated or L2 frame always, against its tenant.
+			let (verify, expected) = match &backing {
+				SlabBacking::Local(_) => (
+					tiered,
+					ExpectedVersion {
+						tenant_id: None,
+						key_identity: None,
+					},
+				),
+				SlabBacking::Rehydrated(copy) => (
+					true,
+					ExpectedVersion {
+						tenant_id: copy.generation.tenant_id,
+						key_identity: None,
+					},
+				),
+				SlabBacking::L2(pointer) => (
+					true,
+					ExpectedVersion {
+						tenant_id: pointer.tenant_id,
+						key_identity: None,
+					},
+				),
+				SlabBacking::Missing => {
+					return Err(Error::new(ErrorKind::NotFound, {
+						self.record_missing_published_references_for_slab(
+							target.slab_id,
+							PublishedReferenceOrigin::Read,
+						);
+						format!("no slab with id {} under this manager", target.slab_id)
+					}));
+				}
+			};
+			let held = reuse
+				.held
+				.as_ref()
+				.is_some_and(|held| held.serves(&backing, target));
+			if held {
+				let frame = reuse.held.as_mut().expect("held");
+				if verify {
+					if frame.entries.is_none() {
+						frame.entries =
+							Some(storage_multirow_index_entries_from_frame(&frame.frame)?);
+						reuse.stats.index_parses += 1;
+						reuse.stats.note_held(frame);
+					}
+					let entries = frame.entries.as_ref().expect("parsed").as_deref();
+					verify_entries_name_version(&frame.header, entries, target, expected)?;
+				}
+				reuse.stats.reused += 1;
+			} else {
+				// The previous frame is released before the next is read, parsed and decoded.
+				reuse.held = None;
+				let read = match &backing {
+					SlabBacking::Local(slab) => {
+						let started = Instant::now();
+						let result = slab.read_with_header(target).await;
+						metrics()
+							.l1_read_latency_seconds
+							.observe_duration(started.elapsed());
+						result
+					}
+					SlabBacking::Rehydrated(copy) => {
+						let started = Instant::now();
+						let result = copy.read_with_header(target).await;
+						metrics()
+							.l1_read_latency_seconds
+							.observe_duration(started.elapsed());
+						result
+					}
+					SlabBacking::L2(pointer) => {
+						let started = Instant::now();
+						let result = self.read_from_l2(pointer, target, None).await;
+						metrics()
+							.l2_range_read_latency_seconds
+							.observe_duration(started.elapsed());
+						match result {
+							Err(error) if error.kind() == ErrorKind::NotFound && attempts == 1 => {
+								continue;
+							}
+							result => result,
+						}
+					}
+					SlabBacking::Missing => unreachable!("refused above"),
+				};
+				let (header, frame) = read?;
+				let entries = if verify {
+					let entries = storage_multirow_index_entries_from_frame(&frame)?;
+					reuse.stats.index_parses += 1;
+					verify_entries_name_version(&header, entries.as_deref(), target, expected)?;
+					Some(entries)
+				} else {
+					None
+				};
+				let batch = decode_record_batch(&frame)?;
+				reuse.stats.reads += 1;
+				reuse.stats.rows_decoded += batch.num_rows() as u64;
+				reuse.held = Some(HeldFrame {
+					backing: HeldBacking::of(&backing).expect("not missing"),
+					target,
+					header,
+					frame,
+					batch,
+					entries,
+				});
+				reuse.stats.note_held(reuse.held.as_ref().expect("held"));
+			}
+			let batch = &reuse.held.as_ref().expect("held").batch;
+			let row = location.record_row_index.get() as usize;
+			if row >= batch.num_rows() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"a stored version's record index is outside its frame",
+				));
+			}
+			return Ok(batch.slice(row, 1));
+		}
 	}
 }

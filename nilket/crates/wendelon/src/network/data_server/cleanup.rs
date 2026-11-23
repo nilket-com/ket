@@ -136,6 +136,16 @@ impl WendelonDataServer {
 	/// kind and content gets none and stays. Evidence that cannot be
 	/// established now (no descriptor, a copy that cannot be read) refuses the
 	/// whole step, retryably: it is never mistaken for a debt-free slab.
+	///
+	/// Codex 01a20599 and 01a205cd (DECIDING-ATTRIBUTION): the copies of every
+	/// debt version are read together, each physical frame read, verified and
+	/// decoded once while its copies are visited
+	/// ([`SlabManager::stored_copies_reusing_frames`]), instead of once per
+	/// version it holds. Each version keeps the descriptor it resolved; equal
+	/// descriptors share one allocation. The refusals are unchanged and in the
+	/// same precedence: the first version (in candidate order) without a
+	/// descriptor ends the list, and refuses unless a copy of an earlier version
+	/// cannot be read.
 	async fn content_evidence(
 		&self,
 		facts: &CoherentFacts,
@@ -146,7 +156,9 @@ impl WendelonDataServer {
 				format!("cleanup evidence unavailable: {what}"),
 			)
 		};
-		let mut evidence = Vec::new();
+		let mut checks = Vec::new();
+		let mut descriptors: Vec<Arc<TableSchemaDescriptor>> = Vec::new();
+		let mut no_descriptor = false;
 		for at in 0..facts.candidates().len() {
 			let fact = facts.get(at);
 			let Some((key, debt)) = &fact.debt else {
@@ -168,7 +180,8 @@ impl WendelonDataServer {
 				})
 				.await
 			else {
-				return Err(unavailable("no descriptor for a debt version's table"));
+				no_descriptor = true;
+				break;
 			};
 			let expected_tombstone = match debt.source {
 				DebtSource::DisplacedBase { tombstone } => tombstone,
@@ -177,23 +190,38 @@ impl WendelonDataServer {
 					&key.as_owned(debt.row_digest),
 				),
 			};
-			let Some(copies) = self.stored_copies(key, &descriptor).await else {
-				return Err(unavailable("a debt version's copy could not be read"));
-			};
-			if let Some(found) = ContentEvidence::check(*key, debt, expected_tombstone, &copies) {
+			checks.push((
+				key,
+				debt,
+				expected_tombstone,
+				share(&mut descriptors, descriptor),
+			));
+		}
+		let copies = if checks.is_empty() {
+			Vec::new()
+		} else {
+			match self.stored_copies(&checks).await {
+				Some(copies) => copies,
+				None => return Err(unavailable("a debt version's copy could not be read")),
+			}
+		};
+		let mut evidence = Vec::new();
+		for ((key, debt, expected_tombstone, _), copies) in checks.iter().zip(&copies) {
+			if let Some(found) = ContentEvidence::check(**key, debt, *expected_tombstone, copies) {
 				evidence.push(found);
 			}
+		}
+		if no_descriptor {
+			return Err(unavailable("no descriptor for a debt version's table"));
 		}
 		Ok(evidence)
 	}
 
-	/// Every stored copy of `key`: its kind, and a row's content digest.
-	/// `None` when any copy cannot be read.
-	async fn stored_copies(
-		&self,
-		key: &VersionKey,
-		descriptor: &TableSchemaDescriptor,
-	) -> Option<Vec<StoredCopy>> {
+	/// Every stored copy of each checked version: its indexed location's kind,
+	/// and a row's content digest, each copy's kind and row taken from the same
+	/// location. The copies are the version's scope-checked indexed locations.
+	/// `None` when any copy of any of them cannot be read.
+	async fn stored_copies(&self, checks: &[EvidenceCheck<'_>]) -> Option<Vec<Vec<StoredCopy>>> {
 		#[cfg(test)]
 		if self
 			.decisions
@@ -202,33 +230,26 @@ impl WendelonDataServer {
 		{
 			return None;
 		}
-		let identity = Identity::new(key.key_identity);
-		let locations = self
-			.slab
-			.version_locations(key.tenant, identity, key.hlc)
-			.ok()?;
-		let rows = self
-			.slab
-			.stored_rows_at_version(key.tenant, identity, key.hlc, None)
-			.await
-			.ok()?;
-		if rows.len() != locations.len() {
-			return None;
+		let mut versions = Vec::with_capacity(checks.len());
+		for (key, ..) in checks {
+			versions.push(
+				self.slab
+					.version_locations(key.tenant, Identity::new(key.key_identity), key.hlc)
+					.ok()?,
+			);
 		}
-		Some(
-			locations
-				.iter()
-				.zip(&rows)
-				.map(|(location, row)| StoredCopy {
-					tombstone: location.is_tombstone,
-					row_digest: if location.is_tombstone {
-						None
-					} else {
-						super::child_writes::stored_row_digest(descriptor, row).ok()
-					},
-				})
-				.collect(),
-		)
+		let (copies, _) = self
+			.slab
+			.stored_copies_reusing_frames(&versions, |version, _, location, row| StoredCopy {
+				tombstone: location.is_tombstone,
+				row_digest: if location.is_tombstone {
+					None
+				} else {
+					super::child_writes::stored_row_digest(&checks[version].3, row).ok()
+				},
+			})
+			.await;
+		copies
 	}
 
 	/// One bounded debt sweep step: retires the debt records of the next page
@@ -490,4 +511,27 @@ impl crate::storage::manager::certified_tier::CertifiedTierDecider for WendelonD
 			job, &facts, &evidence,
 		)
 	}
+}
+
+/// One debt version to check: its key and debt record, its expected kind, and the descriptor it
+/// resolved (shared with every version that resolved an equal one).
+type EvidenceCheck<'a> = (
+	&'a VersionKey,
+	&'a crate::storage::index::certified_base::DebtRecord,
+	bool,
+	Arc<TableSchemaDescriptor>,
+);
+
+/// `descriptor`, as one shared allocation with any equal descriptor already resolved in this
+/// call: the same value, so the same digest and kind rules, held once.
+fn share(
+	descriptors: &mut Vec<Arc<TableSchemaDescriptor>>,
+	descriptor: TableSchemaDescriptor,
+) -> Arc<TableSchemaDescriptor> {
+	if let Some(shared) = descriptors.iter().find(|shared| ***shared == descriptor) {
+		return shared.clone();
+	}
+	let shared = Arc::new(descriptor);
+	descriptors.push(shared.clone());
+	shared
 }
