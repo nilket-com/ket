@@ -14,6 +14,7 @@ use super::child_writes::{ChildWriteMeta, child_request_meta};
 use super::write_deadline::{
 	AttemptGate, EarlyAnswer, EarlyTableWriteAnswer, OwnedAttempt, answer_by_deadline,
 };
+use super::write_stall_trace::{AttemptTrace, HolderSeen, StallAnswer, StallSite as Site};
 use super::*;
 use crate::consensus::decisions::{
 	ChildAckBody, ChildClaim, Claim, DecisionResult, LineageRef, Lookup, ParentKey,
@@ -178,6 +179,19 @@ pub(super) fn above_floor(client_hlc: HybridTimestamp, floor_ms: u64) -> HybridT
 	})
 }
 
+/// Why `build_claim` built no claim: a stall at one named check, or another answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClaimStop {
+	Stalled(super::write_stall_trace::ClaimCheck),
+	Settled(Settled),
+}
+
+impl From<Settled> for ClaimStop {
+	fn from(settled: Settled) -> Self {
+		Self::Settled(settled)
+	}
+}
+
 /// Builds a claim for a fresh parent, or says why this node cannot. Rows are
 /// grouped by the replica segment holding their position, each group a child
 /// of its lineage. Which rows each child carries is `rows_of_claim`'s to say.
@@ -191,9 +205,14 @@ pub(super) fn build_claim(
 	batch: &RecordBatch,
 	positions: &[u64],
 	commit_hlc: HybridTimestamp,
-) -> Result<Claim, Settled> {
-	let stalled = Settled::Indeterminate(WriteStatus::WRITE_STALLED);
-	let decisions = state.decisions.as_ref().ok_or(stalled)?;
+) -> Result<Claim, ClaimStop> {
+	use super::write_stall_trace::ClaimCheck as Check;
+	let stalled = ClaimStop::Stalled;
+	let refused = || ClaimStop::Settled(Settled::Refused(WriteStatus::INTERNAL_ERROR));
+	let decisions = state
+		.decisions
+		.as_ref()
+		.ok_or(stalled(Check::NoDecisions))?;
 	let lineage_at = |position: u64| {
 		decisions
 			.lineages()
@@ -202,15 +221,19 @@ pub(super) fn build_claim(
 			.filter(|(_, lineage)| position <= lineage.range_end)
 			.map(|(start, lineage)| (*start, *lineage))
 	};
-	let first = *positions
-		.first()
-		.ok_or(Settled::Refused(WriteStatus::INTERNAL_ERROR))?;
-	let (_, first_lineage) = lineage_at(first).ok_or(stalled)?;
+	let first = *positions.first().ok_or_else(refused)?;
+	let (_, first_lineage) = lineage_at(first).ok_or(stalled(Check::FirstLineage))?;
 	if first_lineage.holder.id != local.node || first_lineage.incarnation != local.incarnation {
-		return Err(Settled::Redirect(first_lineage.holder));
+		return Err(ClaimStop::Settled(Settled::Redirect(first_lineage.holder)));
 	}
-	let (_, config) = state.epoch_history.last_key_value().ok_or(stalled)?;
-	let tenant = state.tenants.get(&key.tenant).ok_or(stalled)?;
+	let (_, config) = state
+		.epoch_history
+		.last_key_value()
+		.ok_or(stalled(Check::Epoch))?;
+	let tenant = state
+		.tenants
+		.get(&key.tenant)
+		.ok_or(stalled(Check::Tenant))?;
 	let ring = crate::network::ring::RingState::build(
 		&crate::network::ring::membership_from_epoch_config(config),
 		tenant.replication_factor as usize,
@@ -221,7 +244,7 @@ pub(super) fn build_claim(
 		let segment = segments
 			.iter()
 			.find(|segment| segment.start <= *position && *position <= segment.end)
-			.ok_or(stalled)?;
+			.ok_or(stalled(Check::Segment))?;
 		groups.entry(segment.start).or_default().push(row as u32);
 	}
 	let mut children = Vec::with_capacity(groups.len());
@@ -241,7 +264,7 @@ pub(super) fn build_claim(
 			.map(|row| positions[*row as usize])
 			.max()
 			.expect("a non-empty group");
-		let (lineage_start, lineage) = lineage_at(low).ok_or(stalled)?;
+		let (lineage_start, lineage) = lineage_at(low).ok_or(stalled(Check::ChildLineage))?;
 		let current = |node: u32| {
 			state
 				.incarnations
@@ -254,7 +277,7 @@ pub(super) fn build_claim(
 			.iter()
 			.map(|node| current(node.id))
 			.collect::<Option<Vec<_>>>()
-			.ok_or(stalled)?;
+			.ok_or(stalled(Check::Plan))?;
 		let sub = arrow::compute::take_record_batch(
 			batch,
 			&arrow::array::UInt32Array::from(rows.clone()),
@@ -299,7 +322,7 @@ pub(super) fn build_claim(
 		key,
 		request_digest,
 		commit_hlc,
-		coordinator: coordinator.ok_or(stalled)?,
+		coordinator: coordinator.ok_or(stalled(Check::Coordinator))?,
 		first_row_position: first,
 		children,
 		operation: crate::consensus::decisions::Operation::Write,
@@ -462,11 +485,15 @@ impl WendelonDataServer {
 		let gate = AttemptGate::until(caller_deadline_from_remaining_millis(
 			meta.deadline_remaining_millis,
 		));
+		// DC-287 (observation only): an ordinary table write is traced when this node traces; a
+		// CTAS chunk is not. A node without a trace takes no reading here.
+		let traced = self.decisions.write_stall_trace.as_deref();
+		let attempt = AttemptTrace::enter(traced.filter(|_| dispatch.is_none()), &meta);
 		let mut given = None;
 		let settled = answer_by_deadline(
 			&gate,
 			// ADR 0727: on the heap; the deadline wrapper polls the same future.
-			Box::pin(self.coordinate(namespace, &meta, &batch, &gate, dispatch)),
+			Box::pin(self.coordinate(namespace, &meta, &batch, &gate, dispatch, &attempt)),
 			|| {
 				let response = self.settled_response(&meta, Settled::Deadline);
 				if let Some(early) = early {
@@ -479,6 +506,9 @@ impl WendelonDataServer {
 			},
 		)
 		.await;
+		// Only a stall that is this attempt's own answer is published; after a deadline answer the
+		// attempt's result is discarded, and so is its held stall.
+		attempt.publish_if_answered(settled);
 		let response = match (settled, given) {
 			(Some(settled), _) => self.settled_response(&meta, settled),
 			// Already answered, and counted once: the coordination's own result
@@ -531,6 +561,8 @@ impl WendelonDataServer {
 				&payload,
 				&AttemptGate::unbounded(),
 				None,
+				// A KV write's table metadata is synthesized here, not a wire attempt: untraced.
+				&AttemptTrace::untraced(&table_meta),
 			)
 			.await;
 		self.settled_response(&table_meta, settled).write
@@ -549,6 +581,7 @@ impl WendelonDataServer {
 		batch: &RecordBatch,
 		gate: &AttemptGate,
 		dispatch: Option<&CtasDispatch>,
+		attempt: &AttemptTrace<'_>,
 	) -> Settled {
 		let stalled = Settled::Indeterminate(WriteStatus::WRITE_STALLED);
 		let (Some(proposals), Some(signer)) = (
@@ -685,7 +718,9 @@ impl WendelonDataServer {
 					}
 					ParentStatus::Refused { .. } => return Settled::KnownNotCommitted,
 					// A body never carries a noop status.
-					ParentStatus::Noop { .. } => return stalled,
+					ParentStatus::Noop { .. } => {
+						return attempt.stall(Site::ResumeNoop, || StallAnswer::RECORDED);
+					}
 					ParentStatus::Reserved => {
 						// Only the recorded coordinator drives a Reserved parent.
 						let Some((coordinator, lineage)) = record
@@ -694,7 +729,8 @@ impl WendelonDataServer {
 							.get(usize::from(record.claim.coordinator))
 							.map(|child| (child.holder, child.lineage))
 						else {
-							return stalled;
+							return attempt
+								.stall(Site::ResumeNoCoordinatorChild, || StallAnswer::RECORDED);
 						};
 						if coordinator.node != signer.signer.node {
 							// ADR 0729: only while its recorded lineage is open and
@@ -707,7 +743,9 @@ impl WendelonDataServer {
 									diag!("resume: redirect to recorded coordinator {}", route.id);
 									Settled::Redirect(route)
 								}
-								None => stalled,
+								None => {
+									attempt.stall(Site::ResumeUnroutable, || StallAnswer::RECORDED)
+								}
 							};
 						}
 						let open = self
@@ -723,7 +761,8 @@ impl WendelonDataServer {
 						if coordinator != signer.signer || !open {
 							// The reserving coordinator's authority has ended; recorded
 							// closure and Resolve settle it.
-							return stalled;
+							return attempt
+								.stall(Site::ResumeAuthorityEnded, || StallAnswer::RECORDED);
 						}
 						let Some(rows) = rows_of_claim(&record.claim, positions) else {
 							return Settled::Refused(WriteStatus::WRITE_KEY_CONFLICT);
@@ -803,11 +842,11 @@ impl WendelonDataServer {
 						// ADR 0729: no hint to a holder whose applied lease has
 						// lapsed; the range's authority is unavailable until it
 						// renews or a replica takes over. Retryable, names no node.
-						Err(Settled::Redirect(holder)) => {
+						Err(ClaimStop::Settled(Settled::Redirect(holder))) => {
 							// Re-read for this request's own range: the lineage may
 							// have moved since `build_claim` read it.
 							let Some(first) = positions.first().copied() else {
-								return stalled;
+								return attempt.stall(Site::ClaimNoPosition, || StallAnswer::STATE);
 							};
 							return match self.route_for_position(first).await {
 								Some(route) => {
@@ -823,11 +862,16 @@ impl WendelonDataServer {
 										"build_claim: range authority at {} unavailable",
 										holder.id
 									);
-									stalled
+									attempt
+										.stall(Site::ClaimRangeUnavailable, || StallAnswer::STATE)
 								}
 							};
 						}
-						Err(settled) => {
+						Err(ClaimStop::Stalled(check)) => {
+							diag!("build_claim: stalled at {check:?}");
+							return attempt.stall(Site::of_claim(check), || StallAnswer::STATE);
+						}
+						Err(ClaimStop::Settled(settled)) => {
 							diag!("build_claim: {settled:?}");
 							return settled;
 						}
@@ -893,7 +937,8 @@ impl WendelonDataServer {
 						}
 						other => {
 							diag!("reserve: {other:?}");
-							return stalled;
+							return attempt
+								.stall(Site::Reserve, || StallAnswer::of_proposal(&other));
 						}
 					}
 				}
@@ -925,13 +970,14 @@ impl WendelonDataServer {
 				// Absent after this attempt reserved, or the lookup failed: unknown.
 				other => {
 					diag!("lookup: {other:?}");
-					return stalled;
+					return attempt.stall(Site::Lookup, || StallAnswer::of_lookup(&other));
 				}
 			}
 		};
-		let acks = self
+		let (acks, holder) = self
 			.write_children(&claim, rsv, &descriptor, batch, &child_rows)
 			.await;
+		let carried = acks.len();
 		#[cfg(test)]
 		self.decisions
 			.pause_at(super::child_writes::PauseStage::BeforeFinalize)
@@ -968,7 +1014,7 @@ impl WendelonDataServer {
 			} => Settled::KnownNotCommitted,
 			other => {
 				diag!("finalize: {other:?} with {} acks", claim.children.len());
-				stalled
+				attempt.stall_finalize(|| StallAnswer::of_proposal(&other), holder, carried)
 			}
 		}
 	}
@@ -983,9 +1029,10 @@ impl WendelonDataServer {
 		descriptor: &TableSchemaDescriptor,
 		batch: &RecordBatch,
 		child_rows: &[Vec<u32>],
-	) -> Vec<Signed<ChildAckBody>> {
+	) -> (Vec<Signed<ChildAckBody>>, HolderSeen) {
 		let digest = crate::consensus::decisions::claim_digest(claim);
 		let mut acks = Vec::new();
+		let mut holder = HolderSeen::default();
 		for (ordinal, (child, rows)) in claim.children.iter().zip(child_rows).enumerate() {
 			let Ok(sub) = arrow::compute::take_record_batch(
 				batch,
@@ -1017,16 +1064,22 @@ impl WendelonDataServer {
 				},
 			);
 			if child.holder.node == self.local_node.id {
-				acks.extend(
-					self.holder_write(
+				match self
+					.holder_write(
 						self.local_node.id,
 						meta,
 						sub,
 						Arc::new(rows_bytes),
 						trailing,
 					)
-					.await,
-				);
+					.await
+				{
+					Ok(own) => {
+						holder.acked = true;
+						acks.extend(own);
+					}
+					Err(refusal) => holder.refused(&refusal),
+				}
 			} else if let Ok(meta_bytes) = postcard::to_stdvec(&meta) {
 				let response = super::child_writes::send_child_frame_with_trailing(
 					self.factory.clone(),
@@ -1049,7 +1102,7 @@ impl WendelonDataServer {
 				}
 			}
 		}
-		acks
+		(acks, holder)
 	}
 
 	/// Wendelon ADR 0120 D6: an authenticated CTAS chunk write. The credential is
@@ -1194,6 +1247,7 @@ impl WendelonDataServer {
 				&batch,
 				&AttemptGate::until(Some(deadline)),
 				None,
+				&AttemptTrace::untraced(&meta),
 			)
 			.await;
 		self.settled_response(&meta, settled)

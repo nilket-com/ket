@@ -608,7 +608,7 @@ impl WendelonDataServer {
 		};
 		let counts = selection.counts();
 		// Locked persistence runs in its own task and finishes if this ends.
-		let Some(acks) = bounded(
+		let Some((acks, _)) = bounded(
 			deadline,
 			self.write_children(&claim, rsv, &descriptor, &batch, &indices),
 		)

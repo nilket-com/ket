@@ -9505,6 +9505,9 @@ fn adr077_data_server_source_concatenates_submodules() {
 			// so one module.
 			"write_deadline.rs",
 			"write_replication.rs",
+			// DC-287: an opt-in, bounded record of each coordinated write attempt answered
+			// WRITE_STALLED (observation only), kept out of the bounded root.
+			"write_stall_trace.rs",
 		],
 		"ADR 077 production source manifest changed; update this guard deliberately \
 		 (tests.rs is excluded — it is not production source)"

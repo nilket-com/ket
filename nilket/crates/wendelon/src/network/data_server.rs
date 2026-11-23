@@ -219,6 +219,7 @@ pub(crate) mod child_writes;
 pub(crate) mod coordinator;
 mod observation;
 mod write_replication;
+pub(crate) mod write_stall_trace;
 #[cfg(test)]
 use write_replication::append_bifurcated_table_children_durable;
 use write_replication::append_table_children_tracking_effects;

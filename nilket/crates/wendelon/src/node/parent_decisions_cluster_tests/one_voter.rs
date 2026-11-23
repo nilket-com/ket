@@ -8,7 +8,7 @@ use super::*;
 
 const ONE: u32 = 51;
 
-fn one_voter() -> (crate::test_support::TestDir, NodeBootstrapConfig) {
+pub(super) fn one_voter() -> (crate::test_support::TestDir, NodeBootstrapConfig) {
 	let dir = crate::test_support::TestDir::new("parent-decisions-one-voter");
 	let mut cfg = NodeBootstrapConfig::dev(ONE, dir.to_path_buf(), address(ONE));
 	cfg.rf = 1;
@@ -26,7 +26,7 @@ fn one_voter() -> (crate::test_support::TestDir, NodeBootstrapConfig) {
 	(dir, cfg)
 }
 
-async fn open(cfg: &NodeBootstrapConfig) -> WendelonNode {
+pub(super) async fn open(cfg: &NodeBootstrapConfig) -> WendelonNode {
 	let network = Arc::new(SimulatedTransportNetwork::default());
 	let provider: Arc<dyn crate::network::transport::TransportProvider> =
 		Arc::new(SimulatedTransportProvider::new(
@@ -47,7 +47,7 @@ async fn open(cfg: &NodeBootstrapConfig) -> WendelonNode {
 /// replica segment of its one-member ring lies in a lineage it holds at that
 /// incarnation, the table (if named) is applied, and it holds a lease over
 /// each of its lineages at the current epoch.
-async fn until_settled(node: &WendelonNode, table: Option<TableObjectId>) {
+pub(super) async fn until_settled(node: &WendelonNode, table: Option<TableObjectId>) {
 	let deadline = tokio::time::Instant::now() + BOUND;
 	loop {
 		let ready = node.raft.current_leader().await.is_some()

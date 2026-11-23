@@ -6827,6 +6827,8 @@ mod query_cancel;
 mod resolve;
 #[path = "parent_decisions_cluster_tests/retention_window.rs"]
 mod retention_window;
+#[path = "parent_decisions_cluster_tests/write_stall_trace_tests.rs"]
+mod write_stall_trace;
 
 #[path = "parent_decisions_cluster_tests/offload.rs"]
 mod offload;

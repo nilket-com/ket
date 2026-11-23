@@ -538,6 +538,58 @@ fn render_wal_append_slowest(
 	}
 }
 
+/// DC-287: each tracing node's stalled-write record: its totals (`recorded` ever, `retained`,
+/// `overwritten`, `capacity`), then each kept attempt by its ring slot. Nothing when no node traces.
+fn render_write_stall_traces(
+	out: &mut String,
+	traces: &[(
+		u32,
+		crate::network::data_server::write_stall_trace::WriteStallSnapshot,
+	)],
+) {
+	use crate::network::data_server::write_stall_trace::CAPACITY;
+	if traces.is_empty() {
+		return;
+	}
+	let family = "wendelon_data_ring_write_stall_trace";
+	render_gauge_family_header(
+		out,
+		family,
+		"A node's opt-in record of ParentDecisions table write attempts whose answer was WRITE_STALLED (ordinary table writes only; a stall discarded behind a deadline answer is not recorded): recorded ever, retained, overwritten (recorded but no longer retained), and the ring capacity.",
+	);
+	for (node, snapshot) in traces {
+		let node = node.to_string();
+		for (field, value) in [
+			("recorded", snapshot.recorded),
+			("retained", snapshot.records.len() as u64),
+			("overwritten", snapshot.overwritten()),
+			("capacity", CAPACITY as u64),
+		] {
+			render_gauge_with_labels(out, family, &[("node", &node), ("field", field)], value);
+		}
+	}
+	let family = "wendelon_data_ring_write_stalled_attempt";
+	render_gauge_family_header(
+		out,
+		family,
+		"One retained WRITE_STALLED attempt, by ring slot: its sequence, the write identity (client uuid halves, sequence), the wire attempts remaining, the return site, the typed answer it acted on, the local holder answer and acknowledgements (Finalize), the monotonic microseconds since the coordinator's entry, and the wall clock.",
+	);
+	for (node, snapshot) in traces {
+		let node = node.to_string();
+		for record in &snapshot.records {
+			let slot = ((record.seq - 1) % CAPACITY as u64).to_string();
+			for (field, value) in record.fields() {
+				render_gauge_with_labels(
+					out,
+					family,
+					&[("node", &node), ("slot", &slot), ("field", field)],
+					value,
+				);
+			}
+		}
+	}
+}
+
 fn render_lifecycle_drain_timeouts(
 	out: &mut String,
 	captures: &std::collections::BTreeMap<&'static str, Vec<(&'static str, u64)>>,
@@ -3233,6 +3285,10 @@ pub struct MetricsRegistry {
 	wal_append_slowest:
 		std::sync::Mutex<Option<crate::consensus::wal_append_trace::WalAppendRecord>>,
 	wal_append_slowest_ns: std::sync::atomic::AtomicU64,
+	/// DC-287: the nodes whose stalled-write traces are published (see `publish_write_stall_trace`).
+	write_stall_traces: std::sync::Mutex<
+		Vec<std::sync::Weak<crate::network::data_server::write_stall_trace::WriteStallTrace>>,
+	>,
 	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
 	pub storage_l2_superseded_objects_retained_total: Counter,
 	pub storage_supersession_metadata_degraded_total: Counter,
@@ -3596,6 +3652,7 @@ impl Default for MetricsRegistry {
 			lifecycle_drain_timeouts: Default::default(),
 			wal_append_slowest: Default::default(),
 			wal_append_slowest_ns: Default::default(),
+			write_stall_traces: Default::default(),
 			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
 			storage_l2_superseded_objects_retained_total: Counter::default(),
 			storage_supersession_metadata_degraded_total: Counter::default(),
@@ -3840,6 +3897,39 @@ impl MetricsRegistry {
 	pub fn observe_wal_append_latency(&self, duration: Duration) {
 		self.storage_wal_append_latency_seconds
 			.observe_duration(duration);
+	}
+
+	/// DC-287 (Codex 01a208b1): publishes a node's stalled-write trace in every later scrape, for
+	/// as long as the trace lives.
+	pub(crate) fn publish_write_stall_trace(
+		&self,
+		trace: &std::sync::Arc<crate::network::data_server::write_stall_trace::WriteStallTrace>,
+	) {
+		let mut traces = self
+			.write_stall_traces
+			.lock()
+			.unwrap_or_else(|e| e.into_inner());
+		traces.retain(|trace| trace.strong_count() > 0);
+		traces.push(std::sync::Arc::downgrade(trace));
+	}
+
+	/// Each live published trace's node and snapshot, by node.
+	fn write_stall_snapshots(
+		&self,
+	) -> Vec<(
+		u32,
+		crate::network::data_server::write_stall_trace::WriteStallSnapshot,
+	)> {
+		let mut snapshots: Vec<_> = self
+			.write_stall_traces
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.iter()
+			.filter_map(std::sync::Weak::upgrade)
+			.map(|trace| (trace.node(), trace.snapshot()))
+			.collect();
+		snapshots.sort_by_key(|(node, _)| *node);
+		snapshots
 	}
 
 	/// DC-287 (Codex 01a207a1): keeps one coherent record, the slowest completed append batch so
@@ -6508,6 +6598,7 @@ impl MetricsRegistry {
 		{
 			render_wal_append_slowest(&mut out, &record);
 		}
+		render_write_stall_traces(&mut out, &self.write_stall_snapshots());
 		self.decision_generation_targets_proposed.render(
 			&mut out,
 			"wendelon_decision_generation_targets_proposed_total",
@@ -8401,4 +8492,55 @@ fn the_slowest_wal_append_record_is_kept_until_a_slower_one() {
 			.render_prometheus()
 			.contains("wendelon_storage_wal_append_slowest_batch{field=\"seq\"} 4\n")
 	);
+}
+
+/// DC-287 (Codex 01a208b1): a published stalled-write trace renders its totals and each kept
+/// record by ring slot; an overwritten record is counted; nothing renders once no trace lives.
+#[cfg(test)]
+#[test]
+fn a_published_write_stall_trace_renders_totals_and_records_until_dropped() {
+	use crate::network::data_server::write_stall_trace::{
+		AttemptTrace, CAPACITY, StallAnswer, StallSite, WriteStallTrace,
+	};
+	let registry = isolated_for_test();
+	assert!(!registry.render_prometheus().contains("write_stall"));
+	let trace = WriteStallTrace::new(5);
+	registry.publish_write_stall_trace(&trace);
+	let text = registry.render_prometheus();
+	assert!(
+		text.contains("wendelon_data_ring_write_stall_trace{node=\"5\",field=\"recorded\"} 0\n")
+	);
+	assert!(!text.contains("wendelon_data_ring_write_stalled_attempt{"));
+	let mut meta: crate::schema::TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	for n in 0..=CAPACITY as u64 {
+		meta.parent_write_id.sequence_no = n;
+		let attempt = AttemptTrace::enter(Some(&trace), &meta);
+		let settled = attempt.stall(StallSite::Lookup, || StallAnswer::STATE);
+		attempt.publish_if_answered(Some(settled));
+	}
+	let text = registry.render_prometheus();
+	for (field, value) in [
+		("recorded", CAPACITY as u64 + 1),
+		("retained", CAPACITY as u64),
+		("overwritten", 1),
+		("capacity", CAPACITY as u64),
+	] {
+		let series = format!(
+			"wendelon_data_ring_write_stall_trace{{node=\"5\",field=\"{field}\"}} {value}\n"
+		);
+		assert!(text.contains(&series), "missing {series}");
+	}
+	// The newest record took slot 0 over the first.
+	assert!(text.contains(&format!(
+		"wendelon_data_ring_write_stalled_attempt{{node=\"5\",slot=\"0\",field=\"seq\"}} {}\n",
+		CAPACITY + 1
+	)));
+	assert!(text.contains(&format!(
+		"wendelon_data_ring_write_stalled_attempt{{node=\"5\",slot=\"0\",field=\"sequence_no_lo\"}} {CAPACITY}\n"
+	)));
+	assert!(text.contains(
+		"wendelon_data_ring_write_stalled_attempt{node=\"5\",slot=\"1\",field=\"seq\"} 2\n"
+	));
+	drop(trace);
+	assert!(!registry.render_prometheus().contains("write_stall"));
 }

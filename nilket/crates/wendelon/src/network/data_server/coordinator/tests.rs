@@ -211,7 +211,7 @@ fn a_non_holder_of_the_first_row_redirects_to_that_holder() {
 		&positions,
 		HLC,
 	);
-	assert!(matches!(result, Err(Settled::Redirect(node)) if node == holder));
+	assert!(matches!(result, Err(ClaimStop::Settled(Settled::Redirect(node))) if node == holder));
 }
 
 #[test]

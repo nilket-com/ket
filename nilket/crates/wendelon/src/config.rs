@@ -1446,6 +1446,7 @@ impl RawConfig {
 			),
 			data_ring_lease_ttl: Duration::from_millis(data_ring_lease_ttl_millis),
 			query_stall_bound,
+			write_stall_trace: false,
 			advertise_address,
 			lease_signing_secret,
 			allow_dev_keys: self.identity.allow_dev_keys,

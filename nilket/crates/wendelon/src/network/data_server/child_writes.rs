@@ -407,6 +407,32 @@ pub(crate) enum ChildRefusal {
 	Storage(String),
 }
 
+impl ChildRefusal {
+	/// DC-287: this refusal's variant, as a stable code (1 + its position above).
+	pub(crate) fn code(&self) -> u8 {
+		match self {
+			Self::ModeToday => 1,
+			Self::NotCaughtUp => 2,
+			Self::UnknownReservation => 3,
+			Self::ClaimMismatch => 4,
+			Self::WrongSender => 5,
+			Self::NotInPlan => 6,
+			Self::LineageClosed => 7,
+			Self::LeaseMissing => 8,
+			Self::SchemaUnknown => 9,
+			Self::Rows(_) => 10,
+			Self::OutOfRange => 11,
+			Self::ContentMismatch => 12,
+			Self::ParentRefused => 13,
+			Self::ParentAccepted => 14,
+			Self::NotAccepted => 15,
+			Self::Intent(_) => 16,
+			Self::Unverified(_) => 17,
+			Self::Storage(_) => 18,
+		}
+	}
+}
+
 /// A child write checked against replicated state, ready for the storage step.
 #[derive(Clone, Debug)]
 pub(crate) struct ChildPlan {
@@ -1469,6 +1495,9 @@ pub(crate) struct DecisionPeer {
 	/// Wendelon ADR 0121 D1: this store's configured retention window (ms; 0 is
 	/// none). It serves and signs only while it equals the replicated binding.
 	pub(crate) retention_window_ms: u64,
+	/// DC-287: this node's opt-in record of stalled coordinated writes (none by default; see
+	/// [`super::WendelonDataServer::with_write_stall_trace`]).
+	pub(crate) write_stall_trace: Option<Arc<super::write_stall_trace::WriteStallTrace>>,
 	/// Test-only: how many more read-authority checks pass before every
 	/// later one fails.
 	#[cfg(test)]
@@ -1477,6 +1506,10 @@ pub(crate) struct DecisionPeer {
 	/// first row of a served fetch.
 	#[cfg(test)]
 	pub(crate) refuse_replicas: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-287): refuse every holder child write here, so a coordinator sees its own
+	/// holder refuse.
+	#[cfg(test)]
+	pub(crate) refuse_holders: Arc<std::sync::atomic::AtomicBool>,
 	#[cfg(test)]
 	pub(crate) refuse_fetches: Arc<std::sync::atomic::AtomicBool>,
 	#[cfg(test)]
@@ -1710,10 +1743,13 @@ impl Default for DecisionPeer {
 			base_validated: Default::default(),
 			activations: tokio::sync::watch::channel(0).0,
 			retention_window_ms: 0,
+			write_stall_trace: None,
 			#[cfg(test)]
 			read_checks_left: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
 			#[cfg(test)]
 			refuse_replicas: Default::default(),
+			#[cfg(test)]
+			refuse_holders: Default::default(),
 			#[cfg(test)]
 			refuse_fetches: Default::default(),
 			#[cfg(test)]
@@ -2009,7 +2045,10 @@ impl WendelonDataServer {
 		batch: RecordBatch,
 		rows: Arc<Vec<u8>>,
 		trailing: Arc<Vec<u8>>,
-	) -> Vec<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>> {
+	) -> Result<
+		Vec<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>>,
+		ChildRefusal,
+	> {
 		let given = GivenKeys::of_section(&trailing);
 		match self
 			.child_write_keyed(sender, ChildRole::Holder, meta.clone(), batch, given)
@@ -2018,12 +2057,12 @@ impl WendelonDataServer {
 			Ok(own) => {
 				let mut acks = vec![own];
 				acks.extend(self.fan_out_child(&meta, rows, trailing).await);
-				acks
+				Ok(acks)
 			}
-			Err(_refusal) => {
+			Err(refusal) => {
 				#[cfg(test)]
-				eprintln!("COORD holder write: {_refusal:?}");
-				Vec::new()
+				eprintln!("COORD holder write: {refusal:?}");
+				Err(refusal)
 			}
 		}
 	}
@@ -2248,6 +2287,15 @@ impl WendelonDataServer {
 		{
 			return Err(ChildRefusal::Storage("test: replicates refused".into()));
 		}
+		#[cfg(test)]
+		if role == ChildRole::Holder
+			&& self
+				.decisions
+				.refuse_holders
+				.load(std::sync::atomic::Ordering::Acquire)
+		{
+			return Err(ChildRefusal::Storage("test: holder writes refused".into()));
+		}
 		let signer = self
 			.decisions
 			.signer
@@ -2379,11 +2427,11 @@ impl WendelonDataServer {
 			Err(reason) => ChildWriteResponse::Refused(reason),
 			Ok((meta, batch)) if role == ChildRole::Holder => {
 				let rows = Arc::new(rows.unwrap_or_default().to_vec());
-				let acks = self.holder_write(sender, meta, batch, rows, trailing).await;
-				if acks.is_empty() {
-					ChildWriteResponse::Refused("the holder could not write its child".into())
-				} else {
-					ChildWriteResponse::Acked(acks)
+				match self.holder_write(sender, meta, batch, rows, trailing).await {
+					Ok(acks) => ChildWriteResponse::Acked(acks),
+					Err(_) => {
+						ChildWriteResponse::Refused("the holder could not write its child".into())
+					}
 				}
 			}
 			Ok((meta, batch)) => match self
