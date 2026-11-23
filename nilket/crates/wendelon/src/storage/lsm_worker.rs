@@ -152,10 +152,20 @@ where
 	D: LsmCompactionDriver + 'static,
 {
 	pub fn new(driver: Arc<D>, worker: LsmCompactionWorker) -> Self {
+		Self::with_control(driver, worker, LsmCompactionServiceControl::default())
+	}
+
+	/// A service driven by `control`, created by the caller so that the driver can hold the very
+	/// same control (its sticky stop) before the service exists.
+	pub fn with_control(
+		driver: Arc<D>,
+		worker: LsmCompactionWorker,
+		control: LsmCompactionServiceControl,
+	) -> Self {
 		Self {
 			driver,
 			worker,
-			control: LsmCompactionServiceControl::default(),
+			control,
 		}
 	}
 

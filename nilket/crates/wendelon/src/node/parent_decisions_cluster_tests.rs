@@ -7137,3 +7137,429 @@ async fn a_ready_stop_wins_over_a_ready_wake_at_the_maintenance_owner() {
 		time.abort.latched()
 	);
 }
+
+/// The ADR 0706 tier fixture (the setup of
+/// `an_orderly_close_waits_for_a_held_certified_tier_step_and_records_clean`), up to the point the
+/// leader's next certified tier step would run: S1 (an obsolete version of row 1 and row 4) is the
+/// slab it visits first; the leader's cleanup is still paused. Shared by the certified handoff
+/// controls below.
+struct HandoffFixture {
+	cluster: Cluster,
+	leader: u32,
+	descriptor: TableSchemaDescriptor,
+	expected: Expected,
+	s1: crate::schema::SlabId,
+	k4: crate::schema::Identity,
+	v4: Vec<HybridTimestamp>,
+	pause: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn handoff_fixture(tag: &str) -> HandoffFixture {
+	use std::sync::atomic::Ordering::Release;
+	let tag = tag.to_owned();
+	let (cluster, leader, descriptor) = ready_with(Cluster::start_with(move |id, cfg| {
+		let root = crate::test_support::TestDir::new(&format!("{tag}-l2-{id}"));
+		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs {
+			root: root.to_path_buf(),
+		});
+		cfg.tiering.scan_interval = std::time::Duration::from_millis(200);
+		Some(root)
+	}))
+	.await;
+	let server = cluster.node(leader).data_server.clone();
+	let pause = server.decision_peer_for_test().pause_cleanup.clone();
+	pause.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let write = async |rows: &[(i64, &str)], what: &str| {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, rows.len(), uuid_v7()),
+				named_rows(&descriptor, rows),
+			)
+			.await,
+			what,
+		);
+	};
+	write(&[(3, "x")], "S0").await;
+	let s0 = slab.force_seal_active_for_test().await;
+	write(&[(1, "a")], "S1's obsolete row").await;
+	write(&[(4, "y")], "S1's survivor").await;
+	let s1 = slab.force_seal_active_for_test().await;
+	write(&[(1, "b")], "S2 (the winner)").await;
+	let s2 = slab.force_seal_active_for_test().await;
+	let expected = Expected::from([
+		(1, "b".to_string()),
+		(3, "x".to_string()),
+		(4, "y".to_string()),
+	]);
+	let row_of = |id: i64| {
+		server
+			.row_identity_and_locality_for_test(
+				TenantId::ZERO,
+				&descriptor,
+				&named_rows(&descriptor, &[(id, "x")]),
+			)
+			.0
+	};
+	let (k1, k4) = (row_of(1), row_of(4));
+	let (v1, v4) = (
+		owned_versions(&cluster, leader, k1).await,
+		owned_versions(&cluster, leader, k4).await,
+	);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	for id in [s0, s1, s2] {
+		while slab.tier_pointer(id).await.is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"slab {id:?} never tiered"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+	}
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	expect_everywhere(&cluster, &descriptor, &expected, "before the handoff").await;
+	let debt: Vec<_> = slab
+		.persistent_index()
+		.unwrap()
+		.debt_page(None, 100)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|(key, _)| (crate::schema::Identity::new(key.key_identity), key.hlc))
+		.collect();
+	assert_eq!(debt, vec![(k1, v1[0])], "premise: the leader's debt");
+	HandoffFixture {
+		cluster,
+		leader,
+		descriptor,
+		expected,
+		s1,
+		k4,
+		v4,
+		pause,
+	}
+}
+
+/// `id`'s node, taken out of the cluster for its own close (as `close_while_held` does).
+fn take_node(cluster: &mut Cluster, id: u32) -> WendelonNode {
+	let at = cluster
+		.nodes
+		.iter()
+		.position(|node| node.local_node.id == id)
+		.unwrap();
+	let node = cluster.nodes.remove(at);
+	cluster
+		.network
+		.unpublish(crate::schema::NodeId { id, _reserved: 0 });
+	node
+}
+
+/// DC-292 (Codex 01a2066f): with the LSM service's stop observed after the certified tier step
+/// returns, the admitted tick ends there: no certified LSM successor, no new lifecycle permit for
+/// one. The leader's tier step is held after its permit and the successor's post-permit hook is
+/// queued; the close begins and the stop is seen while the tier step is held; released, the tier
+/// step returns (`fail_tier`: through the upload cut, an `Err`) and the close then completes
+/// (the terminal evidence that the successor never started: started, it would hold the close at
+/// its hook). Same admitted tick; the tier step's own return; the clean record before the
+/// reopen; a clean boot with exact validated rows; S1's rewrite published unless the tier step
+/// failed.
+async fn an_observed_stop_skips_the_certified_lsm_successor(fail_tier: bool) {
+	use crate::network::data_server::child_writes::{HeldStepOutcome, PauseStage};
+	use crate::storage::manager::certified_tier::{CertifiedTierCut, CertifiedTierStep};
+	use std::sync::atomic::Ordering::Release;
+	let mut fx = handoff_fixture(if fail_tier {
+		"stop-skips-after-err"
+	} else {
+		"stop-skips-after-ok"
+	})
+	.await;
+	let leader = fx.leader;
+	let server = fx.cluster.node(leader).data_server.clone();
+	let slab = fx.cluster.node(leader).slab.clone();
+	let before = slab.tier_pointer(fx.s1).await.map(|pointer| pointer.l2_uri);
+	if fail_tier {
+		slab.cut_next_certified_tier_step(CertifiedTierCut::AfterUpload);
+	}
+	let outcomes = server.decision_peer_for_test().held_outcomes.clone();
+	let (tier_reached, tier_release) =
+		server.pause_coordinator_for_test(PauseStage::CertifiedTierStep);
+	let (lsm_reached, lsm_release) =
+		server.pause_coordinator_for_test(PauseStage::CertifiedLsmStep);
+	fx.pause.store(false, Release);
+	tokio::time::timeout(BOUND, tier_reached.notified())
+		.await
+		.expect("the leader's tier step holds after its permit");
+	let owner = slab.directory_owner().expect("an owned store");
+	drop(slab);
+	drop(server);
+	let node = take_node(&mut fx.cluster, leader);
+	let control = node.handles.lsm_compaction_control.clone();
+	let admitted = control.admitted_ticks();
+	let clean_record = fx.cluster.configs[&leader].data_dir.join("CLEAN_SHUTDOWN");
+	let mut closing = tokio::spawn(node.shutdown());
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.is_stopped() {
+		assert!(tokio::time::Instant::now() < deadline, "never stopped");
+		tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+	}
+	assert!(
+		outcomes.lock().unwrap().is_empty(),
+		"the tier step is still held"
+	);
+	assert!(
+		!closing.is_finished(),
+		"the close waits for the held tier step"
+	);
+	tier_release.notify_one();
+	// Terminal evidence: the close completes, or the forbidden successor reaches its hook.
+	let ended = tokio::time::timeout(BOUND, async {
+		tokio::select! {
+			biased;
+			closed = &mut closing => Ok(closed),
+			_ = lsm_reached.notified() => Err(()),
+		}
+	})
+	.await
+	.expect("the close, or the successor, within the bound");
+	let closed = match ended {
+		Ok(closed) => closed,
+		Err(()) => {
+			lsm_release.notify_one();
+			let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut closing).await;
+			panic!("the stopped tick started its certified LSM successor");
+		}
+	};
+	closed
+		.unwrap()
+		.expect("an orderly close at the ordinary bound");
+	assert_eq!(control.admitted_ticks(), admitted, "the same admitted tick");
+	let returned = std::mem::take(&mut *outcomes.lock().unwrap());
+	match (fail_tier, returned.as_slice()) {
+		(false, [HeldStepOutcome::Tier(Ok(CertifiedTierStep::Rewritten { slab, .. }))])
+			if *slab == fx.s1 => {}
+		(true, [HeldStepOutcome::Tier(Err(_))]) => {}
+		(_, other) => {
+			panic!("exactly the tier step's own return (fail_tier {fail_tier}): {other:?}")
+		}
+	}
+	assert!(clean_record.exists(), "the clean record, before the reopen");
+	assert!(!owner.clean_record_revoked(), "every permit completed");
+	drop(owner);
+	fx.cluster.reopen(leader).await;
+	until_settled(&fx.cluster, &fx.descriptor).await;
+	assert!(
+		!fx.cluster.node(leader).recovered_after_unclean_shutdown(),
+		"a clean boot"
+	);
+	assert_eq!(
+		fx.cluster.read_once_validated(leader, &fx.descriptor).await,
+		fx.expected,
+		"exact validated rows"
+	);
+	let restarted = fx.cluster.node(leader).slab.clone();
+	restarted.wait_tier_authority_ready().await.unwrap();
+	let after = restarted
+		.tier_pointer(fx.s1)
+		.await
+		.map(|pointer| pointer.l2_uri);
+	if fail_tier {
+		assert_eq!(after, before, "the failed tier step published nothing");
+	} else {
+		assert_ne!(after, before, "the tier step published S1's rewrite");
+		let s1_rows: Vec<_> = restarted
+			.persistent_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.filter(|row| row.location.slab_id == fx.s1)
+			.map(|row| (row.key_identity, row.location.hlc))
+			.collect();
+		assert_eq!(s1_rows, vec![(fx.k4, fx.v4[0])], "S1's exact survivor set");
+	}
+	drop(restarted);
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_observed_stop_after_a_certified_tier_step_skips_its_lsm_successor() {
+	an_observed_stop_skips_the_certified_lsm_successor(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_observed_stop_after_a_failed_certified_tier_step_skips_its_lsm_successor() {
+	an_observed_stop_skips_the_certified_lsm_successor(true).await;
+}
+
+/// Without a stop, the certified tier step hands off to its LSM successor as before, after an
+/// `Ok` and after an `Err` (the upload cut): the successor reaches its post-permit hook.
+async fn without_a_stop_the_certified_tier_step_hands_off(fail_tier: bool) {
+	use crate::network::data_server::child_writes::{HeldStepOutcome, PauseStage};
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	use std::sync::atomic::Ordering::Release;
+	let fx = handoff_fixture(if fail_tier {
+		"handoff-after-err"
+	} else {
+		"handoff-after-ok"
+	})
+	.await;
+	let server = fx.cluster.node(fx.leader).data_server.clone();
+	let slab = fx.cluster.node(fx.leader).slab.clone();
+	let before = slab.tier_pointer(fx.s1).await.map(|pointer| pointer.l2_uri);
+	if fail_tier {
+		slab.cut_next_certified_tier_step(CertifiedTierCut::AfterUpload);
+	}
+	let outcomes = server.decision_peer_for_test().held_outcomes.clone();
+	let (lsm_reached, lsm_release) =
+		server.pause_coordinator_for_test(PauseStage::CertifiedLsmStep);
+	fx.pause.store(false, Release);
+	tokio::time::timeout(BOUND, lsm_reached.notified())
+		.await
+		.expect("the certified LSM successor takes its permit");
+	assert_eq!(
+		slab.certified_tier_cut_pending_for_test(),
+		None,
+		"the tier step ran first (its cut, if any, consumed)"
+	);
+	let after = slab.tier_pointer(fx.s1).await.map(|pointer| pointer.l2_uri);
+	if fail_tier {
+		assert_eq!(after, before, "the failed tier step published nothing");
+	} else {
+		assert_ne!(after, before, "the tier step published S1's rewrite");
+	}
+	lsm_release.notify_one();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while outcomes.lock().unwrap().is_empty() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the successor never returned"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+	}
+	assert!(
+		matches!(
+			outcomes.lock().unwrap().as_slice(),
+			[HeldStepOutcome::Lsm(Ok(_))]
+		),
+		"the successor's own return: {:?}",
+		outcomes.lock().unwrap()
+	);
+	drop(slab);
+	drop(server);
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn without_a_stop_a_certified_tier_step_hands_off_to_its_lsm_successor() {
+	without_a_stop_the_certified_tier_step_hands_off(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn without_a_stop_a_failed_certified_tier_step_hands_off_to_its_lsm_successor() {
+	without_a_stop_the_certified_tier_step_hands_off(true).await;
+}
+
+/// The limitation: the handoff rule cannot rescue a stuck tier step. A tier step held at
+/// `AfterClaim` (inside `reading`) and never released, with the test-only 2 s drain bound: the
+/// close is aborted at the bound and joins the service (the held future is dropped), the
+/// successor never takes a permit, the uncompleted permit revokes the clean record, and the next
+/// boot is unclean, validates and reads exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_certified_tier_step_held_past_the_drain_bound_is_aborted_and_records_unclean() {
+	use crate::network::data_server::child_writes::PauseStage;
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	use std::sync::atomic::Ordering::Release;
+	let mut fx = handoff_fixture("held-tier-past-bound").await;
+	let leader = fx.leader;
+	let server = fx.cluster.node(leader).data_server.clone();
+	let slab = fx.cluster.node(leader).slab.clone();
+	let before = slab.tier_pointer(fx.s1).await.map(|pointer| pointer.l2_uri);
+	let (tier_reached, tier_release) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::AfterClaim);
+	let (lsm_reached, _never_released) =
+		server.pause_coordinator_for_test(PauseStage::CertifiedLsmStep);
+	fx.pause.store(false, Release);
+	tokio::time::timeout(BOUND, tier_reached.acquire())
+		.await
+		.expect("the tier step reaches AfterClaim")
+		.unwrap()
+		.forget();
+	let owner = slab.directory_owner().expect("an owned store");
+	assert!(!owner.clean_record_revoked(), "premise: not revoked");
+	drop(slab);
+	drop(server);
+	let mut node = take_node(&mut fx.cluster, leader);
+	let bound = std::time::Duration::from_secs(2);
+	node.handles.set_lifecycle_drain_bound_for_test(bound);
+	let holders = Arc::strong_count(&tier_release);
+	let error = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+		.await
+		.expect("a bounded close")
+		.expect_err("an interrupted close is not orderly");
+	assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+	assert!(error.to_string().contains("LSM compaction"), "{error}");
+	assert_eq!(
+		(holders, Arc::strong_count(&tier_release)),
+		(2, 1),
+		"the aborted, joined service dropped the held step"
+	);
+	assert!(
+		tokio::time::timeout(
+			std::time::Duration::from_millis(200),
+			lsm_reached.notified()
+		)
+		.await
+		.is_err(),
+		"the successor never took a permit"
+	);
+	assert!(
+		owner.clean_record_revoked(),
+		"the dropped permit revoked the record"
+	);
+	assert!(
+		!fx.cluster.configs[&leader]
+			.data_dir
+			.join("CLEAN_SHUTDOWN")
+			.exists(),
+		"no clean record"
+	);
+	drop(owner);
+	fx.cluster.reopen(leader).await;
+	until_settled(&fx.cluster, &fx.descriptor).await;
+	assert!(
+		fx.cluster.node(leader).recovered_after_unclean_shutdown(),
+		"an unclean boot"
+	);
+	assert_eq!(
+		fx.cluster.read_once_validated(leader, &fx.descriptor).await,
+		fx.expected,
+		"validated, then exact"
+	);
+	let restarted = fx.cluster.node(leader).slab.clone();
+	restarted.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(
+		restarted
+			.tier_pointer(fx.s1)
+			.await
+			.map(|pointer| pointer.l2_uri),
+		before,
+		"the aborted step published nothing"
+	);
+	drop(restarted);
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

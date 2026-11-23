@@ -3186,12 +3186,16 @@ impl WendelonNode {
 				.with_owner_authority(data_server.owner_authority()),
 		);
 		let lsm_worker = LsmCompactionWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
+		// ADR 0706: one control, shared by the service, the node's close and the driver, whose
+		// certified handoff observes its sticky stop.
+		let lsm_compaction_control = LsmCompactionServiceControl::default();
 		let lsm_driver = Arc::new(
 			LeaderGatedLsmCompactionDriver::new(
 				slab.clone(),
 				leader.clone(),
 				raft_committer.clone(),
 				state_machine.clone(),
+				lsm_compaction_control.clone(),
 			)
 			.with_certified(
 				(cfg.decision_mode
@@ -3199,8 +3203,11 @@ impl WendelonNode {
 					.then(|| data_server.clone()),
 			),
 		);
-		let lsm_service = LsmCompactionService::new(lsm_driver, lsm_worker);
-		let lsm_compaction_control = lsm_service.control();
+		let lsm_service = LsmCompactionService::with_control(
+			lsm_driver,
+			lsm_worker,
+			lsm_compaction_control.clone(),
+		);
 		if cfg.lsm_compaction_paused {
 			lsm_compaction_control.pause();
 		}
@@ -4811,6 +4818,9 @@ struct LeaderGatedLsmCompactionDriver {
 	state_machine: WendelonStateMachine,
 	/// ADR 0703: the data server that admits certified jobs, in mode.
 	certified: Option<Arc<WendelonDataServer>>,
+	/// The very control of the service that runs this driver (its sticky stop), observed once
+	/// between a certified tier step and its LSM successor.
+	control: LsmCompactionServiceControl,
 }
 
 impl LeaderGatedLsmCompactionDriver {
@@ -4819,6 +4829,7 @@ impl LeaderGatedLsmCompactionDriver {
 		leader: Arc<dyn LeaderStatus>,
 		committer: Arc<dyn TierCommitter>,
 		state_machine: WendelonStateMachine,
+		control: LsmCompactionServiceControl,
 	) -> Self {
 		Self {
 			slab,
@@ -4826,6 +4837,7 @@ impl LeaderGatedLsmCompactionDriver {
 			committer,
 			state_machine,
 			certified: None,
+			control,
 		}
 	}
 
@@ -4856,6 +4868,14 @@ impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver {
 				.await
 			{
 				tracing::warn!(%error, "certified tier step refused or failed; retried next tick");
+			}
+			// DC-292 (Codex 01a2066f): a stop observed after the tier step returns ends the
+			// admitted tick there: it starts no LSM successor and takes no new lifecycle
+			// permit for one. A stop arriving after this check can still race the successor's
+			// permit; that step is drained under ADR 0706's shared bound as before.
+			if self.control.is_stopped() {
+				tracing::debug!("LSM service stopped; the certified LSM successor is not started");
+				return Ok(None);
 			}
 			return data_server
 				.certified_lsm_step(worker, now, self.committer.as_ref())
