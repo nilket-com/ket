@@ -382,6 +382,8 @@ pub(super) fn decide_members(
 	facts: &CoherentFacts,
 	evidence: &[ContentEvidence],
 ) -> BTreeMap<CertifiedMemberKey, TableObjectId> {
+	// Codex 01a20616 (F2): evidence membership per candidate, decided once.
+	let matched = evidence_kinds(facts, evidence);
 	// Per member: its table while every copy passes, None once one fails.
 	let mut verdicts: BTreeMap<CertifiedMemberKey, Option<TableObjectId>> = BTreeMap::new();
 	let mut kinds: BTreeMap<VersionRef, (bool, bool)> = BTreeMap::new();
@@ -399,7 +401,7 @@ pub(super) fn decide_members(
 			}
 			let at = facts.candidates().binary_search(&reference).ok()?;
 			let fact = facts.get(at);
-			let (key, debt) = fact.debt.as_ref()?;
+			let (key, _) = fact.debt.as_ref()?;
 			if fact.ambiguous
 				|| fact.owned
 				|| fact.base.as_ref().is_some_and(|base| base.hlc == key.hlc)
@@ -420,10 +422,13 @@ pub(super) fn decide_members(
 			{
 				return None;
 			}
-			evidence
-				.iter()
-				.any(|evidence| evidence.matches(*key, debt, entry.location.is_tombstone))
-				.then_some(key.table)
+			let (row, tombstone) = matched[at];
+			if entry.location.is_tombstone {
+				tombstone
+			} else {
+				row
+			}
+			.then_some(key.table)
 		};
 		let verdict = passes();
 		verdicts
@@ -450,6 +455,84 @@ pub(super) fn decide_members(
 			table.filter(|_| !conflicting).map(|table| (member, table))
 		})
 		.collect()
+}
+
+/// Codex 01a20616 (F2): per facts candidate, whether some content evidence matches that
+/// candidate's own debt record for a row copy (`.0`) and for a tombstone copy (`.1`): exactly
+/// `evidence.iter().any(|found| found.matches(key, debt, kind))` for the candidate's `(key, debt)`,
+/// decided once per candidate instead of once per entry. The evidence is ordered by its key
+/// through a vector of indices (no evidence or debt record is copied), and each candidate checks
+/// only the evidence with its key, by the same full key, debt and kind equality as `matches`, so
+/// unordered, missing and duplicate evidence, and evidence for the same key with another debt or
+/// kind, decide exactly as before.
+pub(super) fn evidence_kinds(
+	facts: &CoherentFacts,
+	evidence: &[ContentEvidence],
+) -> Vec<(bool, bool)> {
+	evidence_kinds_counted(facts, evidence, &mut LookupSteps::default())
+}
+
+/// Lookup steps of [`evidence_kinds`]: key comparisons while ordering and searching, and
+/// evidence entries examined. Counted only in test builds (Codex 01a20632): in production the
+/// counter has no field and counting is a no-op.
+#[derive(Default)]
+struct LookupSteps(#[cfg(test)] u64);
+
+impl LookupSteps {
+	#[inline(always)]
+	fn step(&mut self) {
+		#[cfg(test)]
+		{
+			self.0 += 1;
+		}
+	}
+}
+
+/// The one implementation of [`evidence_kinds`], counting its steps into `steps`.
+fn evidence_kinds_counted(
+	facts: &CoherentFacts,
+	evidence: &[ContentEvidence],
+	steps: &mut LookupSteps,
+) -> Vec<(bool, bool)> {
+	let mut order: Vec<usize> = (0..evidence.len()).collect();
+	order.sort_unstable_by(|a, b| {
+		steps.step();
+		evidence[*a].key().cmp(evidence[*b].key())
+	});
+	let mut kinds = Vec::with_capacity(facts.candidates().len());
+	for at in 0..facts.candidates().len() {
+		let Some((key, debt)) = &facts.get(at).debt else {
+			kinds.push((false, false));
+			continue;
+		};
+		let start = order.partition_point(|found| {
+			steps.step();
+			evidence[*found].key() < key
+		});
+		let mut found_kinds = (false, false);
+		for found in &order[start..] {
+			steps.step();
+			let found = &evidence[*found];
+			if found.key() != key {
+				break;
+			}
+			found_kinds.0 |= found.matches(*key, debt, false);
+			found_kinds.1 |= found.matches(*key, debt, true);
+		}
+		kinds.push(found_kinds);
+	}
+	kinds
+}
+
+/// Test-only (Codex 01a20632): [`evidence_kinds`] with its lookup steps.
+#[cfg(test)]
+pub(super) fn evidence_kinds_with_steps_for_test(
+	facts: &CoherentFacts,
+	evidence: &[ContentEvidence],
+) -> (Vec<(bool, bool)>, u64) {
+	let mut steps = LookupSteps::default();
+	let kinds = evidence_kinds_counted(facts, evidence, &mut steps);
+	(kinds, steps.0)
 }
 
 /// The canonical drop multiset of a certified install: one deterministic

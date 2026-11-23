@@ -70510,3 +70510,295 @@ async fn shared_frame_copies_hit_one_tiered_frame_and_refuse_a_failing_copy() {
 	);
 	assert!(stats.reused >= 1, "{stats:?}");
 }
+
+/// Codex 01a20616 (F2): the frozen pre-F2 membership rule, verbatim but for its private helpers
+/// written out: each entry scans every evidence (`evidence.iter().any(..)`). The reference the
+/// indexed rule must equal.
+fn decide_members_reference(
+	entries: &[crate::storage::VersionEntry],
+	frame_tables: &[crate::storage::manager::certified_lsm::FrameTable],
+	facts: &crate::storage::index::certified_base::CoherentFacts,
+	evidence: &[crate::storage::manager::certified_cleanup::ContentEvidence],
+) -> std::collections::BTreeMap<
+	crate::storage::manager::certified_lsm::CertifiedMemberKey,
+	TableObjectId,
+> {
+	use crate::storage::index::certified_base::VersionRef;
+	use crate::storage::manager::certified_lsm::FrameTable;
+	use std::collections::BTreeMap;
+	let mut verdicts: BTreeMap<_, Option<TableObjectId>> = BTreeMap::new();
+	let mut kinds: BTreeMap<VersionRef, (bool, bool)> = BTreeMap::new();
+	for (entry, frame_table) in entries.iter().zip(frame_tables) {
+		let reference = VersionRef {
+			tenant: entry.tenant_id,
+			key_identity: *entry.row_key_id.as_bytes(),
+			hlc: entry.row_hlc,
+		};
+		let seen = kinds.entry(reference).or_insert((false, false));
+		if entry.location.is_tombstone {
+			seen.1 = true;
+		} else {
+			seen.0 = true;
+		}
+		let passes = || -> Option<TableObjectId> {
+			if entry.lifecycle == crate::storage::lsm::VersionLifecycle::MigratedRangeTombstone {
+				return None;
+			}
+			let at = facts.candidates().binary_search(&reference).ok()?;
+			let fact = facts.get(at);
+			let (key, debt) = fact.debt.as_ref()?;
+			if fact.ambiguous
+				|| fact.owned
+				|| fact.base.as_ref().is_some_and(|base| base.hlc == key.hlc)
+			{
+				return None;
+			}
+			if match frame_table {
+				FrameTable::Malformed => true,
+				FrameTable::Stamped(table) => *table != key.table,
+				FrameTable::Untyped => false,
+			} || entry
+				.table_object_id
+				.is_some_and(|table| table != key.table)
+			{
+				return None;
+			}
+			evidence
+				.iter()
+				.any(|evidence| evidence.matches(*key, debt, entry.location.is_tombstone))
+				.then_some(key.table)
+		};
+		let verdict = passes();
+		verdicts
+			.entry((
+				entry.tenant_id,
+				entry.row_key_id,
+				entry.row_hlc,
+				entry.location.is_tombstone,
+			))
+			.and_modify(|current| {
+				if *current != verdict {
+					*current = None;
+				}
+			})
+			.or_insert(verdict);
+	}
+	verdicts
+		.into_iter()
+		.filter_map(|(member, table)| {
+			let reference = VersionRef {
+				tenant: member.0,
+				key_identity: *member.1.as_bytes(),
+				hlc: member.2,
+			};
+			let conflicting = kinds
+				.get(&reference)
+				.is_some_and(|(row, tombstone)| *row && *tombstone);
+			table.filter(|_| !conflicting).map(|table| (member, table))
+		})
+		.collect()
+}
+
+/// Codex 01a20616 (F2): the indexed evidence membership decides exactly as the frozen
+/// existential rule, for positive and negative choices: a right witness; none; only another
+/// debt or only the other kind for the same key; a wrong and a right witness for the same key in
+/// BOTH orders; a duplicate witness; a tombstone; a conflicting row/tombstone pair; owned,
+/// ambiguous, base-protected, stamped-elsewhere and migrated-range versions; no debt; a version
+/// whose two copies disagree; and evidence for a key that is not a candidate. The evidence is
+/// tried in its given order and reversed.
+#[test]
+fn indexed_evidence_membership_equals_the_existential_rule() {
+	use crate::storage::index::certified_base::{
+		BaseEntry, CoherentFacts, DebtRecord, DebtSource, VersionFacts, VersionKey, VersionRef,
+	};
+	use crate::storage::lsm::VersionLifecycle;
+	use crate::storage::manager::certified_cleanup::{ContentEvidence, StoredCopy};
+	use crate::storage::manager::certified_lsm::{
+		FrameTable, decide_members, evidence_kinds, evidence_kinds_with_steps_for_test,
+	};
+	let table = TableObjectId::new([0x61; 16]);
+	let other_table = TableObjectId::new([0x62; 16]);
+	let key = |n: u64| VersionKey {
+		tenant: tenant(),
+		table,
+		key_identity: *id(0x7c00 + n).as_bytes(),
+		hlc: hlc(500 + n),
+	};
+	let debt = |n: u64| DebtRecord {
+		gid: 3,
+		row_digest: [n as u8; 32],
+		source: DebtSource::DisplacedBase { tombstone: false },
+		aged: n % 2 == 0,
+	};
+	let other_debt = |n: u64| DebtRecord {
+		row_digest: [0xEE; 32],
+		..debt(n)
+	};
+	let witness = |n: u64, record: &DebtRecord, tombstone: bool| {
+		ContentEvidence::check(
+			key(n),
+			record,
+			tombstone,
+			&[StoredCopy {
+				tombstone,
+				row_digest: (!tombstone).then_some(record.row_digest),
+			}],
+		)
+		.expect("a witness")
+	};
+	// Versions 0..=16; the facts for each.
+	const POSITIVE: u64 = 0;
+	const NONE: u64 = 1;
+	const OTHER_DEBT: u64 = 2;
+	const OTHER_KIND: u64 = 3;
+	const WRONG_THEN_RIGHT: u64 = 4;
+	const RIGHT_THEN_WRONG: u64 = 5;
+	const DUPLICATE: u64 = 6;
+	const TOMBSTONE: u64 = 7;
+	const CONFLICTING: u64 = 8;
+	const OWNED: u64 = 9;
+	const AMBIGUOUS: u64 = 10;
+	const BASE: u64 = 11;
+	const STAMPED_ELSEWHERE: u64 = 12;
+	const MIGRATED: u64 = 13;
+	const NO_DEBT: u64 = 14;
+	const COPIES_DISAGREE: u64 = 15;
+	const NOT_A_CANDIDATE: u64 = 16;
+	let reference = |n: u64| {
+		let key = key(n);
+		VersionRef {
+			tenant: key.tenant,
+			key_identity: key.key_identity,
+			hlc: key.hlc,
+		}
+	};
+	let mut candidates: Vec<(VersionRef, VersionFacts)> = (0..NOT_A_CANDIDATE)
+		.map(|n| {
+			let fact = VersionFacts {
+				debt: (n != NO_DEBT).then(|| (key(n), debt(n))),
+				ambiguous: n == AMBIGUOUS,
+				base: (n == BASE).then(|| BaseEntry {
+					tenant: tenant(),
+					table,
+					key_identity: key(n).key_identity,
+					hlc: key(n).hlc,
+					row_digest: [n as u8; 32],
+					tombstone: false,
+					position: 0,
+				}),
+				owned: n == OWNED,
+			};
+			(reference(n), fact)
+		})
+		.collect();
+	candidates.sort_by(|a, b| a.0.cmp(&b.0));
+	let facts = CoherentFacts::for_test(
+		3,
+		candidates.iter().map(|(reference, _)| *reference).collect(),
+		candidates.into_iter().map(|(_, fact)| fact).collect(),
+	);
+	let evidence = vec![
+		witness(POSITIVE, &debt(POSITIVE), false),
+		witness(OTHER_DEBT, &other_debt(OTHER_DEBT), false),
+		witness(OTHER_KIND, &debt(OTHER_KIND), true),
+		witness(WRONG_THEN_RIGHT, &other_debt(WRONG_THEN_RIGHT), false),
+		witness(WRONG_THEN_RIGHT, &debt(WRONG_THEN_RIGHT), false),
+		witness(RIGHT_THEN_WRONG, &debt(RIGHT_THEN_WRONG), false),
+		witness(RIGHT_THEN_WRONG, &other_debt(RIGHT_THEN_WRONG), false),
+		witness(DUPLICATE, &debt(DUPLICATE), false),
+		witness(DUPLICATE, &debt(DUPLICATE), false),
+		witness(TOMBSTONE, &debt(TOMBSTONE), true),
+		witness(CONFLICTING, &debt(CONFLICTING), false),
+		witness(CONFLICTING, &debt(CONFLICTING), true),
+		witness(OWNED, &debt(OWNED), false),
+		witness(AMBIGUOUS, &debt(AMBIGUOUS), false),
+		witness(BASE, &debt(BASE), false),
+		witness(STAMPED_ELSEWHERE, &debt(STAMPED_ELSEWHERE), false),
+		witness(MIGRATED, &debt(MIGRATED), false),
+		witness(NO_DEBT, &debt(NO_DEBT), false),
+		witness(COPIES_DISAGREE, &debt(COPIES_DISAGREE), false),
+		witness(NOT_A_CANDIDATE, &debt(NOT_A_CANDIDATE), false),
+	];
+	let entry = |n: u64, tombstone: bool, offset: u64, lifecycle: VersionLifecycle| {
+		crate::storage::VersionEntry {
+			tenant_id: tenant(),
+			table_object_id: None,
+			row_key_id: id(0x7c00 + n),
+			row_hlc: hlc(500 + n),
+			record_row_index: RecordRowIndex::ZERO,
+			location: RecordLocation {
+				slab_id: SlabId::new(41),
+				offset,
+				length: 64,
+				hlc: hlc(500 + n),
+				record_row_index: RecordRowIndex::ZERO,
+				is_tombstone: tombstone,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
+			},
+			lifecycle,
+		}
+	};
+	let mut entries = Vec::new();
+	let mut frame_tables = Vec::new();
+	for n in 0..NOT_A_CANDIDATE {
+		let lifecycle = if n == MIGRATED {
+			VersionLifecycle::MigratedRangeTombstone
+		} else {
+			VersionLifecycle::AppendOnly
+		};
+		entries.push(entry(n, n == TOMBSTONE, n * 64, lifecycle));
+		frame_tables.push(if n == STAMPED_ELSEWHERE {
+			FrameTable::Stamped(other_table)
+		} else {
+			FrameTable::Untyped
+		});
+		if n == CONFLICTING {
+			entries.push(entry(n, true, 4096 + n * 64, lifecycle));
+			frame_tables.push(FrameTable::Untyped);
+		}
+		if n == COPIES_DISAGREE {
+			entries.push(entry(n, false, 4096 + n * 64, lifecycle));
+			frame_tables.push(FrameTable::Stamped(other_table));
+		}
+	}
+	let selected = |members: &std::collections::BTreeMap<
+		crate::storage::manager::certified_lsm::CertifiedMemberKey,
+		TableObjectId,
+	>| {
+		members
+			.keys()
+			.map(|member| (member.1, member.3))
+			.collect::<std::collections::BTreeSet<_>>()
+	};
+	let expected: std::collections::BTreeSet<(Identity, bool)> = [
+		(POSITIVE, false),
+		(WRONG_THEN_RIGHT, false),
+		(RIGHT_THEN_WRONG, false),
+		(DUPLICATE, false),
+		(TOMBSTONE, true),
+	]
+	.into_iter()
+	.map(|(n, tombstone)| (id(0x7c00 + n), tombstone))
+	.collect();
+	let mut reversed = evidence.clone();
+	reversed.reverse();
+	for evidence in [&evidence, &reversed] {
+		let indexed = decide_members(&entries, &frame_tables, &facts, evidence);
+		let frozen = decide_members_reference(&entries, &frame_tables, &facts, evidence);
+		assert_eq!(indexed, frozen, "the indexed rule is the existential rule");
+		assert_eq!(selected(&indexed), expected, "exactly the positive choices");
+		assert!(indexed.values().all(|chosen| *chosen == table));
+	}
+	// The lookup work is the ordering plus one search per candidate, not entries x evidence.
+	let (kinds, steps) = evidence_kinds_with_steps_for_test(&facts, &evidence);
+	assert_eq!(
+		kinds,
+		evidence_kinds(&facts, &evidence),
+		"one implementation"
+	);
+	assert!(
+		steps < (entries.len() * evidence.len()) as u64,
+		"{steps} lookup steps"
+	);
+}

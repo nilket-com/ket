@@ -91,6 +91,11 @@ impl ContentEvidence {
 		})
 	}
 
+	/// The version this evidence is for.
+	pub(crate) fn key(&self) -> &VersionKey {
+		&self.key
+	}
+
 	/// ADR 0703: whether this is the evidence for `key`'s `debt` record with
 	/// copies of this kind.
 	pub(crate) fn matches(&self, key: VersionKey, debt: &DebtRecord, tombstone: bool) -> bool {
