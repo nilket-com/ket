@@ -12744,7 +12744,7 @@ fn every_lifecycle_permit_site_has_an_owner_that_outlives_cancellation() {
 	let order: Vec<_> = [
 		"self.data_server.stop_decision_maintenance();",
 		"handles.lsm_compaction_control.stop();",
-		"handles.drain_lifecycle_services().await",
+		".drain_lifecycle_services(Some(&self.slab))",
 		"lifecycle.begin_drain();",
 		"self.raft.shutdown().await",
 	]
@@ -12759,11 +12759,7 @@ fn every_lifecycle_permit_site_has_an_owner_that_outlives_cancellation() {
 		order.windows(2).all(|pair| pair[0] < pair[1]),
 		"stop both, drain both, then drain transports and stop Raft: {order:?}"
 	);
-	let drain = source_region(
-		&node,
-		"async fn drain_lifecycle_services(&mut self)",
-		"\n\t}\n",
-	);
+	let drain = source_region(&node, "async fn drain_lifecycle_services(", "\n\t}\n");
 	for service in LIFECYCLE_PERMIT_CENSUS
 		.iter()
 		.filter_map(|(_, _, owner)| match owner {

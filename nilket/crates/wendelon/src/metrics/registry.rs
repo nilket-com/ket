@@ -519,6 +519,33 @@ impl CertifiedTierObserverSeries {
 	}
 }
 
+/// DC-292: the lifecycle drain-timeout captures, one series per service and field; nothing when
+/// no drain has timed out.
+fn render_lifecycle_drain_timeouts(
+	out: &mut String,
+	captures: &std::collections::BTreeMap<&'static str, Vec<(&'static str, u64)>>,
+) {
+	if captures.is_empty() {
+		return;
+	}
+	let family = "wendelon_lifecycle_drain_timeout";
+	render_gauge_family_header(
+		out,
+		family,
+		"A lifecycle service's drain timeout, observed before its abort: deadline and observation (ms after the drain's start), the selected call, and the tier observer's detail.",
+	);
+	for (service, fields) in captures {
+		for (field, value) in fields {
+			render_gauge_with_labels(
+				out,
+				family,
+				&[("service", service), ("field", field)],
+				*value,
+			);
+		}
+	}
+}
+
 /// Wendelon ADR 0125: renders one snapshot of the observed certified tier step: the one-hot
 /// stage (`idle` when none), the step's fields, and the last observed step's one-hot outcome
 /// (all 0 before any) and fields. 0 means unknown.
@@ -3181,6 +3208,9 @@ pub struct MetricsRegistry {
 	storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters,
 	decision_generation_targets_proposed: GenerationTargetReasonCounters,
 	certified_tier_observer: CertifiedTierObserverSeries,
+	/// DC-292: each lifecycle service's last drain-timeout capture, by service.
+	lifecycle_drain_timeouts:
+		std::sync::Mutex<std::collections::BTreeMap<&'static str, Vec<(&'static str, u64)>>>,
 	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
 	pub storage_l2_superseded_objects_retained_total: Counter,
 	pub storage_supersession_metadata_degraded_total: Counter,
@@ -3541,6 +3571,7 @@ impl Default for MetricsRegistry {
 			storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters::default(),
 			decision_generation_targets_proposed: GenerationTargetReasonCounters::default(),
 			certified_tier_observer: CertifiedTierObserverSeries::default(),
+			lifecycle_drain_timeouts: Default::default(),
 			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
 			storage_l2_superseded_objects_retained_total: Counter::default(),
 			storage_supersession_metadata_degraded_total: Counter::default(),
@@ -4315,6 +4346,23 @@ impl MetricsRegistry {
 	}
 
 	/// Wendelon ADR 0125: the observed certified tier step's snapshot, set whole.
+	/// DC-292 (Codex 01a206ae): a lifecycle service's drain-timeout capture, set once per close
+	/// after both drains are joined (never inside the timeout branch). Fields: the scheduled
+	/// deadline and the observation, ms after the drain's start; `selected_call` (0 none, 1
+	/// idle, 2 tier step, 3 LSM step) and since when (unix ms); `tier_detail` (0 not
+	/// applicable, 1 captured, 2 contended: not waited for); the captured tier stage (1-based
+	/// in `TierJobStage::ALL` order; 0 none), its entry, start, slab, op and generation.
+	pub(crate) fn set_lifecycle_drain_timeout(
+		&self,
+		service: &'static str,
+		fields: Vec<(&'static str, u64)>,
+	) {
+		self.lifecycle_drain_timeouts
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.insert(service, fields);
+	}
+
 	pub(crate) fn set_certified_tier_snapshot(
 		&self,
 		snapshot: crate::storage::manager::certified_observer::TierStepSnapshot,
@@ -6400,6 +6448,13 @@ impl MetricsRegistry {
 			"Logical row versions pruned by table-aware L2 retention rewrites.",
 		);
 		self.certified_tier_observer.render(&mut out);
+		render_lifecycle_drain_timeouts(
+			&mut out,
+			&self
+				.lifecycle_drain_timeouts
+				.lock()
+				.unwrap_or_else(|e| e.into_inner()),
+		);
 		self.decision_generation_targets_proposed.render(
 			&mut out,
 			"wendelon_decision_generation_targets_proposed_total",

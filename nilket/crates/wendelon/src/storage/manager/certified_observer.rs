@@ -167,7 +167,7 @@ pub(crate) struct TierStepSnapshot {
 pub(crate) struct StepToken(u64);
 
 #[derive(Default)]
-struct Owned {
+pub(crate) struct Owned {
 	/// The observing step's token; 0 when none.
 	owner: u64,
 	next: u64,
@@ -300,6 +300,25 @@ impl CertifiedTierObserver {
 		};
 		owned.owner = 0;
 		publish(&owned.snapshot);
+	}
+
+	/// DC-292 (Codex 01a206ae): the current snapshot, one coherent copy, WITHOUT waiting: `None`
+	/// while another holder (a step publishing its stage) has the lock. For a close's drain
+	/// timeout, which must not wait before it requests an abort.
+	pub(crate) fn try_snapshot(&self) -> Option<TierStepSnapshot> {
+		match self.owned.try_lock() {
+			Ok(owned) => Some(owned.snapshot),
+			Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+				Some(poisoned.into_inner().snapshot)
+			}
+			Err(std::sync::TryLockError::WouldBlock) => None,
+		}
+	}
+
+	/// Test-only (DC-292): holds this observer's lock, as a step publishing its stage holds it.
+	#[cfg(test)]
+	pub(crate) fn hold_lock_for_test(&self) -> std::sync::MutexGuard<'_, Owned> {
+		self.owned.lock().unwrap_or_else(|e| e.into_inner())
 	}
 
 	/// Test-only: the current snapshot, one coherent copy.

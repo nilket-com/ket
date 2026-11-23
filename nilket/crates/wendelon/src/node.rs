@@ -1118,6 +1118,9 @@ pub struct NodeHandles {
 	pub decision_maintenance: Option<JoinHandle<()>>,
 	/// The bound on the lifecycle services' orderly stop.
 	lifecycle_drain_bound: std::time::Duration,
+	/// Test-only (DC-292): each drain timeout's capture, as published, by service.
+	#[cfg(test)]
+	drain_captures: Arc<std::sync::Mutex<Vec<(&'static str, DrainCapture)>>>,
 }
 
 impl NodeHandles {
@@ -1160,17 +1163,64 @@ impl NodeHandles {
 	/// service is aborted and joined before this returns: an interrupted
 	/// lifecycle permit has then dropped and revoked the clean record. A panic
 	/// is a failure, never an orderly stop.
-	async fn drain_lifecycle_services(&mut self) -> std::io::Result<()> {
-		let deadline = tokio::time::Instant::now() + self.lifecycle_drain_bound;
-		let (lsm, decisions) = tokio::join!(
-			drain_lifecycle_service(self.lsm_compaction.take(), deadline, "LSM compaction"),
+	///
+	/// DC-292 (Codex 01a206ae): a service that misses the deadline is observed in its timeout
+	/// branch, before its abort is requested, without waiting (`DrainCapture`); each capture is
+	/// published only after both drains are joined, so publishing never delays the other
+	/// service's timeout or abort. `slab` gives the LSM service's capture its certified tier
+	/// observer.
+	async fn drain_lifecycle_services(
+		&mut self,
+		slab: Option<&Arc<SlabManager>>,
+	) -> std::io::Result<()> {
+		let drain_start = tokio::time::Instant::now();
+		let deadline = drain_start + self.lifecycle_drain_bound;
+		let control = self.lsm_compaction_control.clone();
+		let observe_lsm = || {
+			let (call, since) = control.tick_call();
+			let tier = match slab {
+				Some(slab) => match slab.certified_tier_observer().try_snapshot() {
+					Some(snapshot) => TierDetail::Captured(snapshot),
+					None => TierDetail::Contended,
+				},
+				None => TierDetail::NotApplicable,
+			};
+			(Some((call, since)), tier)
+		};
+		let observe_decisions = || (None, TierDetail::NotApplicable);
+		let ((lsm, lsm_capture), (decisions, decisions_capture)) = tokio::join!(
+			drain_lifecycle_service(
+				self.lsm_compaction.take(),
+				(drain_start, deadline),
+				"LSM compaction",
+				&observe_lsm,
+			),
 			drain_lifecycle_service(
 				self.decision_maintenance.take(),
-				deadline,
-				"decision maintenance"
+				(drain_start, deadline),
+				"decision maintenance",
+				&observe_decisions,
 			),
 		);
+		for (service, capture) in [
+			("LSM compaction", lsm_capture),
+			("decision maintenance", decisions_capture),
+		] {
+			if let Some(capture) = capture {
+				crate::metrics::global().set_lifecycle_drain_timeout(service, capture.fields());
+				#[cfg(test)]
+				self.drain_captures.lock().unwrap().push((service, capture));
+			}
+		}
 		lsm.and(decisions)
+	}
+
+	/// Test-only (DC-292): the drain timeout captures this node's close publishes.
+	#[cfg(test)]
+	pub(crate) fn drain_captures_for_test(
+		&self,
+	) -> Arc<std::sync::Mutex<Vec<(&'static str, DrainCapture)>>> {
+		self.drain_captures.clone()
 	}
 
 	/// Test-only: shortens the bound on the lifecycle services' orderly stop.
@@ -1262,25 +1312,117 @@ impl RestoreValidationStatus {
 	}
 }
 
+/// DC-292 (Codex 01a206ae): the tier step's detail in a drain timeout's capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TierDetail {
+	/// The service has no certified tier observer (decision maintenance).
+	NotApplicable,
+	/// The observer's lock was held (a step publishing its stage): not waited for.
+	Contended,
+	/// One coherent copy of the observer's snapshot.
+	Captured(crate::storage::manager::certified_observer::TierStepSnapshot),
+}
+
+/// DC-292 (Codex 01a206ae): what a lifecycle service's drain recorded in its timeout branch,
+/// before requesting the abort, without waiting: the scheduled deadline and the observation
+/// time, both measured from the drain's start (one monotonic origin); the call the LSM tick's
+/// driver had selected (not that its callee took a permit); and the tier observer's detail. A
+/// local copy: the live state is cleared when the cancelled tick drops its guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DrainCapture {
+	pub(crate) deadline_ms_after_drain_start: u64,
+	pub(crate) observed_ms_after_drain_start: u64,
+	/// `None` for a service without a selected-call word.
+	pub(crate) selected_call: Option<(crate::storage::LsmTickCall, u64)>,
+	pub(crate) tier: TierDetail,
+}
+
+impl DrainCapture {
+	/// The published fields (see `MetricsRegistry::set_lifecycle_drain_timeout` for the codes).
+	pub(crate) fn fields(&self) -> Vec<(&'static str, u64)> {
+		use crate::storage::LsmTickCall;
+		use crate::storage::manager::certified_observer::TierJobStage;
+		let (call, since) = match self.selected_call {
+			None => (0, 0),
+			Some((LsmTickCall::Idle, _)) => (1, 0),
+			Some((LsmTickCall::TierStep, since)) => (2, since),
+			Some((LsmTickCall::LsmStep, since)) => (3, since),
+		};
+		let (detail, snapshot) = match self.tier {
+			TierDetail::NotApplicable => (0, None),
+			TierDetail::Captured(snapshot) => (1, Some(snapshot)),
+			TierDetail::Contended => (2, None),
+		};
+		let stage = snapshot.map_or(0, |snapshot| {
+			TierJobStage::ALL
+				.iter()
+				.position(|stage| *stage == snapshot.stage)
+				.map_or(0, |at| at as u64 + 1)
+		});
+		let field =
+			|read: fn(&crate::storage::manager::certified_observer::TierStepSnapshot) -> u64| {
+				snapshot.as_ref().map_or(0, read)
+			};
+		vec![
+			(
+				"deadline_ms_after_drain_start",
+				self.deadline_ms_after_drain_start,
+			),
+			(
+				"observed_ms_after_drain_start",
+				self.observed_ms_after_drain_start,
+			),
+			("selected_call", call),
+			("selected_call_since_unix_ms", since),
+			("tier_detail", detail),
+			("tier_stage", stage),
+			(
+				"tier_stage_entered_unix_ms",
+				field(|s| s.stage_entered_unix_ms),
+			),
+			("tier_started_unix_ms", field(|s| s.started_unix_ms)),
+			("tier_slab", field(|s| s.slab)),
+			("tier_op_seq", field(|s| s.op_seq)),
+			("tier_active_gid", field(|s| s.active_gid)),
+		]
+	}
+}
+
 /// ADR 0706: one lifecycle service's bounded stop (its stop already
-/// signalled). Past `deadline` it is aborted, then joined.
+/// signalled). Past `deadline` it is aborted, then joined. DC-292: in the timeout branch, before
+/// the abort is requested, `observe` is read once (nonblocking loads only) into the returned
+/// capture; nothing is published here.
 async fn drain_lifecycle_service(
 	handle: Option<JoinHandle<()>>,
-	deadline: tokio::time::Instant,
+	(drain_start, deadline): (tokio::time::Instant, tokio::time::Instant),
 	label: &str,
-) -> std::io::Result<()> {
+	observe: &(dyn Fn() -> (Option<(crate::storage::LsmTickCall, u64)>, TierDetail) + Sync),
+) -> (std::io::Result<()>, Option<DrainCapture>) {
 	let Some(mut handle) = handle else {
-		return Ok(());
+		return (Ok(()), None);
 	};
 	match tokio::time::timeout_at(deadline, &mut handle).await {
-		Ok(Ok(())) => Ok(()),
-		Ok(Err(err)) if err.is_cancelled() => Ok(()),
-		Ok(Err(err)) => Err(Error::other(format!(
-			"{label} task failed while it drained: {err}"
-		))),
+		Ok(Ok(())) => (Ok(()), None),
+		Ok(Err(err)) if err.is_cancelled() => (Ok(()), None),
+		Ok(Err(err)) => (
+			Err(Error::other(format!(
+				"{label} task failed while it drained: {err}"
+			))),
+			None,
+		),
 		Err(_elapsed) => {
+			let observed = tokio::time::Instant::now();
+			let (selected_call, tier) = observe();
+			let capture = DrainCapture {
+				deadline_ms_after_drain_start: deadline.duration_since(drain_start).as_millis()
+					as u64,
+				observed_ms_after_drain_start: observed.duration_since(drain_start).as_millis()
+					as u64,
+				selected_call,
+				tier,
+			};
 			handle.abort();
-			match handle.await {
+			let result = match handle.await {
 				Err(err) if err.is_panic() => Err(Error::other(format!(
 					"{label} task failed while it drained: {err}"
 				))),
@@ -1295,7 +1437,8 @@ async fn drain_lifecycle_service(
 						format!("{label} did not stop within the lifecycle drain bound; aborted"),
 					))
 				}
-			}
+			};
+			(result, Some(capture))
 		}
 	}
 }
@@ -3520,7 +3663,10 @@ impl WendelonNode {
 		// before either is awaited, then drained under one shared deadline.
 		self.data_server.stop_decision_maintenance();
 		handles.lsm_compaction_control.stop();
-		let mut first_error = handles.drain_lifecycle_services().await.err();
+		let mut first_error = handles
+			.drain_lifecycle_services(Some(&self.slab))
+			.await
+			.err();
 		lifecycle.begin_drain();
 		for server in &transport_servers {
 			server.begin_drain();
@@ -4861,6 +5007,11 @@ impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver {
 			return Ok(None);
 		}
 		if let Some(data_server) = &self.certified {
+			// DC-292 (Codex 01a206ae): the call this tick selected, from here until it returns or
+			// is cancelled (the guard then marks it idle). A drain timeout reads it once.
+			let call = self
+				.control
+				.enter_tick_call(crate::storage::LsmTickCall::TierStep);
 			// ADR 0704: one certified tier job, then the certified LSM job; a
 			// tier step that fails leaves the LSM step to run.
 			if let Err(error) = data_server
@@ -4877,6 +5028,7 @@ impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver {
 				tracing::debug!("LSM service stopped; the certified LSM successor is not started");
 				return Ok(None);
 			}
+			call.advance(crate::storage::LsmTickCall::LsmStep);
 			return data_server
 				.certified_lsm_step(worker, now, self.committer.as_ref())
 				.await;

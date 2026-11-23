@@ -1150,6 +1150,8 @@ impl NodeHandlesBuilder {
 				.expect("validated complete startup handle set"),
 			decision_maintenance: self.decision_maintenance.take(),
 			lifecycle_drain_bound: crate::node::LIFECYCLE_SERVICES_DRAIN,
+			#[cfg(test)]
+			drain_captures: Default::default(),
 		})
 	}
 	fn into_named(mut self) -> Vec<(&'static str, JoinHandle<()>)> {

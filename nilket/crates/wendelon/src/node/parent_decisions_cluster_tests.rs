@@ -7369,9 +7369,10 @@ async fn an_observed_stop_skips_the_certified_lsm_successor(fail_tier: bool) {
 		.tier_pointer(fx.s1)
 		.await
 		.map(|pointer| pointer.l2_uri);
-	if fail_tier {
-		assert_eq!(after, before, "the failed tier step published nothing");
-	} else {
+	// After the reopen the leader's own certified steps run again and may legitimately rewrite
+	// S1, so only a published rewrite is evidence here; a failed step's non-publication is its
+	// own `Err` return, asserted above.
+	if !fail_tier {
 		assert_ne!(after, before, "the tier step published S1's rewrite");
 		let s1_rows: Vec<_> = restarted
 			.persistent_index()
@@ -7486,7 +7487,6 @@ async fn a_certified_tier_step_held_past_the_drain_bound_is_aborted_and_records_
 	let leader = fx.leader;
 	let server = fx.cluster.node(leader).data_server.clone();
 	let slab = fx.cluster.node(leader).slab.clone();
-	let before = slab.tier_pointer(fx.s1).await.map(|pointer| pointer.l2_uri);
 	let (tier_reached, tier_release) =
 		slab.hold_next_certified_tier_step(CertifiedTierCut::AfterClaim);
 	let (lsm_reached, _never_released) =
@@ -7548,18 +7548,244 @@ async fn a_certified_tier_step_held_past_the_drain_bound_is_aborted_and_records_
 		fx.expected,
 		"validated, then exact"
 	);
-	let restarted = fx.cluster.node(leader).slab.clone();
-	restarted.wait_tier_authority_ready().await.unwrap();
-	assert_eq!(
-		restarted
-			.tier_pointer(fx.s1)
-			.await
-			.map(|pointer| pointer.l2_uri),
-		before,
-		"the aborted step published nothing"
-	);
-	drop(restarted);
+	// The aborted step published nothing: it was dropped at `AfterClaim`, before its source read
+	// (the barrier). S1's pointer after the reopen is not that evidence: the reopened leader's
+	// own certified steps run again and may legitimately rewrite S1 (DC-292 lanes, Codex 01a206ae).
 	for node in fx.cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// DC-292 (Codex 01a206ae): the leader's close with `bound`, a tier step held at `AfterClaim` (when
+/// `hold_tier`), and the certified LSM step's post-permit hook armed and reached first (when
+/// `hold_lsm`). Returns the close's result, its published drain captures, and the fixture.
+struct HeldClose {
+	result: std::io::Result<()>,
+	captures: Vec<(&'static str, DrainCapture)>,
+	live_call_after: (crate::storage::LsmTickCall, u64),
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_tier_step_held_past_the_drain_bound_is_captured_before_its_abort() {
+	use crate::storage::LsmTickCall;
+	use crate::storage::manager::certified_observer::TierJobStage;
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	use std::sync::atomic::Ordering::Release;
+	let mut fx = handoff_fixture("capture-held-tier").await;
+	let leader = fx.leader;
+	let slab = fx.cluster.node(leader).slab.clone();
+	let (tier_reached, _tier_release) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::AfterClaim);
+	fx.pause.store(false, Release);
+	tokio::time::timeout(BOUND, tier_reached.acquire())
+		.await
+		.expect("the tier step reaches AfterClaim")
+		.unwrap()
+		.forget();
+	drop(slab);
+	let mut node = take_node(&mut fx.cluster, leader);
+	node.handles
+		.set_lifecycle_drain_bound_for_test(std::time::Duration::from_secs(2));
+	let captures = node.handles.drain_captures_for_test();
+	let control = node.handles.lsm_compaction_control.clone();
+	let close = HeldClose {
+		result: tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+			.await
+			.expect("a bounded close"),
+		captures: captures.lock().unwrap().clone(),
+		live_call_after: control.tick_call(),
+	};
+	let error = close.result.expect_err("an interrupted close");
+	assert!(error.to_string().contains("LSM compaction"), "{error}");
+	let [("LSM compaction", capture)] = close.captures.as_slice() else {
+		panic!("exactly the LSM service's capture: {:?}", close.captures);
+	};
+	assert_eq!(
+		capture.deadline_ms_after_drain_start, 2_000,
+		"the scheduled deadline"
+	);
+	assert!(
+		capture.observed_ms_after_drain_start >= capture.deadline_ms_after_drain_start,
+		"observed at or after the deadline: {capture:?}"
+	);
+	assert!(
+		matches!(capture.selected_call, Some((LsmTickCall::TierStep, since)) if since > 0),
+		"the tick had selected the tier step: {capture:?}"
+	);
+	match capture.tier {
+		TierDetail::Captured(snapshot) => assert_eq!(
+			(snapshot.stage, snapshot.slab),
+			(TierJobStage::Reading, fx.s1.get()),
+			"the held tier step's stage"
+		),
+		other => panic!("the tier detail is captured: {other:?}"),
+	}
+	assert_eq!(
+		close.live_call_after,
+		(LsmTickCall::Idle, 0),
+		"the cancelled tick's guard cleared the live word; the capture is the evidence"
+	);
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// The handoff: the tier step returned and its certified LSM successor holds after its permit
+/// past the bound. The capture names the LSM step as the selected call; the tier observer's detail
+/// is idle, a separate observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_certified_lsm_step_held_past_the_drain_bound_is_captured_as_the_lsm_call() {
+	use crate::network::data_server::child_writes::PauseStage;
+	use crate::storage::LsmTickCall;
+	use crate::storage::manager::certified_observer::TierJobStage;
+	use std::sync::atomic::Ordering::Release;
+	let mut fx = handoff_fixture("capture-held-lsm").await;
+	let leader = fx.leader;
+	let server = fx.cluster.node(leader).data_server.clone();
+	let (lsm_reached, _never_released) =
+		server.pause_coordinator_for_test(PauseStage::CertifiedLsmStep);
+	drop(server);
+	fx.pause.store(false, Release);
+	tokio::time::timeout(BOUND, lsm_reached.notified())
+		.await
+		.expect("the certified LSM step holds after its permit");
+	let mut node = take_node(&mut fx.cluster, leader);
+	node.handles
+		.set_lifecycle_drain_bound_for_test(std::time::Duration::from_secs(2));
+	let captures = node.handles.drain_captures_for_test();
+	let result = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+		.await
+		.expect("a bounded close");
+	assert!(result.is_err(), "an interrupted close");
+	let captures = captures.lock().unwrap().clone();
+	let [("LSM compaction", capture)] = captures.as_slice() else {
+		panic!("exactly the LSM service's capture: {captures:?}");
+	};
+	assert!(
+		matches!(capture.selected_call, Some((LsmTickCall::LsmStep, since)) if since > 0),
+		"the tick had selected its LSM successor: {capture:?}"
+	);
+	assert!(
+		matches!(capture.tier, TierDetail::Captured(snapshot) if snapshot.stage == TierJobStage::Idle),
+		"the tier observer, separately, idle: {capture:?}"
+	);
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// Contention, synchronized on the event: the tier observer's lock is held (as a step publishing
+/// its stage holds it) across the deadline. The drain does not wait for it: the abort is
+/// requested while the lock is STILL held (the held step's future is dropped: its release handle
+/// goes from 2 to 1 holders), and the capture records the detail as contended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(
+	clippy::await_holding_lock,
+	reason = "the control holds the observer's lock across the deadline on purpose"
+)]
+async fn a_contended_tier_observer_does_not_delay_the_abort() {
+	use crate::storage::LsmTickCall;
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	use std::sync::atomic::Ordering::Release;
+	let mut fx = handoff_fixture("capture-contended").await;
+	let leader = fx.leader;
+	let slab = fx.cluster.node(leader).slab.clone();
+	let (tier_reached, tier_release) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::AfterClaim);
+	fx.pause.store(false, Release);
+	tokio::time::timeout(BOUND, tier_reached.acquire())
+		.await
+		.expect("the tier step reaches AfterClaim")
+		.unwrap()
+		.forget();
+	let mut node = take_node(&mut fx.cluster, leader);
+	node.handles
+		.set_lifecycle_drain_bound_for_test(std::time::Duration::from_secs(2));
+	let captures = node.handles.drain_captures_for_test();
+	assert_eq!(
+		Arc::strong_count(&tier_release),
+		2,
+		"premise: the step holds its release"
+	);
+	let held = slab.certified_tier_observer().hold_lock_for_test();
+	let mut closing = tokio::spawn(node.shutdown());
+	// The abort is requested while the lock is still held.
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+	while Arc::strong_count(&tier_release) != 1 {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the abort waited for the observer's lock"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+	}
+	drop(held);
+	drop(slab);
+	let result = tokio::time::timeout(std::time::Duration::from_secs(30), &mut closing)
+		.await
+		.expect("a bounded close")
+		.unwrap();
+	assert!(result.is_err(), "an interrupted close");
+	let captures = captures.lock().unwrap().clone();
+	let [("LSM compaction", capture)] = captures.as_slice() else {
+		panic!("exactly the LSM service's capture: {captures:?}");
+	};
+	assert_eq!(
+		capture.tier,
+		TierDetail::Contended,
+		"not waited for: {capture:?}"
+	);
+	assert!(
+		matches!(capture.selected_call, Some((LsmTickCall::TierStep, _))),
+		"the selected call is still read: {capture:?}"
+	);
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// A clean drain publishes no capture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_clean_drain_publishes_no_capture() {
+	let mut fx = handoff_fixture("capture-clean").await;
+	let node = take_node(&mut fx.cluster, fx.leader);
+	let captures = node.handles.drain_captures_for_test();
+	tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+		.await
+		.expect("a bounded close")
+		.expect("an orderly close");
+	assert!(captures.lock().unwrap().is_empty(), "no drain timed out");
+	for node in fx.cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// The published family, on an isolated registry: one series per service and field; none when
+/// no drain timed out.
+#[test]
+fn drain_timeout_captures_render_per_service_and_field() {
+	use crate::storage::LsmTickCall;
+	let registry = crate::metrics::isolated_for_test();
+	assert!(
+		!registry
+			.render_prometheus()
+			.contains("wendelon_lifecycle_drain_timeout"),
+		"nothing before a timeout"
+	);
+	let capture = DrainCapture {
+		deadline_ms_after_drain_start: 15_000,
+		observed_ms_after_drain_start: 15_003,
+		selected_call: Some((LsmTickCall::LsmStep, 1_795_000_000_000)),
+		tier: TierDetail::Contended,
+	};
+	registry.set_lifecycle_drain_timeout("LSM compaction", capture.fields());
+	let text = registry.render_prometheus();
+	for line in [
+		"wendelon_lifecycle_drain_timeout{service=\"LSM compaction\",field=\"deadline_ms_after_drain_start\"} 15000",
+		"wendelon_lifecycle_drain_timeout{service=\"LSM compaction\",field=\"observed_ms_after_drain_start\"} 15003",
+		"wendelon_lifecycle_drain_timeout{service=\"LSM compaction\",field=\"selected_call\"} 3",
+		"wendelon_lifecycle_drain_timeout{service=\"LSM compaction\",field=\"tier_detail\"} 2",
+		"wendelon_lifecycle_drain_timeout{service=\"LSM compaction\",field=\"tier_stage\"} 0",
+	] {
+		assert!(text.contains(line), "missing {line}");
 	}
 }

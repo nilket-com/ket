@@ -100,6 +100,9 @@ pub struct LsmCompactionServiceControl {
 	stop: Arc<tokio::sync::watch::Sender<bool>>,
 	/// Ticks admitted to the driver, ever.
 	admitted: Arc<AtomicU64>,
+	/// DC-292 (Codex 01a206ae): the call an admitted tick's driver selected, and since when: see
+	/// [`LsmTickCall`]. Packed: the call in the top byte, unix ms below.
+	tick_call: Arc<AtomicU64>,
 }
 
 impl Default for LsmCompactionServiceControl {
@@ -108,6 +111,7 @@ impl Default for LsmCompactionServiceControl {
 			paused: Arc::default(),
 			stop: Arc::new(tokio::sync::watch::channel(false).0),
 			admitted: Arc::default(),
+			tick_call: Arc::default(),
 		}
 	}
 }
@@ -138,6 +142,21 @@ impl LsmCompactionServiceControl {
 	/// How many ticks the service has admitted to its driver.
 	pub fn admitted_ticks(&self) -> u64 {
 		self.admitted.load(Ordering::SeqCst)
+	}
+
+	/// DC-292: marks the call the admitted tick's driver is about to make, from now, until the
+	/// returned guard is dropped (on return, or when the tick is cancelled), which marks it idle.
+	pub fn enter_tick_call(&self, call: LsmTickCall) -> LsmTickCallGuard {
+		let guard = LsmTickCallGuard(self.tick_call.clone());
+		guard.advance(call);
+		guard
+	}
+
+	/// DC-292: the call the admitted tick's driver selected (idle when none) and since when (unix
+	/// ms; 0 when idle), in one load. It names the selected call, not that the callee took a
+	/// permit or did any work.
+	pub fn tick_call(&self) -> (LsmTickCall, u64) {
+		LsmTickCall::unpack(self.tick_call.load(Ordering::SeqCst))
 	}
 }
 
@@ -562,3 +581,90 @@ impl LsmGcWorker {
 #[cfg(test)]
 #[path = "lsm_worker/tests.rs"]
 mod tests;
+
+/// DC-292 (Codex 01a206ae): the call an admitted LSM tick's driver selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LsmTickCall {
+	Idle,
+	/// The certified tier step was called.
+	TierStep,
+	/// The certified LSM step (the tier step's successor) was called.
+	LsmStep,
+}
+
+impl LsmTickCall {
+	const TIME_BITS: u32 = 56;
+
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::Idle => "idle",
+			Self::TierStep => "tier_step",
+			Self::LsmStep => "lsm_step",
+		}
+	}
+
+	fn pack(self, since_unix_ms: u64) -> u64 {
+		let call: u64 = match self {
+			Self::Idle => 0,
+			Self::TierStep => 1,
+			Self::LsmStep => 2,
+		};
+		(call << Self::TIME_BITS) | (since_unix_ms & ((1 << Self::TIME_BITS) - 1))
+	}
+
+	fn unpack(word: u64) -> (Self, u64) {
+		let call = match word >> Self::TIME_BITS {
+			1 => Self::TierStep,
+			2 => Self::LsmStep,
+			_ => Self::Idle,
+		};
+		let since = if call == Self::Idle {
+			0
+		} else {
+			word & ((1 << Self::TIME_BITS) - 1)
+		};
+		(call, since)
+	}
+}
+
+/// Marks an admitted tick's selected call; dropped (on return or cancellation), marks it idle.
+pub struct LsmTickCallGuard(Arc<AtomicU64>);
+
+impl LsmTickCallGuard {
+	/// The driver selected its next call.
+	pub fn advance(&self, call: LsmTickCall) {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |elapsed| elapsed.as_millis() as u64);
+		self.0.store(call.pack(now), Ordering::SeqCst);
+	}
+}
+
+impl Drop for LsmTickCallGuard {
+	fn drop(&mut self) {
+		self.0.store(LsmTickCall::Idle.pack(0), Ordering::SeqCst);
+	}
+}
+
+#[cfg(test)]
+mod tick_call_tests {
+	use super::*;
+
+	#[test]
+	fn the_selected_call_is_one_word_cleared_by_its_guard() {
+		let control = LsmCompactionServiceControl::default();
+		assert_eq!(control.tick_call(), (LsmTickCall::Idle, 0));
+		let guard = control.enter_tick_call(LsmTickCall::TierStep);
+		let (call, since) = control.tick_call();
+		assert_eq!(call, LsmTickCall::TierStep);
+		assert!(since > 0);
+		guard.advance(LsmTickCall::LsmStep);
+		assert_eq!(control.tick_call().0, LsmTickCall::LsmStep);
+		drop(guard);
+		assert_eq!(
+			control.tick_call(),
+			(LsmTickCall::Idle, 0),
+			"cleared on drop"
+		);
+	}
+}
