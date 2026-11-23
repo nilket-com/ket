@@ -1521,6 +1521,10 @@ pub(crate) struct DecisionPeer {
 	/// held; activation of committed generations, writes and reads continue.
 	#[cfg(test)]
 	pub(crate) hold_certification: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-296): the next signed report is not proposed (once), so its candidate is
+	/// reused, unbuilt and unstaged, by the next pass.
+	#[cfg(test)]
+	pub(crate) skip_next_report: Arc<std::sync::atomic::AtomicBool>,
 	/// Test-only (ADR 0706): only the local certified cleanup step is paused,
 	/// so a held certified LSM job is the only work on its slabs.
 	#[cfg(test)]
@@ -1599,6 +1603,9 @@ pub(crate) enum PauseStage {
 	/// ADR 0707: in a certification step, after its candidate is durably
 	/// staged and its report signed, before the report is proposed.
 	CertificationBeforeReport,
+	/// DC-296: in a certification step whose same-gid candidate this process already built
+	/// (neither built nor staged again), before its staged readback.
+	CertificationReusedReadback,
 	/// In a cleanup step, after its plan reclaims something and before the
 	/// rewrite.
 	CleanupBeforeRewrite,
@@ -1733,6 +1740,8 @@ impl Default for DecisionPeer {
 			pause_cleanup: Default::default(),
 			#[cfg(test)]
 			hold_certification: Default::default(),
+			#[cfg(test)]
+			skip_next_report: Default::default(),
 			#[cfg(test)]
 			pause_local_cleanup: Default::default(),
 			#[cfg(test)]

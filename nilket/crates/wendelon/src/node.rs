@@ -1116,6 +1116,9 @@ pub struct NodeHandles {
 	/// ADR 0699 S3a: ParentDecisions only. `None` once an orderly close
 	/// drained it.
 	pub decision_maintenance: Option<JoinHandle<()>>,
+	/// DC-296 (Codex 01a20716): the read side of decision maintenance's selected step, while it
+	/// runs (`None`: no such task).
+	decision_maintenance_step: Option<crate::network::decision_proposals::MaintenanceStepCell>,
 	/// The bound on the lifecycle services' orderly stop.
 	lifecycle_drain_bound: std::time::Duration,
 	/// Test-only (DC-292): each drain timeout's capture, as published, by service.
@@ -1185,9 +1188,17 @@ impl NodeHandles {
 				},
 				None => TierDetail::NotApplicable,
 			};
-			(Some((call, since)), tier)
+			(Some((call, since)), tier, MaintenanceDetail::NotApplicable)
 		};
-		let observe_decisions = || (None, TierDetail::NotApplicable);
+		let step_word = self.decision_maintenance_step.clone();
+		let observe_decisions = || {
+			// DC-296: one load of the task's step word, never a wait.
+			let maintenance = match step_word.as_ref().and_then(|word| word.selected()) {
+				Some((step, since)) => MaintenanceDetail::Selected(step, since),
+				None => MaintenanceDetail::NoneSelected,
+			};
+			(None, TierDetail::NotApplicable, maintenance)
+		};
 		let ((lsm, lsm_capture), (decisions, decisions_capture)) = tokio::join!(
 			drain_lifecycle_service(
 				self.lsm_compaction.take(),
@@ -1221,6 +1232,14 @@ impl NodeHandles {
 		&self,
 	) -> Arc<std::sync::Mutex<Vec<(&'static str, DrainCapture)>>> {
 		self.drain_captures.clone()
+	}
+
+	/// Test-only (DC-296): the read side of decision maintenance's selected step.
+	#[cfg(test)]
+	pub(crate) fn decision_maintenance_step_for_test(
+		&self,
+	) -> Option<crate::network::decision_proposals::MaintenanceStepCell> {
+		self.decision_maintenance_step.clone()
 	}
 
 	/// Test-only: shortens the bound on the lifecycle services' orderly stop.
@@ -1323,6 +1342,17 @@ pub(crate) enum TierDetail {
 	Captured(crate::storage::manager::certified_observer::TierStepSnapshot),
 }
 
+/// DC-296 (Codex 01a20716): decision maintenance's selected step in a drain timeout's capture: the
+/// step its pass had selected, not that the callee was running, waiting or holding a lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceDetail {
+	/// Not this service's word (the LSM service): no fields are published for it.
+	NotApplicable,
+	/// The word was clear: no step selected (the task had not selected one, or had ended).
+	NoneSelected,
+	Selected(crate::network::decision_proposals::MaintenanceStep, u64),
+}
+
 /// DC-292 (Codex 01a206ae): what a lifecycle service's drain recorded in its timeout branch,
 /// before requesting the abort, without waiting: the scheduled deadline and the observation
 /// time, both measured from the drain's start (one monotonic origin); the call the LSM tick's
@@ -1335,6 +1365,8 @@ pub(crate) struct DrainCapture {
 	/// `None` for a service without a selected-call word.
 	pub(crate) selected_call: Option<(crate::storage::LsmTickCall, u64)>,
 	pub(crate) tier: TierDetail,
+	/// DC-296: decision maintenance's selected step; not applicable to the LSM service.
+	pub(crate) maintenance: MaintenanceDetail,
 }
 
 impl DrainCapture {
@@ -1363,7 +1395,7 @@ impl DrainCapture {
 			|read: fn(&crate::storage::manager::certified_observer::TierStepSnapshot) -> u64| {
 				snapshot.as_ref().map_or(0, read)
 			};
-		vec![
+		let mut fields = vec![
 			(
 				"deadline_ms_after_drain_start",
 				self.deadline_ms_after_drain_start,
@@ -1384,7 +1416,20 @@ impl DrainCapture {
 			("tier_slab", field(|s| s.slab)),
 			("tier_op_seq", field(|s| s.op_seq)),
 			("tier_active_gid", field(|s| s.active_gid)),
-		]
+		];
+		// DC-296: published for decision maintenance only, so the LSM capture's series are unchanged.
+		match self.maintenance {
+			MaintenanceDetail::NotApplicable => {}
+			MaintenanceDetail::NoneSelected => {
+				fields.push(("maintenance_step", 0));
+				fields.push(("maintenance_step_since_unix_ms", 0));
+			}
+			MaintenanceDetail::Selected(step, since) => {
+				fields.push(("maintenance_step", step.code()));
+				fields.push(("maintenance_step_since_unix_ms", since));
+			}
+		}
+		fields
 	}
 }
 
@@ -1396,7 +1441,13 @@ async fn drain_lifecycle_service(
 	handle: Option<JoinHandle<()>>,
 	(drain_start, deadline): (tokio::time::Instant, tokio::time::Instant),
 	label: &str,
-	observe: &(dyn Fn() -> (Option<(crate::storage::LsmTickCall, u64)>, TierDetail) + Sync),
+	observe: &(
+	     dyn Fn() -> (
+		Option<(crate::storage::LsmTickCall, u64)>,
+		TierDetail,
+		MaintenanceDetail,
+	) + Sync
+	 ),
 ) -> (std::io::Result<()>, Option<DrainCapture>) {
 	let Some(mut handle) = handle else {
 		return (Ok(()), None);
@@ -1412,7 +1463,7 @@ async fn drain_lifecycle_service(
 		),
 		Err(_elapsed) => {
 			let observed = tokio::time::Instant::now();
-			let (selected_call, tier) = observe();
+			let (selected_call, tier, maintenance) = observe();
 			let capture = DrainCapture {
 				deadline_ms_after_drain_start: deadline.duration_since(drain_start).as_millis()
 					as u64,
@@ -1420,6 +1471,7 @@ async fn drain_lifecycle_service(
 					as u64,
 				selected_call,
 				tier,
+				maintenance,
 			};
 			handle.abort();
 			let result = match handle.await {
@@ -2984,9 +3036,15 @@ impl WendelonNode {
 			}
 			let decision_lease_ttl = cfg.data_ring_lease_ttl;
 			let mut stop = data_server.decision_maintenance_stop();
-			scope
-				.handles()
-				.set_decision_maintenance(tokio::spawn(async move {
+			// DC-296 (Codex 01a20716): the task's selected step; the node keeps the read side
+			// for the drain's timeout branch.
+			let step_word = crate::network::decision_proposals::MaintenanceStepCell::default();
+			let task_step_word = step_word.clone();
+			scope.handles().set_decision_maintenance(
+				tokio::spawn(async move {
+					use crate::network::decision_proposals::MaintenanceStep as Step;
+					// Cleared when this task returns or is cancelled.
+					let _clear = task_step_word.clear_on_exit();
 					let mut ticker = tokio::time::interval(DECISION_MAINTENANCE_INTERVAL);
 					ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 					// ADR 0700: owned here; stopped with the loop, cancelled if
@@ -2999,8 +3057,10 @@ impl WendelonNode {
 					let maintenance = crate::network::decision_proposals::MaintenanceProposals::new(
 						&proposals,
 						stop.clone(),
+						task_step_word,
 					);
 					loop {
+						maintenance.select(Step::Head);
 						// ADR 0707: a ready stop wins over a ready tick.
 						let stopping = tokio::select! {
 							biased;
@@ -3011,34 +3071,45 @@ impl WendelonNode {
 							_ = pass_requested(&maintenance_wake) => false,
 						};
 						if stopping {
+							maintenance.select(Step::ProbeStop);
 							probe.stop().await;
 							return;
 						}
+						maintenance.select(Step::ClockProbe);
 						let begun = pass_begin(&maintenance_wake);
 						// ADR 0700: keep this follower's clock sample fresh at
 						// the leader, whatever its readiness or the gate says.
 						proposals.clock_probe_step(&mut probe).await;
+						maintenance.select(Step::Signer);
 						let _ = maintenance.ensure_signer_once(incarnation).await;
 						// Wendelon ADR 0121 D1: bind the window before any write.
+						maintenance.select(Step::Retention);
 						let _ = maintenance.ensure_retention_once().await;
+						maintenance.select(Step::Floor);
 						let _ = maintenance.advance_floor_once().await;
 						// ADR 0729: take the ranges of a holder that stopped
 						// renewing, then resolve what it left reserved.
+						maintenance.select(Step::Takeover);
 						let _ = data_server
 							.takeover_step(&maintenance, decision_lease_ttl)
 							.await;
+						maintenance.select(Step::Resolve);
 						let _ = maintenance
 							.resolve_closed_once(DECISION_RESOLVE_BATCH)
 							.await;
 						// Wendelon ADR 0120 D9: CTAS recovery, conclusion and prune.
+						maintenance.select(Step::Ctas);
 						let _ = maintenance.ctas_step(DECISION_RESOLVE_BATCH).await;
+						maintenance.select(Step::RefusedIntents);
 						let _ = data_server.sweep_refused_intents().await;
 						// ADR 0699 S5a: certified generations; reads wait for the
 						// base to validate after each start.
 						// Validation (activation of a committed staged candidate
 						// first) precedes any new build or report.
+						maintenance.select(Step::Generation);
 						let _ = maintenance.generation_step().await;
 						// ADR 0104 (wendelon): the replacement controller, leader only.
+						maintenance.select(Step::Replacement);
 						let step = maintenance.replacement_step().await;
 						if !matches!(
 							step,
@@ -3046,16 +3117,24 @@ impl WendelonNode {
 						) {
 							tracing::info!(?step, "member replacement");
 						}
+						maintenance.select(Step::ValidateBase);
 						let _ = data_server.validate_certified_base().await;
+						// The step selects its own later phases through `maintenance`.
+						maintenance.select(Step::CertifyActivate);
 						let _ = data_server.certification_step(&maintenance).await;
 						// ADR 0699 S5b: one bounded cleanup step and one debt
 						// sweep page, once the base is validated.
+						maintenance.select(Step::Cleanup);
 						let _ = data_server.certified_cleanup_step().await;
+						maintenance.select(Step::DebtSweep);
 						let _ = data_server.debt_sweep_step().await;
+						maintenance.select(Step::PassEnd);
 						pass_finish(&maintenance_wake, begun);
 						pass_after(&maintenance_wake).await;
 					}
-				}));
+				}),
+				step_word,
+			);
 		}
 
 		// 13. Ring-aware dispatch — the single `HrftService` the QUIC

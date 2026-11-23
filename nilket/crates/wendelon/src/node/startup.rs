@@ -739,6 +739,8 @@ pub(super) struct NodeHandlesBuilder {
 	pub(super) checkpoint_emitter: Option<JoinHandle<()>>,
 	/// ADR 0699 S3a: signer binding and the leader's floor, ParentDecisions only.
 	pub(super) decision_maintenance: Option<JoinHandle<()>>,
+	pub(super) decision_maintenance_step:
+		Option<crate::network::decision_proposals::MaintenanceStepCell>,
 	extra: Vec<(&'static str, JoinHandle<()>)>,
 	duplicate: bool,
 }
@@ -866,7 +868,12 @@ impl NodeHandlesBuilder {
 			self.duplicate = true;
 		}
 	}
-	pub(super) fn set_decision_maintenance(&mut self, value: JoinHandle<()>) {
+	pub(super) fn set_decision_maintenance(
+		&mut self,
+		value: JoinHandle<()>,
+		step: crate::network::decision_proposals::MaintenanceStepCell,
+	) {
+		self.decision_maintenance_step = Some(step);
 		if let Some(previous) = self.decision_maintenance.replace(value) {
 			self.extra.push(("decision maintenance", previous));
 			self.duplicate = true;
@@ -1149,6 +1156,7 @@ impl NodeHandlesBuilder {
 				.take()
 				.expect("validated complete startup handle set"),
 			decision_maintenance: self.decision_maintenance.take(),
+			decision_maintenance_step: self.decision_maintenance_step.take(),
 			lifecycle_drain_bound: crate::node::LIFECYCLE_SERVICES_DRAIN,
 			#[cfg(test)]
 			drain_captures: Default::default(),

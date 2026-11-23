@@ -6815,6 +6815,8 @@ mod debt_before_append;
 mod drop_exclusion;
 #[path = "parent_decisions_cluster_tests/drop_prepare.rs"]
 mod drop_prepare;
+#[path = "parent_decisions_cluster_tests/maintenance_step.rs"]
+mod maintenance_step;
 #[path = "parent_decisions_cluster_tests/multi_row_delete.rs"]
 mod multi_row_delete;
 #[path = "parent_decisions_cluster_tests/one_voter.rs"]
@@ -7776,6 +7778,7 @@ fn drain_timeout_captures_render_per_service_and_field() {
 		observed_ms_after_drain_start: 15_003,
 		selected_call: Some((LsmTickCall::LsmStep, 1_795_000_000_000)),
 		tier: TierDetail::Contended,
+		maintenance: MaintenanceDetail::NotApplicable,
 	};
 	registry.set_lifecycle_drain_timeout("LSM compaction", capture.fields());
 	let text = registry.render_prometheus();
@@ -7788,4 +7791,46 @@ fn drain_timeout_captures_render_per_service_and_field() {
 	] {
 		assert!(text.contains(line), "missing {line}");
 	}
+	assert_eq!(
+		text.matches("service=\"LSM compaction\"").count(),
+		11,
+		"DC-296: the LSM capture's series are unchanged (no maintenance step)"
+	);
+	// DC-296: decision maintenance's capture adds its selected step, and only there.
+	let maintenance = DrainCapture {
+		deadline_ms_after_drain_start: 15_000,
+		observed_ms_after_drain_start: 15_001,
+		selected_call: None,
+		tier: TierDetail::NotApplicable,
+		maintenance: MaintenanceDetail::Selected(
+			crate::network::decision_proposals::MaintenanceStep::CertifyReport,
+			1_795_000_000_123,
+		),
+	};
+	registry.set_lifecycle_drain_timeout("decision maintenance", maintenance.fields());
+	let text = registry.render_prometheus();
+	for line in [
+		"wendelon_lifecycle_drain_timeout{service=\"decision maintenance\",field=\"selected_call\"} 0",
+		"wendelon_lifecycle_drain_timeout{service=\"decision maintenance\",field=\"maintenance_step\"} 18",
+		"wendelon_lifecycle_drain_timeout{service=\"decision maintenance\",field=\"maintenance_step_since_unix_ms\"} 1795000000123",
+	] {
+		assert!(text.contains(line), "missing {line}");
+	}
+	assert_eq!(
+		text.matches("service=\"decision maintenance\"").count(),
+		13,
+		"the 11 fields plus the step and its time"
+	);
+	let clear = DrainCapture {
+		maintenance: MaintenanceDetail::NoneSelected,
+		..maintenance
+	};
+	assert_eq!(
+		clear.fields()[11..],
+		[
+			("maintenance_step", 0),
+			("maintenance_step_since_unix_ms", 0)
+		],
+		"a clear word is published as code 0, never omitted"
+	);
 }

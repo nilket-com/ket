@@ -468,6 +468,7 @@ impl RecoveryDriver {
 				// C5: prove inherited winners from this store's own data before
 				// signing for them.
 				reprove_inherited: true,
+				step: None,
 				#[cfg(test)]
 				peer: None,
 			}),

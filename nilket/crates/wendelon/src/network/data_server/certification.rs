@@ -264,6 +264,7 @@ impl WendelonDataServer {
 				// The data server relies on this start's base validation for
 				// the winners it inherits (ADR 0107 C5 keeps that unchanged).
 				reprove_inherited: false,
+				step: Some(maintenance.step()),
 				#[cfg(test)]
 				peer: Some(&self.decisions),
 			}),
@@ -275,6 +276,15 @@ impl WendelonDataServer {
 		let Some(report) = report else {
 			return Ok(());
 		};
+		#[cfg(test)]
+		if self
+			.decisions
+			.skip_next_report
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Ok(());
+		}
+		maintenance.select(crate::network::decision_proposals::MaintenanceStep::CertifyReport);
 		#[cfg(test)]
 		self.decisions
 			.pause_at(super::child_writes::PauseStage::CertificationBeforeReport)
@@ -374,9 +384,22 @@ pub(crate) struct CandidateBuild<'a> {
 	/// Prove the winners inherited from the active base too, once per new
 	/// candidate (a recovered replacement, ADR 0107 C5).
 	pub(crate) reprove_inherited: bool,
+	/// DC-296 (Codex 01a20716): the decision maintenance pass's step word, selected through each
+	/// phase of this build; `None` for any other caller (a recovering replacement), which
+	/// never writes it.
+	pub(crate) step: Option<&'a crate::network::decision_proposals::MaintenanceStepCell>,
 	/// Test-only: the data server's pause seams.
 	#[cfg(test)]
 	pub(crate) peer: Option<&'a super::child_writes::DecisionPeer>,
+}
+
+impl CandidateBuild<'_> {
+	/// DC-296: selects `step` on the decision maintenance pass's word, if this build is its.
+	fn select(&self, step: crate::network::decision_proposals::MaintenanceStep) {
+		if let Some(word) = self.step {
+			word.select(step);
+		}
+	}
 }
 
 /// ADR 0699 S5a, ADR 0107 (wendelon): a store's part in certified generations,
@@ -545,6 +568,7 @@ impl StoreCertification<'_> {
 		let signer = build.repair.signer.clone();
 		let local = signer.signer;
 		let configured_window = build.configured_window_ms;
+		build.select(crate::network::decision_proposals::MaintenanceStep::CertifyClosedSet);
 		let work = self
 			.state_machine
 			.read_state(move |state| {
@@ -647,12 +671,15 @@ impl StoreCertification<'_> {
 		)
 		.then(|| pending.target.retention.floor_hlc())
 		.flatten();
+		build.select(crate::network::decision_proposals::MaintenanceStep::CertifyBuild);
 		let meta = index.base_meta().await?;
 		if meta.active_gid != pending.target.predecessor_gid {
 			return Ok(None);
 		}
 		let gid = pending.target.gid;
 		let built = &self.progress.built_gid;
+		// DC-296: whether this call reuses a candidate this process built (no build, no stage).
+		let mut reused = true;
 		match meta.staged.as_ref() {
 			Some(staged) if staged.gid == gid => {
 				// A candidate recovered from before this start: rebuilt with this
@@ -661,6 +688,7 @@ impl StoreCertification<'_> {
 				// mismatch fails closed: nothing is overwritten and nothing is
 				// reported. This holds whether or not its report is recorded.
 				if built.load(std::sync::atomic::Ordering::Acquire) != gid {
+					reused = false;
 					let (entries, aged) = match self
 						.build_candidate(build, &index, &children, exclusion, aged_floor)
 						.await
@@ -699,6 +727,7 @@ impl StoreCertification<'_> {
 						);
 						return Ok(None);
 					}
+					build.select(crate::network::decision_proposals::MaintenanceStep::CertifyStage);
 					if let Err(refusal) = index.restage_base(staged.clone(), entries, aged).await? {
 						tracing::warn!(
 							?refusal,
@@ -711,6 +740,7 @@ impl StoreCertification<'_> {
 				}
 			}
 			_ => {
+				reused = false;
 				let (entries, aged) = match self
 					.build_candidate(build, &index, &children, exclusion, aged_floor)
 					.await
@@ -734,6 +764,7 @@ impl StoreCertification<'_> {
 						.map(|_| crate::storage::index::certified_base::aged_evidence(&aged)),
 				};
 				let staged = entries.len() as u64;
+				build.select(crate::network::decision_proposals::MaintenanceStep::CertifyStage);
 				if index.stage_base(candidate, entries, aged).await?.is_err() {
 					return Ok(None);
 				}
@@ -744,6 +775,17 @@ impl StoreCertification<'_> {
 		// Report only what is durably staged.
 		if pending.reports.contains_key(&local.node) {
 			return Ok(None);
+		}
+		// DC-296: the staged readback and signature are `CertifyStage` on every path. A reused
+		// candidate selects it here; a path that staged or restaged keeps its selection, and its
+		// time.
+		if reused {
+			build.select(crate::network::decision_proposals::MaintenanceStep::CertifyStage);
+			#[cfg(test)]
+			if let Some(peer) = build.peer {
+				peer.pause_at(super::child_writes::PauseStage::CertificationReusedReadback)
+					.await;
+			}
 		}
 		let meta = index.base_meta().await?;
 		let Some(staged) = meta.staged.filter(|staged| {

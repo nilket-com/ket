@@ -884,3 +884,28 @@ async fn the_previous_builds_lookup_frames_are_refused_before_their_bodies() {
 		"the handler refuses the previous build's request before its body"
 	);
 }
+
+/// DC-296 (Codex 01a20716): the selected-step word. None before any selection, the selected step
+/// and its time after one, and cleared by the owning task's guard; every code is distinct and
+/// reads back as its step.
+#[test]
+fn the_maintenance_step_is_one_word_cleared_by_its_owner() {
+	let word = MaintenanceStepCell::default();
+	assert_eq!(word.selected(), None, "nothing selected yet");
+	word.record_for_test();
+	let clear = word.clear_on_exit();
+	for step in MaintenanceStep::ALL {
+		word.select(step);
+		let (read, since) = word.selected().expect("a selected step");
+		assert_eq!(read, step);
+		assert!(since > 0, "{step:?} carries the time it was selected");
+	}
+	let codes: std::collections::BTreeSet<u64> = MaintenanceStep::ALL
+		.iter()
+		.map(|step| step.code())
+		.collect();
+	assert_eq!(codes, (1..=21).collect(), "codes 1..=21, 0 being none");
+	assert_eq!(word.trace_for_test(), MaintenanceStep::ALL.to_vec());
+	drop(clear);
+	assert_eq!(word.selected(), None, "cleared when the task ends");
+}

@@ -1730,6 +1730,156 @@ pub(crate) async fn until_stopped(
 	}
 }
 
+/// DC-296 (Codex 01a20716): the step decision maintenance's pass had selected, observed by a
+/// drain that times out. Selecting a step happens just before its call; the word says which
+/// call the pass selected and since when, not that the callee is running, waiting for a lock
+/// or holding one, nor for how long. `Head` is the loop's head (no pass admitted: waiting for
+/// a tick, a wake or the stop); `ProbeStop` is the stop having won there (cancelling and
+/// joining the clock probe); `PassEnd` is a finished pass's end hooks (a no-op in production).
+/// The certification step's phases are selected by this pass's own call only (its
+/// `MaintenanceProposals`), never by a recovering replacement's build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceStep {
+	Head,
+	ProbeStop,
+	ClockProbe,
+	Signer,
+	Retention,
+	Floor,
+	Takeover,
+	Resolve,
+	Ctas,
+	RefusedIntents,
+	Generation,
+	Replacement,
+	ValidateBase,
+	/// The certification step entered: its lifecycle permit, then activating a committed
+	/// generation.
+	CertifyActivate,
+	/// The closed set's `read_state` call, its lock acquisition included.
+	CertifyClosedSet,
+	/// The candidate's build and proofs (the base meta, `build_candidate`, the least
+	/// visible row).
+	CertifyBuild,
+	/// The durable stage (or restage) and its signed readback.
+	CertifyStage,
+	/// The report: its proposal and wait, under the stop.
+	CertifyReport,
+	Cleanup,
+	DebtSweep,
+	PassEnd,
+}
+
+impl MaintenanceStep {
+	/// Every step, in its code order: the code is the 1-based position (0: none selected).
+	pub(crate) const ALL: [Self; 21] = [
+		Self::Head,
+		Self::ProbeStop,
+		Self::ClockProbe,
+		Self::Signer,
+		Self::Retention,
+		Self::Floor,
+		Self::Takeover,
+		Self::Resolve,
+		Self::Ctas,
+		Self::RefusedIntents,
+		Self::Generation,
+		Self::Replacement,
+		Self::ValidateBase,
+		Self::CertifyActivate,
+		Self::CertifyClosedSet,
+		Self::CertifyBuild,
+		Self::CertifyStage,
+		Self::CertifyReport,
+		Self::Cleanup,
+		Self::DebtSweep,
+		Self::PassEnd,
+	];
+	const TIME_BITS: u32 = 56;
+
+	/// The published code: the 1-based position in [`Self::ALL`].
+	pub(crate) fn code(self) -> u64 {
+		Self::ALL
+			.iter()
+			.position(|step| *step == self)
+			.map_or(0, |at| at as u64 + 1)
+	}
+
+	fn from_code(code: u64) -> Option<Self> {
+		code.checked_sub(1)
+			.and_then(|at| Self::ALL.get(at as usize))
+			.copied()
+	}
+}
+
+/// DC-296 (Codex 01a20716): one decision maintenance task's selected step, one word (the step's
+/// code in the top byte, the unix ms it was selected below), read without waiting. The task
+/// owns it: it selects each step, and its [`MaintenanceStepClear`] clears the word when the task
+/// returns or is cancelled. A clone is the node's read side, for the drain's timeout branch.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MaintenanceStepCell(Arc<StepWord>);
+
+/// The shared word (one pointer in every build).
+#[derive(Debug, Default)]
+struct StepWord {
+	word: std::sync::atomic::AtomicU64,
+	/// Test-only: every selection, in order, once a control asked for it.
+	#[cfg(test)]
+	trace: std::sync::Mutex<Option<Vec<MaintenanceStep>>>,
+}
+
+impl MaintenanceStepCell {
+	/// The pass selected `step`, now.
+	pub(crate) fn select(&self, step: MaintenanceStep) {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |elapsed| elapsed.as_millis() as u64);
+		let since = now & ((1 << MaintenanceStep::TIME_BITS) - 1);
+		self.0.word.store(
+			(step.code() << MaintenanceStep::TIME_BITS) | since,
+			std::sync::atomic::Ordering::SeqCst,
+		);
+		#[cfg(test)]
+		if let Some(trace) = self.0.trace.lock().unwrap().as_mut() {
+			trace.push(step);
+		}
+	}
+
+	/// The selected step and since when (unix ms); `None` while none is selected (before the
+	/// task's first selection, or after it ended).
+	pub(crate) fn selected(&self) -> Option<(MaintenanceStep, u64)> {
+		let word = self.0.word.load(std::sync::atomic::Ordering::SeqCst);
+		MaintenanceStep::from_code(word >> MaintenanceStep::TIME_BITS)
+			.map(|step| (step, word & ((1 << MaintenanceStep::TIME_BITS) - 1)))
+	}
+
+	/// The owning task's guard: dropped (return or cancellation), it clears the word.
+	pub(crate) fn clear_on_exit(&self) -> MaintenanceStepClear {
+		MaintenanceStepClear(self.0.clone())
+	}
+
+	/// Test-only: records every selection from now on.
+	#[cfg(test)]
+	pub(crate) fn record_for_test(&self) {
+		self.0.trace.lock().unwrap().get_or_insert_with(Vec::new);
+	}
+
+	/// Test-only: the selections recorded so far, in order.
+	#[cfg(test)]
+	pub(crate) fn trace_for_test(&self) -> Vec<MaintenanceStep> {
+		self.0.trace.lock().unwrap().clone().unwrap_or_default()
+	}
+}
+
+/// Clears its task's selected step when dropped.
+pub(crate) struct MaintenanceStepClear(Arc<StepWord>);
+
+impl Drop for MaintenanceStepClear {
+	fn drop(&mut self) {
+		self.0.word.store(0, std::sync::atomic::Ordering::SeqCst);
+	}
+}
+
 /// ADR 0707: decision maintenance's own proposal path, the only one the
 /// maintenance stop cancels. It wraps the whole proposal future: the leader's
 /// admission and `client_write`, or the follower's forward (connect, open,
@@ -1747,14 +1897,31 @@ pub(crate) async fn until_stopped(
 pub(crate) struct MaintenanceProposals<'a> {
 	proposals: &'a DecisionProposals,
 	stop: tokio::sync::watch::Receiver<bool>,
+	/// DC-296: this task's selected step; the certification phases select through it.
+	step: MaintenanceStepCell,
 }
 
 impl<'a> MaintenanceProposals<'a> {
 	pub(crate) fn new(
 		proposals: &'a DecisionProposals,
 		stop: tokio::sync::watch::Receiver<bool>,
+		step: MaintenanceStepCell,
 	) -> Self {
-		Self { proposals, stop }
+		Self {
+			proposals,
+			stop,
+			step,
+		}
+	}
+
+	/// DC-296: this pass selected `step`.
+	pub(crate) fn select(&self, step: MaintenanceStep) {
+		self.step.select(step);
+	}
+
+	/// DC-296: this task's step word, for the certification phases.
+	pub(crate) fn step(&self) -> &MaintenanceStepCell {
+		&self.step
 	}
 
 	/// Sender side, local or forwarded, until the node stops.
