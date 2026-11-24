@@ -8,7 +8,7 @@ tables interacting with DDL fences, vacuum/tiering racing in-flight readers,
 backup holds blocking schema changes, and every new SQL verb demanding its own
 state-machine protocol.
 
-Across the `ParentDecisions` cutover (ADRs 0100, 0112–0125), Wendelon and Toron
+Across the `ParentDecisions` cutover (ADRs 0100, 0112–0127), Wendelon and Toron
 have already built roughly three-quarters of a general LTAP substrate on the
 Unified Ring. Stepping back from individual SQL verbs shows that every
 distributed coordination, ingestion, query, readiness, and background
@@ -18,21 +18,23 @@ hierarchical ring cells `(tenant, table, key_arc)`.
 We call this five-generator structure the **Boron semiring** ($Z = 5$,
 $1s^2\,2s^2\,2p^1$):
 
-- It is an **idempotent semiring with tests**, not a group (projections and
-  `max`-watermarks have no inverses) and not a field (sequential composition is
-  non-commutative and guards are zero divisors).
-- Its five generators split by first-principles operator structure into
-  **$2 + 2 + 1$**: two conjugate abelian subalgebras (`read`, `merge`), one
-  non-abelian universal closure (`update`), and two boundary couplings
-  (`await`, `send`).
+- It is a **trace-enriched idempotent semiring with tests**, not a group
+  (projections, `AppendOnly` logs, and `max`-watermarks have no inverses) and
+  not a field (sequential composition is non-commutative and guards are zero
+  divisors).
+- Its five generators split into **$2 + 2 + 1$**: a monoid-pullback pair of
+  abelian subalgebras (`read`, `merge`), their non-abelian universal closure
+  (`update`), and two boundary couplings (`await`, `send`).
+- Five is **minimal** up to footprint-preserving, progress-preserving, and
+  consensus-cost-preserving observational equivalence.
 
-This note records the algebraic model, its commutation matrix, its reduction
-laws, and how future Wendelon × Toron work harvests it without bespoke
-per-verb protocols.
+This note records the carrier semiring, the pullback and minimality laws, the
+commutation matrix, and how future Wendelon × Toron work harvests them without
+bespoke per-verb protocols.
 
 ---
 
-## 1. Semiring Structure: $\mathcal{B} = (S, \oplus, \cdot, 0, \mathbf{1})$
+## 1. Carrier Semiring: $\mathcal{B} \subseteq \mathcal{P}(\Omega \times \mathcal{R} \times \Omega)$
 
 Let the logical state and outbox configuration space be
 
@@ -41,95 +43,139 @@ $$\Omega = \left(\prod_{c \in \mathcal{C}} X_c\right) \times \mathcal{M}_{\text{
 where $\mathcal{C}$ is the poset of hierarchical ring cells
 `(tenant, table, key_arc)` ordered by containment (a table cell
 `(tenant, T, [-\infty, +\infty))` dominates its key sub-arcs and point keys),
-and $\mathcal{M}_{\text{outbox}}$ is the free commutative monoid (multiset) of
-durable background intents.
+and $\mathcal{M}_{\text{outbox}} \cong \mathbb{N}^{\text{Msg}}$ is the free
+commutative monoid indexed by unique durable intent identities $m \in \text{Msg}$.
 
-Operations live in an **idempotent semiring with tests** (Kozen's *Kleene
-Algebra with Tests*, 1997):
+### Why Plain Relations and Ordered Word Traces Both Fail
 
-- **Choice / union ($\oplus$):** associative, commutative, and idempotent
-  ($A \oplus A = A$).
-- **Sequential composition ($\cdot$):** associative
-  ($A \cdot (B \cdot C) = (A \cdot B) \cdot C$), distributing over $\oplus$,
-  and **non-commutative** in general ($A \cdot B \neq B \cdot A$).
-- **Blocked / empty ($0$):** annihilator for composition
-  ($A \cdot 0 = 0 \cdot A = 0$, $A \oplus 0 = A$).
-- **Identity ($\mathbf{1}$):** state-preserving no-op ($A \cdot \mathbf{1} = \mathbf{1} \cdot A = A$).
+- Plain state relations $\mathcal{P}(\Omega \times \Omega)$ drop caller outputs,
+  collapsing every total `read` $D_g$ onto the identity $\mathbf{1}$.
+- Appending caller outputs to an *ordered* word $u \cdot v \in \mathcal{O}^*$
+  over-orders concurrent observations: $[g(\omega), h(\omega)] \neq
+  [h(\omega), g(\omega)]$ whenever $g(\omega) \neq h(\omega)$, which would
+  falsely break self-commutation between two concurrent reads.
+
+Instead, tag each value-returning invocation by its unique call handle
+$\iota \in \text{CallId}$ and take the response monoid to be finite partial maps
+$\mathcal{R} = \text{FinMap}(\text{CallId}, \text{Val})$ under disjoint-domain
+union $\uplus$. Operations live in $\mathcal{P}(\Omega \times \mathcal{R} \times \Omega)$
+with **left-to-right** sequential composition ($A \cdot B$ means "$A$ then $B$"):
+
+- **Choice / union ($\oplus$):** set union ($A \oplus A = A$).
+- **Sequential composition ($\cdot$):**
+  $$A \cdot B = \{(\omega_0, r_1 \uplus r_2, \omega_2) \mid \exists \omega_1:\;
+  (\omega_0, r_1, \omega_1) \in A \;\land\; (\omega_1, r_2, \omega_2) \in B,\;
+  \text{dom}(r_1) \cap \text{dom}(r_2) = \emptyset\}.$$
+  Associative, distributing over $\oplus$, and **non-commutative** in general.
+- **Blocked / empty ($0 = \emptyset$):** annihilator ($A \cdot 0 = 0 \cdot A = 0$, $A \oplus 0 = A$).
+- **Identity ($\mathbf{1} = \{(\omega, \emptyset, \omega) \mid \omega \in \Omega\}$):**
+  state-preserving, silent no-op.
 - **Boolean test subalgebra ($\mathcal{T} \subseteq [0, \mathbf{1}]$):**
-  diagonal predicates $P \in \mathcal{T}$ with complement $\bar{P} \in \mathcal{T}$
-  satisfying $P \cdot P = P$, $P \oplus \bar{P} = \mathbf{1}$, $P \cdot \bar{P} = 0$,
-  and $P \cdot Q = Q \cdot P$.
+  silent predicates $P = \{(\omega, \emptyset, \omega) \mid \text{pred}(\omega)\}$
+  with complement $\bar{P}$, satisfying $P \cdot P = P$, $P \oplus \bar{P} = \mathbf{1}$,
+  $P \cdot \bar{P} = 0$, and $P \cdot Q = Q \cdot P$.
 
-Working in a semiring avoids inventing artificial "negative executions" just to
-define a Lie bracket:
+Working in this semiring requires no subtraction or artificial "negative
+executions":
 
-- A guarded transition (`if P then C_f else skip`) is written directly as the
-  disjoint sum $P \cdot C_f \oplus \bar{P}$.
-- Commutation is the plain equation **$A \cdot B = B \cdot A$** (identical
-  resulting state and caller return values under both orders).
+- A guarded transition (`if P then C_f else skip`) is the disjoint sum
+  $P \cdot C_f \oplus \bar{P}$.
+- Commutation is the exact semiring equality **$A \cdot B = B \cdot A$**
+  (identical ending state and call-indexed response map under both orders).
 
 ---
 
-## 2. Derivation of the Five Generators ($1s^2\,2s^2\,2p^1$)
+## 2. Derivation and Minimality of the Five Generators ($1s^2\,2s^2\,2p^1$)
 
 Every generator acts nontrivially only on a finite support (footprint) of
 factors, $O = O_F \otimes \mathbf{1}_{\Omega \setminus F}$. Operators with
 disjoint supports commute unconditionally ($F_A \cap F_B = \emptyset \implies
-A \cdot B = B \cdot A$). To classify the primitives, examine how operators act
-on a **single shared cell** $X_c$ and how they couple to blocking and async
-work.
+A \cdot B = B \cdot A$).
 
 ### A. Total Cell Operations: $2s^2 + 2p^1$ (Size 3)
 
-On a single cell $X_c$, total (non-blocking) operations have a state transition
-$\tau: X_c \to X_c$ and a caller return map $\omega: X_c \to Y$:
+On a single cell $X_c$, total (non-blocking) operations split into two
+conjugate abelian families and their closure:
 
-1. **`read(R, K)` — Diagonal subalgebra $\mathcal{D}$ (Consensus #1):**
-   State-preserving ($\tau = \text{id}$), returning $\omega = g(x_R)$. Every
-   diagonal operator commutes with every other diagonal operator
-   ($D_g \cdot D_h = D_h \cdot D_g$). Evaluated at a **closed snapshot cut
-   $K$**, `read(R, K)` is a constant function of committed history $\le K$, so
-   it commutes with every transition ordered after $K$.
+1. **`read(R, K)` — Diagonal observation subalgebra $\mathcal{D}$ (Consensus #1):**
+   $$D_g^{(\iota)} = \{(\omega, \{\iota \mapsto g(\omega_R)\}, \omega) \mid \omega \in \Omega\}.$$
+   State-preserving and total, yet distinct from $\mathbf{1}$ because it records
+   $\iota \mapsto g(\omega_R)$. For distinct calls $\iota_1 \neq \iota_2$,
+   disjoint-map union commutes, so
+   $D_g^{(\iota_1)} \cdot D_h^{(\iota_2)} = D_h^{(\iota_2)} \cdot D_g^{(\iota_1)}$.
+   Evaluated at a **closed snapshot cut $K$**, `read(R, K)` is a constant
+   function of committed history $\le K$, commuting with every transition
+   ordered after $K$.
 2. **`merge(M, id, δ)` — Abelian shift subalgebra $\mathcal{C}$ (Consensus #1):**
-   Applies an associative, commutative transition $x \mapsto x \oplus_M \delta$
-   (deduplicated by `id`) and returns **`()`**.
-   - *Why `merge` must return `()` (discrete Weyl relation):* Diagonal
-     observation $\mathcal{D}$ and shift $\mathcal{C}$ are conjugate
-     ($D_g \cdot C_\delta \neq C_\delta \cdot D_g$ whenever
-     $g(x \oplus_M \delta) \neq g(x)$). Returning pre-state information couples
-     $\mathcal{D}$ and $\mathcal{C}$ in one step (e.g. `fetch_add`), breaking
-     self-commutation on outputs and raising Herlihy's consensus number to $\ge 2$.
+   $$C_\delta = \{(\omega, \emptyset, t_\delta(\omega)) \mid \omega \in \Omega\}, \qquad t_\delta(x) = x \oplus_M \delta$$
+   in a commutative monoid $(X_M, \oplus_M)$ (deduplicated by `id`), emitting
+   the empty response map $\emptyset$ (unit return `()`).
+   - *Pullback duality (no group inverses required):* Unlike the group-theoretic
+     Weyl phase relation, which needs Pontryagin characters and inverses that
+     `AppendOnly` logs and `max`-watermarks lack, `read` and `merge` satisfy the
+     universal **pullback intertwining identity** on any monoid:
+     $$C_\delta \cdot D_g^{(\iota)} = D_{g \circ t_\delta}^{(\iota)} \cdot C_\delta.$$
+     Shifting by $\delta$ then reading $g$ equals reading the pulled-back
+     observable $g \circ t_\delta$ then shifting. In one line:
+     $$C_\delta \cdot D_g^{(\iota)} = D_g^{(\iota)} \cdot C_\delta \iff g \circ t_\delta = g.$$
+   - *Why `merge` must emit $\emptyset$ (`()`):* Any step that both shifts $X_c$
+     and records pre-state in $\mathcal{R}$ (such as `fetch_add`) produces
+     $\{\iota_1 \mapsto x, \iota_2 \mapsto x + 1\} \neq \{\iota_2 \mapsto x,
+     \iota_1 \mapsto x + 1\}$, breaking self-commutation and raising Herlihy's
+     consensus number to $\ge 2$.
    - *Why raw blind `set(v)` is excluded:* An unversioned overwrite register has
-     consensus number $1$ (overwriting erases prior state), yet fails
-     commutation ($\text{set}(u) \cdot \text{set}(v) \neq \text{set}(v) \cdot
-     \text{set}(u)$ for $u \neq v$). Lifting overwrites into timestamped LWW
-     `merge((hlc, node, v))` under $\max$ restores $C_\delta \cdot C_{\delta'} =
-     C_{\delta'} \cdot C_\delta$.
-3. **`update(R, W, id, f)` — Full endomorphism closure ($P_R \cdot C_{f,W} \oplus \bar{P}_R$, Consensus $\infty$):**
-   By Schwinger completeness (finite-dimensional Stone–von Neumann) and
-   Herlihy's universality theorem (1988), combining a diagonal guard/observation
-   on $R$ with a state transition on $W$ generates the entire non-commutative
-   transformation semiring. One universal CAS-equivalent primitive spans all
+     consensus number $1$, yet $\text{set}(u) \cdot \text{set}(v) \neq
+     \text{set}(v) \cdot \text{set}(u)$ for $u \neq v$. Lifting overwrites into
+     timestamped LWW `merge((hlc, node, v))` under $\max$ restores
+     $C_\delta \cdot C_{\delta'} = C_{\delta'} \cdot C_\delta$.
+3. **`update(R, W, id, f)` — Full endomorphism closure ($P_R \cdot C_{f,W}^{(\iota)} \oplus \bar{P}_R$, Consensus $\infty$):**
+   By finite-dimensional operator completeness and Herlihy's universality
+   theorem (1988), combining a diagonal guard/observation on $R$ with a state
+   transition and response on $W$ spans the entire non-commutative
+   transformation semiring. One universal CAS-equivalent primitive handles all
    non-commuting coordination.
 
 ### B. Boundary Couplings: $1s^2$ (Size $3 \to 5$)
 
-Pure single-cell commutation stops at `{read, merge, update}`. Two operational
-distinctions split off the remaining pair:
-
 4. **`await(R, pred)` — Partial test projection ($P_{\text{pred}} \in \mathcal{T}$, Consensus #1):**
-   Has the exact same commutation profile as `read`, separated by
-   **partiality**: states in $\ker P_{\text{pred}}$ evaluate to $0$ (blocking
-   the caller) until another transition moves $X_R$ into $\text{im} P_{\text{pred}}$.
-5. **`send(m)` — Outbox monoid emission ($\mathbf{1}_{\text{cells}} \otimes a^\dagger_m$, Consensus #1):**
-   Appends durable intent $m$ to $\mathcal{M}_{\text{outbox}}$
-   ($S \mapsto S \uplus \{m\}$). Algebraically a `merge` on the outbox factor,
-   separated so `update` can emit async work atomically
-   ($U_{\text{cells}} \otimes a^\dagger_m$) without causing two cell-disjoint
-   `update`s to conflict on the shared outbox:
-   $$(U_1 \otimes a^\dagger_{m_1}) \cdot (U_2 \otimes a^\dagger_{m_2}) = (U_1 \cdot U_2) \otimes a^\dagger_{\{m_1, m_2\}}.$$
-   Subsequent consumption by a background worker ($a_m \otimes V$) inherits the
-   footprint and consensus number of $V$.
+   Shares the diagonal commutation profile of `read`, separated by
+   **partiality** (and silent response $\emptyset$): states in
+   $\ker P_{\text{pred}}$ map to $0$, suspending the caller until another
+   transition moves $X_R$ into $\text{im} P_{\text{pred}}$.
+5. **`send(m)` — Outbox token emission ($\mathbf{1}_{\text{cells}} \otimes a^\dagger_m$, Consensus #1):**
+   Increments coordinate $m$ in $\mathcal{M}_{\text{outbox}} \cong \mathbb{N}^{\text{Msg}}$
+   while emitting $\emptyset$ in $\mathcal{R}$. Separating $\mathcal{M}_{\text{outbox}}$
+   from ordinary cells $c \in \mathcal{C}$ achieves **two** non-interference
+   properties simultaneously:
+   - *Producer–producer commutation:* $(U_1 \otimes a^\dagger_{m_1}) \cdot
+     (U_2 \otimes a^\dagger_{m_2}) = (U_1 \cdot U_2) \otimes a^\dagger_{\{m_1, m_2\}}$,
+     so disjoint `update`s emitting intents never conflict on the outbox.
+   - *Producer–consumer commutation:* For distinct message tokens $m_1 \neq m_2$,
+     emitting $m_2$ acts on coordinate $m_2$ while background consumption
+     $V \otimes a_{m_1}$ acts on coordinate $m_1$ plus $V$'s cells:
+     $$(\mathbf{1} \otimes a^\dagger_{m_2}) \cdot (V \otimes a_{m_1}) = (V \otimes a_{m_1}) \cdot (\mathbf{1} \otimes a^\dagger_{m_2}) \qquad (m_1 \neq m_2).$$
+     If `send` were simulated by `merge` onto a shared queue cell
+     $c_{\text{outbox}} \in \mathcal{C}$, a sweeper acknowledging $m_1$ via
+     `update` on $c_{\text{outbox}}$ would conflict with every concurrent
+     foreground writer emitting $m_2$. In Wendelon, durable intents must
+     therefore be keyed as independent per-message tokens (such as
+     `(parent_key, ordinal)`), never as a monolithic per-slab or per-table queue
+     cell.
+
+### C. Five-Generator Minimality
+
+In raw relational semantics without cost or footprint constraints, `update`
+alone could simulate `read` and `merge`, `await` would be a partial guard, and
+`send` would be a cell mutation. All five generators become **strictly
+irreducible** under **footprint-preserving, progress-preserving, and
+consensus-cost-preserving observational equivalence ($\equiv$)**:
+
+| Collapse Blocked | Invariant Preserved by $\equiv$ | Why Dropping the Generator Fails |
+|---|---|---|
+| `{read, merge, await, send}` $\to$ `update` | Consensus / coordination cost ($1$ vs. $\infty$) | Simulating consensus-$1$ ops via `update` destroys self-commutation and serializes scalable paths through Raft. |
+| `read` $\leftrightarrow$ `merge` | State purity ($\tau = \text{id}$) vs. silent shift ($\mathcal{R} = \emptyset$) | Coupling observation and shift breaks $C_{\delta_1} \cdot C_{\delta_2} = C_{\delta_2} \cdot C_{\delta_1}$ on $\mathcal{R}$ and jumps to consensus $\ge 2$. |
+| `read` $\leftrightarrow$ `await` | Totality (wait-free return vs. partial $0$ on $\ker P$) | Total ops cannot suspend on $\ker P$ without busy-spinning; `await` returns $\emptyset$ and blocks until `pred` holds. |
+| `merge` $\leftrightarrow$ `send` | Producer–consumer footprint non-interference | Merging into a cell $c \in \mathcal{C}$ makes consumer ack/pop (`update` on $c$) collide with concurrent producers emitting $m_2 \neq m_1$. |
 
 ---
 
@@ -137,29 +183,29 @@ distinctions split off the remaining pair:
 
 ### Table 1: The Five Boron Generators
 
-| Subshell | Generator | Semiring / Tensor Form | Cell Footprint | Consensus # | Current & Target Nilket Realization |
+| Subshell | Generator | Semiring Form ($A \cdot B$ = "$A$ then $B$") | Cell Footprint | Consensus # | Current & Target Nilket Realization |
 |---|---|---|---|---|---|
-| **$2s^2$** *(Weyl pair)* | **`read(R, K)`** | $D_g \otimes \mathbf{1}$ *(total diagonal)* | Guard $R$ *(empty vs. $>K$ once pinned to closed cut $K$)* | **1** | Snapshot scan/lookup over `certified_base@B` + `Accepted` in $(B, K]$; COCD pushdown; lockless export. |
-| **$2s^2$** *(Weyl pair)* | **`merge(M, id, δ)`** | $C_\delta \otimes \mathbf{1}$ *(abelian shift, unit return)* | Merge $M_\oplus$ *(plus guard `table.live`)* | **1** | `AppendOnly` row batches (ADR 0119, commuting under `(op, pos)`), monotone `max` cut watermarks. |
-| **$2p^1$** *(Closure)* | **`update(R, W, id, f)`** | $(P_R \cdot C_{f,W} \oplus \bar{P}_R) \otimes \mathbf{1}$ | Guard $R \setminus W$, Write $W$ | **$\infty$** | `ParentDecisions` `Reserve` $\to$ `Finalize`, PK writes, `DELETE` (0112), `DROP` (0118), `CTAS` (0120), transactions. |
-| **$1s^2$** *(Boundary)* | **`await(R, pred)`** | $P_{\text{pred}} \otimes \mathbf{1}$ *(partial test $P^2=P$)* | Guard $R$ | **1** | Local cut-activation wait (`DC-281`), lease-gate wait (`ADR 0713`), reader-drain barriers. |
-| **$1s^2$** *(Boundary)* | **`send(m)`** | $\mathbf{1} \otimes a^\dagger_m$ *(outbox union)* | Outbox $\mathcal{M}_{\text{outbox}}$ *(zero cell footprint)* | **1** | Durable cleanup/tier/compaction intents, retention debt, CDC emission. |
+| **$2s^2$** *(Pullback pair)* | **`read(R, K)`** | $D_g^{(\iota)} \otimes \mathbf{1}$ *(total diagonal)* | Guard $R$ *(empty vs. $>K$ once pinned to closed cut $K$)* | **1** | Snapshot scan/lookup over `certified_base@B` + `Accepted` in $(B, K]$; COCD pushdown; lockless export. |
+| **$2s^2$** *(Pullback pair)* | **`merge(M, id, δ)`** | $C_\delta \otimes \mathbf{1}$ *(monoid shift, $\mathcal{R}=\emptyset$)* | Merge $M_\oplus$ *(plus guard `table.live`)* | **1** | `AppendOnly` row batches (ADR 0119, commuting under `(op, pos)`), monotone `max` cut watermarks. |
+| **$2p^1$** *(Closure)* | **`update(R, W, id, f)`** | $(P_R \cdot C_{f,W}^{(\iota)} \oplus \bar{P}_R) \otimes \mathbf{1}$ | Guard $R \setminus W$, Write $W$ | **$\infty$** | `ParentDecisions` `Reserve` $\to$ `Finalize`, PK writes, `DELETE` (0112), `DROP` (0118), `CTAS` (0120), transactions. |
+| **$1s^2$** *(Boundary)* | **`await(R, pred)`** | $P_{\text{pred}} \otimes \mathbf{1}$ *(partial test, $\mathcal{R}=\emptyset$)* | Guard $R$ | **1** | Local cut-activation wait (`DC-281`), lease-gate wait (`ADR 0713`), reader-drain barriers. |
+| **$1s^2$** *(Boundary)* | **`send(m)`** | $\mathbf{1} \otimes a^\dagger_m$ *(per-token outbox, $\mathcal{R}=\emptyset$)* | Token $m \in \mathcal{M}_{\text{outbox}}$ *(zero cell footprint)* | **1** | Durable cleanup/tier/compaction intents, retention debt, CDC emission. |
 
 ### Table 2: Same-Cell Commutation ($A \cdot B \stackrel{?}{=} B \cdot A$ on Shared Cell $c$)
 
-Disjoint cells always commute (`=`). When two operations touch a shared cell or
-overlapping `(tenant, table, key_arc)`, split `update(R, W, ...)` into its
-**guard factors** ($c \in R \setminus W$, where it acts diagonally in
-$\mathcal{T}$) and its **write factors** ($c \in W$):
+Disjoint cells always commute (`=`). When two operations with distinct call
+handles ($\iota_1 \neq \iota_2$) touch a shared cell or overlapping
+`(tenant, table, key_arc)`, split `update(R, W, ...)` into its **guard factors**
+($c \in R \setminus W$, acting diagonally) and its **write factors** ($c \in W$):
 
-| Shared cell $c$ | `read` ($D_g$) | `await` ($P$) | `merge` ($C_\delta$) | `update` guard ($c \in R \setminus W$) | `update` write ($c \in W$) | `send` ($a^\dagger_m$) |
+| Shared cell $c$ | `read` ($D_g^{(\iota_2)}$) | `await` ($P$) | `merge` ($C_\delta$) | `update` guard ($c \in R \setminus W$) | `update` write ($c \in W$) | `send` ($a^\dagger_m$) |
 |---|---|---|---|---|---|---|
-| **`read` ($D_g$)** | **`=`** *(pinned $@K$: `=` w/ all $>K$)* | **`=`** | `≠` *(unless $g(x\oplus\delta)=g(x)$)* | **`=`** | `≠` *(unless $g \circ f = g$)* | **`=`** |
+| **`read` ($D_g^{(\iota_1)}$)** | **`=`** *(pinned $@K$: `=` w/ all $>K$)* | **`=`** | `≠` *(unless $g \circ t_\delta = g$)* | **`=`** | `≠` *(unless $g \circ f = g$)* | **`=`** |
 | **`await` ($P$)** | **`=`** | **`=`** | `≠` *(wakes/blocks if $\delta$ flips $P$)* | **`=`** | `≠` *(if $f$ flips $P$)* | **`=`** |
 | **`merge` ($C_\delta$)** | `≠` | `≠` | **`=`** *(same abelian $\oplus$, distinct `id`)* | `≠` *(invalidates scanned range)* | `≠` | **`=`** |
 | **`update` guard ($R \setminus W$)** | **`=`** | **`=`** | `≠` | **`=`** *(shared guards commute)* | `≠` | **`=`** |
 | **`update` write ($W$)** | `≠` | `≠` | `≠` | `≠` | `≠` *(requires consensus order)* | **`=`** |
-| **`send` ($a^\dagger_m$)** | **`=`** | **`=`** | **`=`** | **`=`** | **`=`** | **`=`** *(until $a_m \otimes V$)* |
+| **`send` ($a^\dagger_m$)** | **`=`** | **`=`** | **`=`** | **`=`** | **`=`** | **`=`** *(and `=` w/ $a_{m'} \otimes V$ for $m \neq m'$)* |
 
 ---
 
@@ -174,14 +220,16 @@ merges all reading `table.state == live` **commute with one another** on the
 therefore conflicting cleanly with every concurrent write to that table without
 visiting a single row (ADR 0114, ADR 0118).
 
-### Law 2: Merge Invalidates Scanned Guards
-In row 3, column 4 of Table 2, `merge` commutes with `merge` (`=`), **not** with
-an `update` guard (`≠`). If a certifying `update` relies on a range or
-predicate scan over `arc`, an intervening `AppendOnly` `merge` or row insert
-into `arc` alters that predicate and must fail certification. Also, logical
-commutation of distinct `AppendOnly` contributions under `(op, position)`
-requires retries of the same `id` to carry identical content and does not by
-itself make the current replication transport consensus-free.
+### Law 2: Pullback Invalidation of Scanned Guards by `merge`
+By $C_\delta \cdot D_g^{(\iota)} = D_{g \circ t_\delta}^{(\iota)} \cdot C_\delta$
+(row 3, column 4 of Table 2), `merge` commutes with `merge` (`=`), **not** with
+an `update` guard (`≠`) unless the guard predicate is invariant under $t_\delta$.
+If a certifying `update` relies on a range or predicate scan over `arc`, an
+intervening `AppendOnly` `merge` or row insert into `arc` alters that predicate
+and must fail certification. Also, logical commutation of distinct `AppendOnly`
+contributions under `(op, position)` requires retries of the same `id` to carry
+identical content and does not by itself make the current replication transport
+consensus-free.
 
 ### Law 3: Spacetime-Arc Certification (General Transactions Without Lock Tables)
 A transaction that reads `R_arcs` at closed cut $K$ (resolved from certified
@@ -221,13 +269,15 @@ bytes in $H_1$ and $H_2$:
    fences when logical state has not changed.
 
 ### Law 5: Semiring Fusion
-- **Merge batching:** $C_{\delta_1} \cdot C_{\delta_2} = C_{\delta_1 \oplus \delta_2}$
+- **Merge batching:** $C_{\delta_1} \cdot C_{\delta_2} = C_{\delta_1 \oplus_M \delta_2}$
   coalesces commuting `AppendOnly` batches and `max`-cut watermarks.
-- **Cut sharing (lockless multi-table backup):** $D_g^{(K)} \cdot D_h^{(K)} = D_{(g,h)}^{(K)}$.
-  Pinning **one** common retained cut $K$ across catalog/settings, secondary
-  indexes, and all table scans turns logical backup into a pure `read(R_all, K)`,
-  retiring `BeginBackupHold` / `ReleaseBackupHold` while upgrading exports from
-  per-table cuts $K_i \ge R$ to a single cross-table snapshot.
+- **Cut sharing (lockless multi-table backup):**
+  $D_g^{(\iota_1, K)} \cdot D_h^{(\iota_2, K)}$ evaluates against one pinned cut
+  $K$. Sharing **one** common retained cut $K$ across catalog/settings,
+  secondary indexes, and all table scans turns logical backup into a pure
+  snapshot read, retiring `BeginBackupHold` / `ReleaseBackupHold` while
+  upgrading exports from per-table cuts $K_i \ge R$ to a single cross-table
+  snapshot.
 
 ---
 
