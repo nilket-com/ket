@@ -212,9 +212,12 @@ pub(crate) mod deletes;
 pub(crate) mod reader;
 pub(crate) mod repair;
 mod table_query;
+// Wendelon ADR 0129: the tenant admission policy, its cache and its lookups.
+mod tenant_policy;
 use table_query::{
 	QueryProjectedExecution, RowGroupFetchAuditCounters, TableQueryResponseStreamWriter,
 };
+use tenant_policy::TenantPolicyCacheState;
 pub(crate) mod child_writes;
 pub(crate) mod coordinator;
 pub(crate) mod lease_evidence;
@@ -482,33 +485,6 @@ enum PointReadOutcome {
 	Hit(RecordLocation, Vec<u8>),
 	AuthoritativeMiss,
 	Incomplete,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CachedTenantPolicy {
-	state: TenantLifecycleState,
-	quota_bytes: u64,
-	used_bytes: u64,
-	replication_factor: u32,
-	mean_write_size_bytes: u64,
-}
-
-impl Default for CachedTenantPolicy {
-	fn default() -> Self {
-		Self {
-			state: TenantLifecycleState::Creating,
-			quota_bytes: 0,
-			used_bytes: 0,
-			replication_factor: 0,
-			mean_write_size_bytes: 1,
-		}
-	}
-}
-
-#[derive(Debug, Default)]
-struct TenantPolicyCacheState {
-	policies: HashMap<TenantId, CachedTenantPolicy>,
-	last_refresh: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -2658,155 +2634,12 @@ impl WendelonDataServer {
 		Ok(report)
 	}
 
-	pub async fn sync_tenant_policy_cache_once(&self) -> usize {
-		let snapshot = self.state_machine.state_snapshot().await;
-		let mut guard = recover_rwlock_write(&self.tenant_policy_cache, "tenant_policy_cache");
-		let mut next = HashMap::with_capacity(snapshot.tenants.len());
-		for (tenant_id, record) in snapshot.tenants {
-			let mean_write_size_bytes = guard
-				.policies
-				.get(&tenant_id)
-				.map(|cached| cached.mean_write_size_bytes)
-				.unwrap_or(1)
-				.max(1);
-			next.insert(
-				tenant_id,
-				CachedTenantPolicy {
-					state: record.state,
-					quota_bytes: record.quota_bytes,
-					used_bytes: record.used_bytes,
-					replication_factor: record.replication_factor,
-					mean_write_size_bytes,
-				},
-			);
-		}
-		guard.policies = next;
-		guard.last_refresh = Some(Instant::now());
-		guard.policies.len()
-	}
-
-	pub fn spawn_tenant_policy_reconciler(self: Arc<Self>, tick: Duration) -> JoinHandle<()> {
-		tokio::spawn(async move {
-			let _ = self.sync_tenant_policy_cache_once().await;
-			let mut ticker = tokio::time::interval(tick);
-			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-			loop {
-				ticker.tick().await;
-				let _ = self.sync_tenant_policy_cache_once().await;
-			}
-		})
-	}
-
 	/// Shared handle to the lease cache. The lease manager writes
 	/// to it; the write/read paths read from it. Exposed so the
 	/// manager task (which lives in a separate module) can take an
 	/// `Arc` without poking at private fields.
 	pub fn lease_cache(&self) -> Arc<RwLock<Vec<LeaseDescriptor>>> {
 		self.leases.clone()
-	}
-
-	async fn ensure_tenant_policy_fresh(&self) {
-		let refresh_needed = {
-			let guard = recover_rwlock_read(&self.tenant_policy_cache, "tenant_policy_cache");
-			guard
-				.last_refresh
-				.is_none_or(|last| last.elapsed() >= self.tenant_cache_refresh_interval)
-		};
-		if refresh_needed {
-			let _ = self.sync_tenant_policy_cache_once().await;
-		}
-	}
-
-	async fn cached_tenant_policy(&self, tenant_id: TenantId) -> Option<CachedTenantPolicy> {
-		self.ensure_tenant_policy_fresh().await;
-		recover_rwlock_read(&self.tenant_policy_cache, "tenant_policy_cache")
-			.policies
-			.get(&tenant_id)
-			.copied()
-	}
-
-	async fn enforce_write_policy(
-		&self,
-		tenant_id: TenantId,
-		estimated_bytes: u64,
-	) -> Result<TenantWriteReservation, WriteStatus> {
-		let Some(policy) = self.cached_tenant_policy(tenant_id).await else {
-			return Err(WriteStatus::TENANT_UNAVAILABLE);
-		};
-		match policy.state {
-			TenantLifecycleState::Active => {}
-			TenantLifecycleState::Suspended => return Err(WriteStatus::TENANT_SUSPENDED),
-			TenantLifecycleState::Creating
-			| TenantLifecycleState::Deleting
-			| TenantLifecycleState::Deleted => return Err(WriteStatus::TENANT_UNAVAILABLE),
-		}
-		if policy.used_bytes >= policy.quota_bytes {
-			return Err(WriteStatus::QUOTA_EXCEEDED);
-		}
-
-		let inflight = self
-			.tenant_inflight
-			.get(&tenant_id)
-			.map(|entry| *entry.value())
-			.unwrap_or_default();
-		if inflight.count >= DEFAULT_TENANT_MAX_INFLIGHT_WRITES {
-			return Err(WriteStatus::QUOTA_EXCEEDED);
-		}
-		let mean_write_size = policy.mean_write_size_bytes.max(estimated_bytes).max(1);
-		let overshoot_budget =
-			(DEFAULT_TENANT_MAX_INFLIGHT_WRITES as u64).saturating_mul(mean_write_size);
-		let projected = policy
-			.used_bytes
-			.saturating_add(inflight.bytes)
-			.saturating_add(estimated_bytes);
-		if projected > policy.quota_bytes.saturating_add(overshoot_budget) {
-			return Err(WriteStatus::QUOTA_EXCEEDED);
-		}
-
-		self.tenant_inflight
-			.entry(tenant_id)
-			.and_modify(|entry| {
-				entry.count = entry.count.saturating_add(1);
-				entry.bytes = entry.bytes.saturating_add(estimated_bytes);
-			})
-			.or_insert(TenantInflight {
-				count: 1,
-				bytes: estimated_bytes,
-			});
-		Ok(TenantWriteReservation {
-			inflight: self.tenant_inflight.clone(),
-			tenant_id,
-			bytes: estimated_bytes,
-			active: true,
-		})
-	}
-
-	async fn enforce_read_policy(&self, tenant_id: TenantId) -> Result<(), ReadStatus> {
-		let Some(policy) = self.cached_tenant_policy(tenant_id).await else {
-			return Err(ReadStatus::TENANT_UNAVAILABLE);
-		};
-		if policy.state.allows_reads() {
-			return Ok(());
-		}
-		Err(ReadStatus::TENANT_UNAVAILABLE)
-	}
-
-	fn note_committed_write(&self, tenant_id: TenantId, charged_bytes: u64) {
-		let mut guard = recover_rwlock_write(&self.tenant_policy_cache, "tenant_policy_cache");
-		let Some(policy) = guard.policies.get_mut(&tenant_id) else {
-			return;
-		};
-		// Conservatively anticipate the next reconciler sweep so a
-		// freshly-committed local write tightens quota admission
-		// immediately instead of waiting for the authoritative cache
-		// refresh.
-		policy.used_bytes = policy.used_bytes.saturating_add(charged_bytes);
-		policy.mean_write_size_bytes = if policy.mean_write_size_bytes == 0 {
-			charged_bytes.max(1)
-		} else {
-			((policy.mean_write_size_bytes.saturating_mul(7)).saturating_add(charged_bytes)) / 8
-		}
-		.max(1);
 	}
 
 	fn idempotency_key_for(

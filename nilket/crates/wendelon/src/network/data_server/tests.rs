@@ -18470,6 +18470,9 @@ mod tenant_cache;
 #[path = "tests/pending_tenant/tests.rs"]
 mod pending_tenant;
 
+#[path = "tests/tenant_policy_miss/tests.rs"]
+mod tenant_policy_miss;
+
 #[path = "counter_visibility/tests.rs"]
 mod counter_visibility_tests;
 

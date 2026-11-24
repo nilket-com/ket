@@ -9500,6 +9500,9 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"scan_accounting.rs",
 			"streaming.rs",
 			"table_query.rs",
+			// Wendelon ADR 0129: a member's tenant admission policy (its cache, its
+			// refresh and its read and write admissions), one mechanism, out of the root.
+			"tenant_policy.rs",
 			"write_clocks.rs",
 			// ADR 0714: the gate between a coordinated table write attempt and its
 			// caller's deadline, and the early answer a stream handler joins with
@@ -9660,15 +9663,16 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// examined count it reports; moving it would split the observation from the
 /// state transition it describes. ADR 0102 F-CTR-5b carved the per-tenant
 /// counter-leader factory into `counter.rs`, and the cap ratchets down to
-/// the size that left (16_287).
+/// the size that left (16_287). Wendelon ADR 0129 carved the tenant admission
+/// policy into `tenant_policy.rs`, and the cap ratchets down again (16_120).
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 16_287,
-		"data_server.rs root is {lines} lines (cap 16_287); carve more or justify a deliberate cap bump"
+		lines <= 16_120,
+		"data_server.rs root is {lines} lines (cap 16_120); carve more or justify a deliberate cap bump"
 	);
 }
 
