@@ -24,6 +24,25 @@ use super::coordinator::Settled;
 
 use super::child_writes::ChildRefusal;
 
+pub(crate) mod attempts;
+
+tokio::task_local! {
+	/// DC-290: the frame-in-hand reading of the table write this task is serving, set only by
+	/// a tracing node.
+	static FRAME_READING: Instant;
+}
+
+/// DC-290: `work` with `received` as its frame reading; untouched when there is none.
+pub(crate) async fn in_frame_scope<F: std::future::Future>(
+	received: Option<Instant>,
+	work: F,
+) -> F::Output {
+	match received {
+		Some(received) => FRAME_READING.scope(received, work).await,
+		None => work.await,
+	}
+}
+
 /// The records a trace keeps; older ones are overwritten and counted.
 pub(crate) const CAPACITY: usize = 16;
 
@@ -322,6 +341,8 @@ pub(crate) struct WriteStallSnapshot {
 	pub(crate) records: Vec<WriteStallRecord>,
 	/// Wendelon ADR 0127: each kept record's lease evidence, aligned with `records`.
 	pub(crate) leases: Vec<Option<super::lease_evidence::LeaseEvidence>>,
+	/// DC-290: the answered attempts kept beside them.
+	pub(crate) attempts: attempts::WriteAttemptSnapshot,
 }
 
 impl WriteStallSnapshot {
@@ -345,6 +366,8 @@ pub(crate) struct WriteStallTrace {
 	ring: std::sync::Mutex<Ring>,
 	/// Wendelon ADR 0127 D1: the issue witness of this node's own lease renewals.
 	pub(crate) leases: super::lease_evidence::LeaseWitness,
+	/// DC-290: the last answered attempts, whatever their answer.
+	pub(crate) attempts: attempts::WriteAttemptRing,
 }
 
 impl WriteStallTrace {
@@ -353,6 +376,7 @@ impl WriteStallTrace {
 			node,
 			ring: Default::default(),
 			leases: Default::default(),
+			attempts: Default::default(),
 		})
 	}
 
@@ -390,6 +414,7 @@ impl WriteStallTrace {
 			recorded: ring.recorded,
 			records,
 			leases,
+			attempts: self.attempts.snapshot(),
 		}
 	}
 }
@@ -425,6 +450,12 @@ pub(crate) struct AttemptTrace<'a> {
 		WriteStallRecord,
 		Option<Box<super::lease_evidence::LeaseEvidence>>,
 	)>,
+	/// DC-290: the request frame in hand, when the caller read one.
+	received: Option<Instant>,
+	/// DC-290: the children's start with their count, and their return.
+	children: std::sync::OnceLock<(Instant, u16)>,
+	children_done: std::sync::OnceLock<Instant>,
+	lookups: std::sync::atomic::AtomicU8,
 }
 
 impl<'a> AttemptTrace<'a> {
@@ -436,6 +467,10 @@ impl<'a> AttemptTrace<'a> {
 			trace: trace.map(|trace| (trace, Instant::now())),
 			meta,
 			held: std::sync::OnceLock::new(),
+			received: None,
+			children: std::sync::OnceLock::new(),
+			children_done: std::sync::OnceLock::new(),
+			lookups: std::sync::atomic::AtomicU8::new(0),
 		}
 	}
 
@@ -447,11 +482,97 @@ impl<'a> AttemptTrace<'a> {
 	/// Publishes the held stall when `answered`, the attempt's own result that became its
 	/// response, is that stall. A deadline answer (`None`) publishes nothing.
 	pub(crate) fn publish_if_answered(self, answered: Option<Settled>) {
-		let (Some((trace, _)), Some((record, lease))) = (self.trace, self.held.into_inner()) else {
+		let Some((trace, entered)) = self.trace else {
+			return;
+		};
+		// DC-290: every attempt whose own result was its answer, with its spans.
+		if let Some(settled) = &answered {
+			trace.attempts.push(self.attempt_record(entered, settled));
+		}
+		let Some((record, lease)) = self.held.into_inner() else {
 			return;
 		};
 		if answered == Some(Settled::Indeterminate(WriteStatus::WRITE_STALLED)) {
 			trace.push(record, lease);
+		}
+	}
+
+	/// DC-290: takes the frame reading of the task serving this attempt ([`in_frame_scope`]),
+	/// only when this node traces.
+	pub(crate) fn with_frame_reading(self) -> Self {
+		let received = self
+			.trace
+			.and_then(|_| FRAME_READING.try_with(|received| *received).ok());
+		self.received(received)
+	}
+
+	/// DC-290: this attempt's frame reading, kept only when this node traces.
+	pub(crate) fn received(mut self, received: Option<Instant>) -> Self {
+		self.received = received.filter(|_| self.trace.is_some());
+		self
+	}
+
+	/// DC-290: a Lookup was answered.
+	pub(crate) fn looked_up(&self) {
+		if self.trace.is_some() {
+			let _ = self.lookups.fetch_update(
+				std::sync::atomic::Ordering::Relaxed,
+				std::sync::atomic::Ordering::Relaxed,
+				|n| Some(n.saturating_add(1)),
+			);
+		}
+	}
+
+	/// Whether any DC-290 mark, count or frame reading is held.
+	#[cfg(test)]
+	pub(crate) fn any_mark_for_test(&self) -> bool {
+		self.received.is_some()
+			|| self.children.get().is_some()
+			|| self.children_done.get().is_some()
+			|| self.lookups.load(std::sync::atomic::Ordering::Relaxed) != 0
+	}
+
+	/// DC-290: the children of this attempt's claim start. Marked once.
+	pub(crate) fn children_start(&self, children: usize) {
+		if self.trace.is_some() {
+			let _ = self
+				.children
+				.set((Instant::now(), u16::try_from(children).unwrap_or(u16::MAX)));
+		}
+	}
+
+	/// DC-290: the children returned. Marked once.
+	pub(crate) fn children_end(&self) {
+		if self.trace.is_some() {
+			let _ = self.children_done.set(Instant::now());
+		}
+	}
+
+	/// The four spans at this answer: marks never taken leave their spans zero, and the time
+	/// up to the answer goes to the last span begun.
+	fn attempt_record(&self, entered: Instant, settled: &Settled) -> attempts::WriteAttemptRecord {
+		let answered = Instant::now();
+		let started = self.children.get().copied();
+		let done = self.children_done.get().copied();
+		let (coord_before, children_span, coord_after) =
+			attempts::spans(entered, started.map(|(start, _)| start), done, answered);
+		let (outcome, status) = attempts::outcome_of(settled);
+		attempts::WriteAttemptRecord {
+			seq: 0,
+			client_uuid: self.meta.parent_write_id.client_uuid,
+			sequence_no: self.meta.parent_write_id.sequence_no,
+			attempts_remaining: self.meta.attempts_remaining(),
+			outcome,
+			status,
+			lookups: self.lookups.load(std::sync::atomic::Ordering::Relaxed),
+			children: started.map(|(_, children)| children),
+			pre: self
+				.received
+				.map(|received| entered.saturating_duration_since(received)),
+			coord_before,
+			children_span,
+			coord_after,
+			at_unix_ms: unix_ms_now(),
 		}
 	}
 
@@ -499,14 +620,29 @@ impl<'a> AttemptTrace<'a> {
 				holder,
 				acks: u32::try_from(acks).unwrap_or(u32::MAX),
 				elapsed: entered.elapsed(),
-				at_unix_ms: std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.map_or(0, |since| {
-						u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-					}),
+				at_unix_ms: unix_ms_now(),
 			},
 			lease,
 		));
+	}
+}
+
+fn unix_ms_now() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_or(0, |since| {
+			u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+		})
+}
+
+impl super::WendelonDataServer {
+	/// DC-290: a monotonic reading with a request frame in hand, taken only when this node
+	/// traces; `None` otherwise (no clock reading).
+	pub(crate) fn frame_reading(&self) -> Option<Instant> {
+		self.decisions
+			.write_stall_trace
+			.is_some()
+			.then(Instant::now)
 	}
 }
 

@@ -9507,6 +9507,9 @@ fn adr077_data_server_source_concatenates_submodules() {
 			// so one module.
 			"write_deadline.rs",
 			"write_replication.rs",
+			// DC-290: the answered attempts the same opt-in trace keeps, with their four
+			// spans (observation only); a submodule of the stalled record's, out of the root.
+			"attempts.rs",
 			// DC-287: an opt-in, bounded record of each coordinated write attempt answered
 			// WRITE_STALLED (observation only), kept out of the bounded root.
 			"write_stall_trace.rs",

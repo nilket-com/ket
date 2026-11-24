@@ -588,6 +588,7 @@ fn render_write_stall_traces(
 			}
 		}
 	}
+	render_write_attempts(out, traces);
 	// Wendelon ADR 0127 D4: only records that carry lease evidence; nothing otherwise.
 	let with_lease = traces
 		.iter()
@@ -609,6 +610,62 @@ fn render_write_stall_traces(
 			};
 			let slot = ((record.seq - 1) % CAPACITY as u64).to_string();
 			for (field, value) in lease.fields() {
+				render_gauge_with_labels(
+					out,
+					family,
+					&[("node", &node), ("slot", &slot), ("field", field)],
+					value,
+				);
+			}
+		}
+	}
+}
+
+/// DC-290: each tracing node's answered write attempts: its totals, then each kept attempt by
+/// its ring slot.
+fn render_write_attempts(
+	out: &mut String,
+	traces: &[(
+		u32,
+		crate::network::data_server::write_stall_trace::WriteStallSnapshot,
+	)],
+) {
+	use crate::network::data_server::write_stall_trace::attempts::CAPACITY;
+	let family = "wendelon_data_ring_write_attempt_trace";
+	render_gauge_family_header(
+		out,
+		family,
+		"A node's opt-in record of ParentDecisions table write attempts whose own result was their answer, whatever the answer (ordinary table writes only; an attempt answered by its caller's deadline is not recorded): recorded ever, retained, overwritten, and the ring capacity.",
+	);
+	for (node, snapshot) in traces {
+		let node = node.to_string();
+		let attempts = &snapshot.attempts;
+		for (field, value) in [
+			("recorded", attempts.recorded),
+			("retained", attempts.records.len() as u64),
+			("overwritten", attempts.overwritten()),
+			("capacity", CAPACITY as u64),
+		] {
+			render_gauge_with_labels(out, family, &[("node", &node), ("field", field)], value);
+		}
+	}
+	if traces
+		.iter()
+		.all(|(_, snapshot)| snapshot.attempts.records.is_empty())
+	{
+		return;
+	}
+	let family = "wendelon_data_ring_write_attempt";
+	render_gauge_family_header(
+		out,
+		family,
+		"One retained answered attempt, by ring slot: its sequence, the write identity, the wire attempts remaining, the answered outcome (1 committed, 2 known not committed, 3 redirect, 4 indeterminate, 5 refused, 6 deadline) and wire status, the Lookups answered, the children reached, and four contiguous monotonic spans in microseconds: the frame in hand to the coordinator's entry (when known), the entry to the children's start, the children, and their return to the answer; then the wall clock.",
+	);
+	for (node, snapshot) in traces {
+		let node = node.to_string();
+		for record in &snapshot.attempts.records {
+			let slot = ((record.seq - 1) % CAPACITY as u64).to_string();
+			for (field, value) in record.fields() {
 				render_gauge_with_labels(
 					out,
 					family,
@@ -8681,4 +8738,60 @@ fn a_fully_populated_lease_evidence_scrape_is_measured() {
 		text.len().saturating_sub(base)
 	);
 	drop(trace);
+}
+
+/// DC-290 (Codex 01a20ba5): the answered-attempt families render only for a published trace;
+/// a full ring's scrape delta is measured with every value at its widest.
+#[cfg(test)]
+#[test]
+fn a_full_answered_attempt_ring_scrape_is_measured() {
+	use crate::network::data_server::coordinator::Settled;
+	use crate::network::data_server::write_stall_trace::attempts::CAPACITY;
+	use crate::network::data_server::write_stall_trace::{AttemptTrace, WriteStallTrace};
+	let registry = isolated_for_test();
+	assert!(!registry.render_prometheus().contains("write_attempt"));
+	let trace = WriteStallTrace::new(u32::MAX);
+	registry.publish_write_stall_trace(&trace);
+	let empty = registry.render_prometheus();
+	assert!(empty.contains(&format!(
+		"wendelon_data_ring_write_attempt_trace{{node=\"{}\",field=\"recorded\"}} 0\n",
+		u32::MAX
+	)));
+	assert!(!empty.contains("wendelon_data_ring_write_attempt{"));
+	let mut meta: crate::schema::TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	meta.parent_write_id.client_uuid = [0xff; 16];
+	meta.set_attempts_remaining(3);
+	for n in 0..CAPACITY as u64 + 3 {
+		meta.parent_write_id.sequence_no = u64::MAX - n;
+		let attempt =
+			AttemptTrace::enter(Some(&trace), &meta).received(Some(std::time::Instant::now()));
+		attempt.children_start(usize::from(u16::MAX));
+		attempt.children_end();
+		attempt.publish_if_answered(Some(Settled::Indeterminate(
+			crate::schema::WriteStatus::WRITE_STALLED,
+		)));
+	}
+	let text = registry.render_prometheus();
+	let records: Vec<usize> = text
+		.lines()
+		.filter(|line| line.starts_with("wendelon_data_ring_write_attempt{"))
+		.map(|line| line.len() + 1)
+		.collect();
+	assert_eq!(records.len(), CAPACITY * 19, "nineteen fields a record");
+	assert!(text.contains(&format!(
+		"wendelon_data_ring_write_attempt_trace{{node=\"{}\",field=\"overwritten\"}} 3\n",
+		u32::MAX
+	)));
+	let delta = text.len() - empty.len();
+	// The spans here are near zero; a span of an hour adds at most 9 digits to each of four
+	// fields a record.
+	let widest = delta + CAPACITY * 4 * 9;
+	eprintln!(
+		"DC290 scrape: full ring {} series lines, {} B of them, delta {delta} B over an empty trace, at most {widest} B with hour-long spans",
+		records.len(),
+		records.iter().sum::<usize>()
+	);
+	assert!(widest <= 64 * 1024, "{widest}");
+	drop(trace);
+	assert!(!registry.render_prometheus().contains("write_attempt"));
 }

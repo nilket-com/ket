@@ -346,6 +346,8 @@ impl WendelonDataServer {
 		frame: HrftFrame,
 		early: Option<EarlyAnswer>,
 	) -> std::io::Result<HrftFrame> {
+		// DC-290 (observation only): read only when this node traces.
+		let received = self.frame_reading();
 		let (meta, payload) = self.decode_table_write_request_frame(&frame)?;
 		let span = tracing::info_span!(
 			"data_ring.table_write.request",
@@ -360,9 +362,12 @@ impl WendelonDataServer {
 			write_sequence = meta.parent_write_id.sequence_no,
 		);
 		// ADR 0727: on the heap (see `serve_table_write_stream`).
-		let (resp, trailing) = Box::pin(
-			self.table_write_answering(meta, payload, early)
-				.instrument(span),
+		let (resp, trailing) = super::write_stall_trace::in_frame_scope(
+			received,
+			Box::pin(
+				self.table_write_answering(meta, payload, early)
+					.instrument(span),
+			),
 		)
 		.await?;
 		let resp = self.finalize_table_write_attempt(meta, resp).await?;

@@ -96,7 +96,24 @@ fn a_stall_that_is_not_the_answer_is_not_published() {
 	// An attempt that decided no stall publishes nothing even if the answer is a stall.
 	AttemptTrace::enter(Some(&trace), &meta)
 		.publish_if_answered(Some(Settled::Indeterminate(WriteStatus::WRITE_STALLED)));
-	assert_eq!(trace.snapshot(), WriteStallSnapshot::default());
+	let snapshot = trace.snapshot();
+	assert_eq!(
+		(
+			snapshot.recorded,
+			snapshot.records.len(),
+			snapshot.leases.len()
+		),
+		(0, 0, 0)
+	);
+	// DC-290: the three attempts with an answer of their own are kept as answered attempts,
+	// each with its outcome; the one a deadline answered is not.
+	let outcomes: Vec<u8> = snapshot
+		.attempts
+		.records
+		.iter()
+		.map(|record| record.outcome)
+		.collect();
+	assert_eq!(outcomes, [6, 2, 4]);
 	answered(&trace, &meta, stall);
 	assert_eq!(trace.snapshot().recorded, 1, "the positive counterpart");
 }

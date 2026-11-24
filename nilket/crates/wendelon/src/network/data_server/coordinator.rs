@@ -489,7 +489,8 @@ impl WendelonDataServer {
 		// DC-287 (observation only): an ordinary table write is traced when this node traces; a
 		// CTAS chunk is not. A node without a trace takes no reading here.
 		let traced = self.decisions.write_stall_trace.as_deref();
-		let attempt = AttemptTrace::enter(traced.filter(|_| dispatch.is_none()), &meta);
+		let attempt =
+			AttemptTrace::enter(traced.filter(|_| dispatch.is_none()), &meta).with_frame_reading();
 		let mut given = None;
 		let settled = answer_by_deadline(
 			&gate,
@@ -709,6 +710,7 @@ impl WendelonDataServer {
 					sent_ms: proposals.now_ms(),
 				})
 				.await;
+			attempt.looked_up();
 			match lookup {
 				LookupResponse::Found(Lookup::Recorded { record }) => match record.status {
 					ParentStatus::Accepted { dec } => {
@@ -989,6 +991,7 @@ impl WendelonDataServer {
 			} else {
 				RetirementWait::NONE
 			};
+		attempt.children_start(claim.children.len());
 		let (acks, holder, lease) = self
 			.write_children(
 				&claim,
@@ -999,6 +1002,7 @@ impl WendelonDataServer {
 				retirement_wait,
 			)
 			.await;
+		attempt.children_end();
 		let carried = acks.len();
 		#[cfg(test)]
 		self.decisions
