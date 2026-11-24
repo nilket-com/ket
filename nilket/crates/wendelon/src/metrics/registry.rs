@@ -588,6 +588,36 @@ fn render_write_stall_traces(
 			}
 		}
 	}
+	// Wendelon ADR 0127 D4: only records that carry lease evidence; nothing otherwise.
+	let with_lease = traces
+		.iter()
+		.any(|(_, snapshot)| snapshot.leases.iter().any(Option::is_some));
+	if !with_lease {
+		return;
+	}
+	let family = "wendelon_data_ring_write_stall_lease";
+	render_gauge_family_header(
+		out,
+		family,
+		"The lease evidence of a retained WRITE_STALLED attempt whose first local holder refusal was LeaseMissing, by the same ring slot: the refusing check, its own reads (sampled time, epochs, applied index, at most two rows of this holder with their predicates and digests), the row class, and the agreement or later issue its node's renewal witness held at the observation's cutoff. Every 64-bit value is two 32-bit words.",
+	);
+	for (node, snapshot) in traces {
+		let node = node.to_string();
+		for (record, lease) in snapshot.records.iter().zip(&snapshot.leases) {
+			let Some(lease) = lease else {
+				continue;
+			};
+			let slot = ((record.seq - 1) % CAPACITY as u64).to_string();
+			for (field, value) in lease.fields() {
+				render_gauge_with_labels(
+					out,
+					family,
+					&[("node", &node), ("slot", &slot), ("field", field)],
+					value,
+				);
+			}
+		}
+	}
 }
 
 fn render_lifecycle_drain_timeouts(
@@ -8543,4 +8573,112 @@ fn a_published_write_stall_trace_renders_totals_and_records_until_dropped() {
 	));
 	drop(trace);
 	assert!(!registry.render_prometheus().contains("write_stall"));
+}
+
+/// Wendelon ADR 0127 D4: a fully populated trace, every retained Finalize carrying a
+/// maximum-width lease evidence, rendered by the production renderer: the lease family's
+/// actual series and bytes (reported in the review packet), and nothing of it without evidence.
+#[test]
+fn a_fully_populated_lease_evidence_scrape_is_measured() {
+	use crate::network::data_server::lease_evidence::{
+		Agreement, Hlc, IssueOutcome, LaterIssue, LeaseEvidence, LeaseSite, Provenance, RowClass,
+		RowFacts, VerifyState,
+	};
+	use crate::network::data_server::write_stall_trace::{
+		AttemptTrace, CAPACITY, HolderSeen, StallAnswer, WriteStallTrace,
+	};
+	let registry = isolated_for_test();
+	let trace = WriteStallTrace::new(u32::MAX);
+	registry.publish_write_stall_trace(&trace);
+	let wide = Hlc {
+		physical_ms: u64::MAX,
+		logical: u32::MAX,
+		node_id: u32::MAX,
+	};
+	let row = RowFacts {
+		range_start: u64::MAX,
+		range_end: u64::MAX,
+		epoch: u64::MAX,
+		holder: u32::MAX,
+		issuer: u32::MAX,
+		start: wide,
+		expiry: wide,
+		digest: [0xff; 32],
+		filter_live: true,
+		verify: VerifyState::Failed,
+		covered: true,
+		epoch_dec: true,
+	};
+	let evidence = LeaseEvidence {
+		site: LeaseSite::Stripe,
+		cutoff: u64::MAX,
+		now_ms: u64::MAX,
+		e_view: Some(u64::MAX),
+		e_dec: Some(u64::MAX),
+		applied_index: Some(u64::MAX),
+		target: (u64::MAX, u64::MAX),
+		actual: (u64::MAX, u64::MAX),
+		hint_matches: true,
+		truncated: true,
+		overlapping: u8::MAX,
+		rows: [Some(row), Some(row)],
+		class: RowClass::Withheld,
+		provenance: Some(Provenance {
+			complete_from: Some(u64::MAX),
+			agree: Some(Agreement {
+				ticket: u64::MAX,
+				retained_matches: u8::MAX,
+				outcome: IssueOutcome::Unanswered,
+			}),
+			later: Some(LaterIssue {
+				ticket: u64::MAX,
+				request: wide,
+				outcome: IssueOutcome::Unanswered,
+			}),
+		}),
+	};
+	let lease_lines = |text: &str| {
+		text.lines()
+			.filter(|line| line.starts_with("wendelon_data_ring_write_stall_lease{"))
+			.map(|line| line.len() + 1)
+			.collect::<Vec<_>>()
+	};
+	let mut meta: crate::schema::TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	// Without evidence, the family is absent.
+	let attempt = AttemptTrace::enter(Some(&trace), &meta);
+	let settled = attempt.stall_finalize(|| StallAnswer::STATE, HolderSeen::default(), 0, None);
+	attempt.publish_if_answered(Some(settled));
+	assert!(
+		!registry
+			.render_prometheus()
+			.contains("wendelon_data_ring_write_stall_lease")
+	);
+	let base = registry.render_prometheus().len();
+	for n in 0..CAPACITY as u64 {
+		meta.parent_write_id.sequence_no = n;
+		let attempt = AttemptTrace::enter(Some(&trace), &meta);
+		let settled = attempt.stall_finalize(
+			|| StallAnswer::STATE,
+			HolderSeen::default(),
+			0,
+			Some(Box::new(evidence)),
+		);
+		attempt.publish_if_answered(Some(settled));
+	}
+	let text = registry.render_prometheus();
+	let lines = lease_lines(&text);
+	let fields = evidence.fields().len();
+	assert_eq!(
+		lines.len(),
+		CAPACITY * fields,
+		"one series per field per slot"
+	);
+	let bytes: usize = lines.iter().sum();
+	eprintln!(
+		"ADR0127 scrape: {fields} fields per evidence; {} lease series, {bytes} B of series lines for {CAPACITY} slots ({} B per slot, widest values); the whole render grew by {} B over a one-record trace",
+		lines.len(),
+		bytes / CAPACITY,
+		text.len().saturating_sub(base)
+	);
+	drop(trace);
 }

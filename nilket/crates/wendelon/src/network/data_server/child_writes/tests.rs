@@ -544,6 +544,7 @@ fn authority_with_leases(
 				}
 			})
 		})),
+		lease_evidence: None,
 		before_sign: None,
 	}
 }

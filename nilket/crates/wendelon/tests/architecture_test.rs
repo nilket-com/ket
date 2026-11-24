@@ -9469,6 +9469,8 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"descriptor_migration.rs",
 			// ADR 0701: a ParentDecisions holder's batched lease renewal.
 			"lease_batch.rs",
+			// Wendelon ADR 0127: what a traced holder lease refusal's own reads saw.
+			"lease_evidence.rs",
 			// ADR 0734: one renewal pass, its budget and its continuation.
 			"lease_pass.rs",
 			// ADR 542's durable outcome/replay wire is one named protocol seam;

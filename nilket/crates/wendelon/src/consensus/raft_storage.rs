@@ -4300,6 +4300,21 @@ struct SnapshotRuntime {
 	/// apply answers, so before the leader proposes the uniform step.
 	#[cfg(test)]
 	after_joint_membership: Arc<std::sync::Mutex<Option<Box<dyn FnOnce(LogId<u32>) + Send>>>>,
+	/// Test-only (DC-287 lease control), this state machine's own: a one-shot hold of the live
+	/// apply of the next batch holding an `AcquireLeases` entry, BEFORE the state lock is taken,
+	/// so readers of the applied state are never blocked by it.
+	#[cfg(test)]
+	before_lease_batch_apply: Arc<std::sync::Mutex<Option<LeaseApplyHold>>>,
+}
+
+/// Test-only (DC-287 lease control): see [`WendelonStateMachine::hold_next_lease_batch_apply_for_test`].
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct LeaseApplyHold {
+	/// The held `AcquireLeases` entry's log id, set at the hold's entry.
+	pub(crate) log_id: Arc<std::sync::Mutex<Option<LogId<u32>>>>,
+	pub(crate) entered: Arc<tokio::sync::Notify>,
+	pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 impl SnapshotRuntime {
@@ -4321,6 +4336,8 @@ impl SnapshotRuntime {
 			after_state_publication: Arc::new(std::sync::Mutex::new(None)),
 			#[cfg(test)]
 			after_joint_membership: Arc::new(std::sync::Mutex::new(None)),
+			#[cfg(test)]
+			before_lease_batch_apply: Arc::new(std::sync::Mutex::new(None)),
 		}
 	}
 
@@ -4979,6 +4996,21 @@ impl WendelonStateMachine {
 	/// Runs `hook` once, with the entry's log id, right after this state
 	/// machine's live apply of its next joint membership entry, before that
 	/// apply answers.
+	/// Test-only (DC-287 lease control): holds the live apply of the next batch that carries an
+	/// `AcquireLeases` entry, after Raft handed it to this state machine (so after its commit)
+	/// and before the state lock is taken. `entered` is notified with the entry's log id set;
+	/// apply proceeds on `release`.
+	#[cfg(test)]
+	pub(crate) fn hold_next_lease_batch_apply_for_test(&self) -> LeaseApplyHold {
+		let hold = LeaseApplyHold::default();
+		*self
+			.snapshot_runtime
+			.before_lease_batch_apply
+			.lock()
+			.unwrap() = Some(hold.clone());
+		hold
+	}
+
 	#[cfg(test)]
 	pub(crate) fn on_next_joint_membership_for_test(
 		&self,
@@ -5554,6 +5586,37 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		let mut pending_key_authority: Option<crate::crypto::KeyAuthority> = None;
 		let mut pending_finalizations: Vec<FinalizationMarker> = Vec::new();
 		let mut pending_drop_settlements: Vec<TableDropSettlementRequest> = Vec::new();
+		// DC-287 lease control (test-only): the held batch waits here, before the state lock.
+		#[cfg(test)]
+		let entries: Vec<Entry<WendelonTypeConfig>> = {
+			let entries: Vec<Entry<WendelonTypeConfig>> = entries.into_iter().collect();
+			let lease_entry = entries
+				.iter()
+				.find(|entry| {
+					matches!(
+						entry.payload,
+						EntryPayload::Normal(WendelonRequest::AcquireLeases(_))
+					)
+				})
+				.map(|entry| entry.log_id);
+			if let Some(log_id) = lease_entry {
+				let hold = self
+					.snapshot_runtime
+					.before_lease_batch_apply
+					.lock()
+					.unwrap()
+					.take();
+				if let Some(hold) = hold {
+					*hold.log_id.lock().unwrap() = Some(log_id);
+					let released = hold.release.notified();
+					tokio::pin!(released);
+					released.as_mut().enable();
+					hold.entered.notify_one();
+					released.await;
+				}
+			}
+			entries
+		};
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			for entry in entries {

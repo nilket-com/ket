@@ -497,6 +497,7 @@ pub(crate) async fn repair_child_in(
 				signer: signer.clone(),
 				role: ChildRole::Repair,
 				leases: None,
+				lease_evidence: None,
 				#[cfg(test)]
 				before_sign: None,
 			},

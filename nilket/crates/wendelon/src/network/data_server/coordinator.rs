@@ -989,7 +989,7 @@ impl WendelonDataServer {
 			} else {
 				RetirementWait::NONE
 			};
-		let (acks, holder) = self
+		let (acks, holder, lease) = self
 			.write_children(
 				&claim,
 				rsv,
@@ -1036,7 +1036,7 @@ impl WendelonDataServer {
 			} => Settled::KnownNotCommitted,
 			other => {
 				diag!("finalize: {other:?} with {} acks", claim.children.len());
-				attempt.stall_finalize(|| StallAnswer::of_proposal(&other), holder, carried)
+				attempt.stall_finalize(|| StallAnswer::of_proposal(&other), holder, carried, lease)
 			}
 		}
 	}
@@ -1052,10 +1052,16 @@ impl WendelonDataServer {
 		batch: &RecordBatch,
 		child_rows: &[Vec<u32>],
 		retirement_wait: RetirementWait,
-	) -> (Vec<Signed<ChildAckBody>>, HolderSeen) {
+	) -> (
+		Vec<Signed<ChildAckBody>>,
+		HolderSeen,
+		Option<Box<super::lease_evidence::LeaseEvidence>>,
+	) {
 		let digest = crate::consensus::decisions::claim_digest(claim);
 		let mut acks = Vec::new();
 		let mut holder = HolderSeen::default();
+		// Wendelon ADR 0127 D4: the lease evidence of the first recorded local refusal, if any.
+		let mut lease = None;
 		for (ordinal, (child, rows)) in claim.children.iter().zip(child_rows).enumerate() {
 			let Ok(sub) = arrow::compute::take_record_batch(
 				batch,
@@ -1087,6 +1093,7 @@ impl WendelonDataServer {
 				},
 			);
 			if child.holder.node == self.local_node.id {
+				let sink = self.lease_evidence_sink((child.range_start, child.range_end));
 				match self
 					.holder_write(
 						self.local_node.id,
@@ -1095,6 +1102,7 @@ impl WendelonDataServer {
 						Arc::new(rows_bytes),
 						trailing,
 						retirement_wait,
+						sink.clone(),
 					)
 					.await
 				{
@@ -1102,7 +1110,11 @@ impl WendelonDataServer {
 						holder.acked = true;
 						acks.extend(own);
 					}
-					Err(refusal) => holder.refused(&refusal),
+					Err(refusal) => {
+						if holder.refused(&refusal) {
+							lease = sink.and_then(|sink| sink.take());
+						}
+					}
 				}
 			} else if let Ok(meta_bytes) = postcard::to_stdvec(&meta) {
 				let response = super::child_writes::send_child_frame_with_trailing(
@@ -1126,7 +1138,7 @@ impl WendelonDataServer {
 				}
 			}
 		}
-		(acks, holder)
+		(acks, holder, lease)
 	}
 
 	/// Wendelon ADR 0120 D6: an authenticated CTAS chunk write. The credential is

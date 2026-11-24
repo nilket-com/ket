@@ -126,7 +126,7 @@ fn a_finalize_stall_keeps_the_local_holder_refusal_or_says_it_is_unknown() {
 		),
 	] {
 		answered(&trace, &meta, |attempt| {
-			attempt.stall_finalize(pending, holder, acks)
+			attempt.stall_finalize(pending, holder, acks, None)
 		});
 	}
 	let records = trace.snapshot().records;

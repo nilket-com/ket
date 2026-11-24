@@ -208,8 +208,11 @@ pub(crate) struct HolderSeen {
 }
 
 impl HolderSeen {
-	pub(crate) fn refused(&mut self, refusal: &ChildRefusal) {
+	/// Keeps the first local holder refusal; true when `refusal` is that first one.
+	pub(crate) fn refused(&mut self, refusal: &ChildRefusal) -> bool {
+		let first = self.refusal.is_none();
 		self.refusal.get_or_insert(refusal.code());
+		first
 	}
 
 	/// Exported: 1 unknown (no local holder answer observed), 2 a local holder wrote its child
@@ -317,6 +320,8 @@ fn variant_index<T: serde::Serialize>(value: &T) -> u64 {
 pub(crate) struct WriteStallSnapshot {
 	pub(crate) recorded: u64,
 	pub(crate) records: Vec<WriteStallRecord>,
+	/// Wendelon ADR 0127: each kept record's lease evidence, aligned with `records`.
+	pub(crate) leases: Vec<Option<super::lease_evidence::LeaseEvidence>>,
 }
 
 impl WriteStallSnapshot {
@@ -330,12 +335,16 @@ impl WriteStallSnapshot {
 struct Ring {
 	recorded: u64,
 	slots: [Option<WriteStallRecord>; CAPACITY],
+	/// Wendelon ADR 0127: the lease evidence of the record in the same slot, if any.
+	leases: [Option<Box<super::lease_evidence::LeaseEvidence>>; CAPACITY],
 }
 
 /// One node's trace.
 pub(crate) struct WriteStallTrace {
 	node: u32,
 	ring: std::sync::Mutex<Ring>,
+	/// Wendelon ADR 0127 D1: the issue witness of this node's own lease renewals.
+	pub(crate) leases: super::lease_evidence::LeaseWitness,
 }
 
 impl WriteStallTrace {
@@ -343,6 +352,7 @@ impl WriteStallTrace {
 		Arc::new(Self {
 			node,
 			ring: Default::default(),
+			leases: Default::default(),
 		})
 	}
 
@@ -350,21 +360,36 @@ impl WriteStallTrace {
 		self.node
 	}
 
-	fn push(&self, mut record: WriteStallRecord) {
+	fn push(
+		&self,
+		mut record: WriteStallRecord,
+		lease: Option<Box<super::lease_evidence::LeaseEvidence>>,
+	) {
 		let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
 		ring.recorded += 1;
 		record.seq = ring.recorded;
 		let slot = ((record.seq - 1) % CAPACITY as u64) as usize;
 		ring.slots[slot] = Some(record);
+		ring.leases[slot] = lease;
 	}
 
 	pub(crate) fn snapshot(&self) -> WriteStallSnapshot {
 		let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-		let mut records: Vec<WriteStallRecord> = ring.slots.iter().flatten().copied().collect();
-		records.sort_by_key(|record| record.seq);
+		let mut kept: Vec<(
+			WriteStallRecord,
+			Option<super::lease_evidence::LeaseEvidence>,
+		)> = ring
+			.slots
+			.iter()
+			.zip(&ring.leases)
+			.filter_map(|(record, lease)| record.map(|record| (record, lease.as_deref().copied())))
+			.collect();
+		kept.sort_by_key(|(record, _)| record.seq);
+		let (records, leases) = kept.into_iter().unzip();
 		WriteStallSnapshot {
 			recorded: ring.recorded,
 			records,
+			leases,
 		}
 	}
 }
@@ -396,7 +421,10 @@ impl super::WendelonDataServer {
 pub(crate) struct AttemptTrace<'a> {
 	trace: Option<(&'a WriteStallTrace, Instant)>,
 	meta: &'a TableWriteRequestMeta,
-	held: std::sync::OnceLock<WriteStallRecord>,
+	held: std::sync::OnceLock<(
+		WriteStallRecord,
+		Option<Box<super::lease_evidence::LeaseEvidence>>,
+	)>,
 }
 
 impl<'a> AttemptTrace<'a> {
@@ -419,29 +447,31 @@ impl<'a> AttemptTrace<'a> {
 	/// Publishes the held stall when `answered`, the attempt's own result that became its
 	/// response, is that stall. A deadline answer (`None`) publishes nothing.
 	pub(crate) fn publish_if_answered(self, answered: Option<Settled>) {
-		let (Some((trace, _)), Some(record)) = (self.trace, self.held.into_inner()) else {
+		let (Some((trace, _)), Some((record, lease))) = (self.trace, self.held.into_inner()) else {
 			return;
 		};
 		if answered == Some(Settled::Indeterminate(WriteStatus::WRITE_STALLED)) {
-			trace.push(record);
+			trace.push(record, lease);
 		}
 	}
 
 	/// The stalled answer from `site`, held when this node traces; `answer` is read only then.
 	pub(crate) fn stall(&self, site: StallSite, answer: impl FnOnce() -> StallAnswer) -> Settled {
-		self.record(site, answer, None, 0);
+		self.record(site, answer, None, 0, None);
 		Settled::Indeterminate(WriteStatus::WRITE_STALLED)
 	}
 
 	/// The stalled answer of a Finalize, with what the local holders answered and the
-	/// acknowledgements it carried.
+	/// acknowledgements it carried, and (Wendelon ADR 0127) the first local
+	/// holder refusal's lease evidence, if one was recorded.
 	pub(crate) fn stall_finalize(
 		&self,
 		answer: impl FnOnce() -> StallAnswer,
 		holder: HolderSeen,
 		acks: usize,
+		lease: Option<Box<super::lease_evidence::LeaseEvidence>>,
 	) -> Settled {
-		self.record(StallSite::Finalize, answer, Some(holder), acks);
+		self.record(StallSite::Finalize, answer, Some(holder), acks, lease);
 		Settled::Indeterminate(WriteStatus::WRITE_STALLED)
 	}
 
@@ -451,28 +481,32 @@ impl<'a> AttemptTrace<'a> {
 		answer: impl FnOnce() -> StallAnswer,
 		holder: Option<HolderSeen>,
 		acks: usize,
+		lease: Option<Box<super::lease_evidence::LeaseEvidence>>,
 	) {
 		let Some((_, entered)) = self.trace else {
 			return;
 		};
 		let answer = answer();
 		// One stall per attempt: each is returned as soon as it is decided.
-		let _ = self.held.set(WriteStallRecord {
-			seq: 0,
-			client_uuid: self.meta.parent_write_id.client_uuid,
-			sequence_no: self.meta.parent_write_id.sequence_no,
-			attempts_remaining: self.meta.attempts_remaining(),
-			site,
-			answer,
-			holder,
-			acks: u32::try_from(acks).unwrap_or(u32::MAX),
-			elapsed: entered.elapsed(),
-			at_unix_ms: std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map_or(0, |since| {
-					u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-				}),
-		});
+		let _ = self.held.set((
+			WriteStallRecord {
+				seq: 0,
+				client_uuid: self.meta.parent_write_id.client_uuid,
+				sequence_no: self.meta.parent_write_id.sequence_no,
+				attempts_remaining: self.meta.attempts_remaining(),
+				site,
+				answer,
+				holder,
+				acks: u32::try_from(acks).unwrap_or(u32::MAX),
+				elapsed: entered.elapsed(),
+				at_unix_ms: std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map_or(0, |since| {
+						u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+					}),
+			},
+			lease,
+		));
 	}
 }
 

@@ -1011,22 +1011,41 @@ pub(crate) fn applied_leases(
 	local: u32,
 	now_ms: u64,
 ) -> Vec<crate::schema::LeaseDescriptor> {
-	let Some((_, config)) = state.epoch_history.last_key_value() else {
-		return Vec::new();
-	};
+	scan_applied_leases(state, local, now_ms, |_, _| {})
+}
+
+/// The one scan behind [`applied_leases`]: each of `local`'s rows is passed to `visit` with the
+/// view's own filter result (the current epoch, and `HLC(now, 0, 0) < lease_expiry`, the full
+/// HLC comparison), and the rows it admits are returned. Wendelon ADR 0127 D2: a traced holder
+/// read captures inside this same pass, reusing the same result.
+pub(crate) fn scan_applied_leases(
+	state: &SmState,
+	local: u32,
+	now_ms: u64,
+	mut visit: impl FnMut(&crate::schema::LeaseDescriptor, bool),
+) -> Vec<crate::schema::LeaseDescriptor> {
+	let epoch = state
+		.epoch_history
+		.last_key_value()
+		.map(|(_, config)| config.epoch);
 	let now = HybridTimestamp {
 		physical_ms: now_ms,
 		logical: 0,
 		node_id: 0,
 	};
-	state
+	let mut live = Vec::new();
+	for lease in state
 		.leases
 		.values()
-		.filter(|lease| {
-			lease.holder.id == local && lease.epoch == config.epoch && now < lease.lease_expiry
-		})
-		.copied()
-		.collect()
+		.filter(|lease| lease.holder.id == local)
+	{
+		let admitted = Some(lease.epoch) == epoch && now < lease.lease_expiry;
+		visit(lease, admitted);
+		if admitted {
+			live.push(*lease);
+		}
+	}
+	live
 }
 
 pub(crate) type LeaseSource = Arc<
@@ -1042,6 +1061,9 @@ pub(crate) struct ChildAuthority {
 	pub(crate) signer: Arc<DecisionSigner>,
 	pub(crate) role: ChildRole,
 	pub(crate) leases: Option<LeaseSource>,
+	/// Wendelon ADR 0127 D2: the coordinator's local holder child, traced: where its first
+	/// `LeaseMissing` evidence goes, with the capturing lease view.
+	pub(crate) lease_evidence: Option<Arc<super::lease_evidence::LeaseEvidenceSink>>,
 	/// Test-only pause after persistence and before the final check and
 	/// signature: `(reached, release)`.
 	#[cfg(test)]
@@ -1204,14 +1226,29 @@ async fn holder_authority(
 	if !open {
 		return Err(ChildRefusal::LineageClosed);
 	}
-	let leases = match &authority.leases {
-		Some(source) => source().await,
-		None => Vec::new(),
-	};
 	let (start, end) = (plan.intent.range_start, plan.intent.range_end);
+	// Wendelon ADR 0127 D2: a traced local holder child reads the same lease view, captured,
+	// after the same epoch and lineage read.
+	let (leases, capture) = match (&authority.lease_evidence, &authority.leases) {
+		(Some(sink), _) => {
+			let (leases, capture) = (sink.source)((start, end)).await;
+			(leases, Some(capture))
+		}
+		(None, Some(source)) => (source().await, None),
+		(None, None) => (Vec::new(), None),
+	};
 	if !leases.iter().any(|(low, high, lease_epoch)| {
 		Some(*lease_epoch) == epoch && *low <= start && end <= *high
 	}) {
+		if let (Some(sink), Some(capture)) = (&authority.lease_evidence, &capture) {
+			sink.offer(super::lease_evidence::LeaseEvidence::build(
+				super::lease_evidence::LeaseSite::Stripe,
+				capture,
+				epoch,
+				(start, end),
+				sink.lease_witness(),
+			));
+		}
 		return Err(ChildRefusal::LeaseMissing);
 	}
 	Ok(())
@@ -1626,6 +1663,14 @@ pub(crate) struct DecisionPeer {
 	#[cfg(test)]
 	pub(crate) hold_lease_answer:
 		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+	/// Test-only (wendelon ADR 0127): the next own lease batch names a generation its lineage
+	/// does not have, so the leader's apply denies it per target (a valid results vector).
+	#[cfg(test)]
+	pub(crate) skew_lease_generation: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (wendelon ADR 0127): the next own lease batch's answer, after its real apply,
+	/// is treated as a results vector that does not match its leases.
+	#[cfg(test)]
+	pub(crate) malformed_lease_results: Arc<std::sync::atomic::AtomicBool>,
 	/// Test-only: a KV key read as if at another position, the seam for a
 	/// different key at the same position.
 	#[cfg(test)]
@@ -1836,6 +1881,10 @@ impl Default for DecisionPeer {
 			pause_takeover: Default::default(),
 			#[cfg(test)]
 			hold_lease_answer: Default::default(),
+			#[cfg(test)]
+			skew_lease_generation: Default::default(),
+			#[cfg(test)]
+			malformed_lease_results: Default::default(),
 			#[cfg(test)]
 			kv_position_override: Default::default(),
 		}
@@ -2096,13 +2145,22 @@ impl WendelonDataServer {
 		rows: Arc<Vec<u8>>,
 		trailing: Arc<Vec<u8>>,
 		wait: RetirementWait,
+		lease_evidence: Option<Arc<super::lease_evidence::LeaseEvidenceSink>>,
 	) -> Result<
 		Vec<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>>,
 		ChildRefusal,
 	> {
 		let given = GivenKeys::of_section(&trailing);
 		match self
-			.child_write_keyed(sender, ChildRole::Holder, meta.clone(), batch, given, wait)
+			.child_write_keyed(
+				sender,
+				ChildRole::Holder,
+				meta.clone(),
+				batch,
+				given,
+				wait,
+				lease_evidence,
+			)
 			.await
 		{
 			Ok(own) => {
@@ -2312,6 +2370,64 @@ impl WendelonDataServer {
 		})
 	}
 
+	/// Wendelon ADR 0127 D2: [`Self::lease_source`] with its capture, for a traced node. The same
+	/// sampled time, the same read and the same verification loop, in the same order; the
+	/// observation's cutoff ticket is taken before the read, and the capture inside it.
+	fn captured_lease_source(
+		&self,
+		trace: &Arc<super::write_stall_trace::WriteStallTrace>,
+	) -> super::lease_evidence::CapturedLeaseSource {
+		let (state_machine, clock, authority, local, trace) = (
+			self.state_machine.clone(),
+			self.clock.clone(),
+			self.lease_authority.clone(),
+			self.local_node.id,
+			trace.clone(),
+		);
+		Arc::new(move |target| {
+			let (state_machine, clock, authority, trace) = (
+				state_machine.clone(),
+				clock.clone(),
+				authority.clone(),
+				trace.clone(),
+			);
+			Box::pin(async move {
+				let now_ms = clock.now_ms();
+				let cutoff = trace.leases.observe();
+				let (rows, mut capture) = state_machine
+					.read_state(move |state| {
+						super::lease_evidence::applied_leases_captured(
+							state, local, now_ms, target, cutoff,
+						)
+					})
+					.await;
+				let mut leases = Vec::with_capacity(rows.len());
+				for lease in rows {
+					let verified = authority.verify_lease(&lease).is_ok();
+					capture.note_verify(&lease, verified);
+					if verified {
+						leases.push((lease.range_start, lease.range_end, lease.epoch));
+					}
+				}
+				(leases, capture)
+			})
+		})
+	}
+
+	/// Wendelon ADR 0127: a local holder child's evidence sink, when this node traces; `hint`
+	/// is the child's range as the coordinator knows it (a diagnostic hint, checked at use).
+	pub(super) fn lease_evidence_sink(
+		&self,
+		hint: (u64, u64),
+	) -> Option<Arc<super::lease_evidence::LeaseEvidenceSink>> {
+		let trace = self.decisions.write_stall_trace.as_ref()?;
+		Some(super::lease_evidence::LeaseEvidenceSink::new(
+			hint,
+			self.captured_lease_source(trace),
+			trace.clone(),
+		))
+	}
+
 	/// One child write at this store: checked against applied state, persisted
 	/// under the parent's lock, and acknowledged with this store's signature.
 	/// A child write with the row keys its frame carried (wendelon ADR 0119).
@@ -2323,6 +2439,7 @@ impl WendelonDataServer {
 		batch: RecordBatch,
 		given: GivenKeys,
 		wait: RetirementWait,
+		lease_evidence: Option<Arc<super::lease_evidence::LeaseEvidenceSink>>,
 	) -> Result<
 		crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
 		ChildRefusal,
@@ -2354,7 +2471,20 @@ impl WendelonDataServer {
 			.clone()
 			.ok_or(ChildRefusal::ModeToday)?;
 		self.await_applied(meta.rsv).await?;
-		let leases = (self.lease_source())().await;
+		// Wendelon ADR 0127 D2: a traced local holder child reads the same lease view, captured.
+		let lease_evidence = lease_evidence.filter(|_| role == ChildRole::Holder);
+		let (leases, capture) = match &lease_evidence {
+			Some(sink) => {
+				let (leases, capture) = (sink.source)(sink.hint).await;
+				(leases, Some(capture))
+			}
+			None => ((self.lease_source())().await, None),
+		};
+		// What the coverage predicate actually checked when it refused: its range and epoch.
+		let refused_check: std::sync::Mutex<Option<((u64, u64), Option<u64>)>> =
+			std::sync::Mutex::new(None);
+		let refused_at = &refused_check;
+		let capturing = lease_evidence.is_some();
 		let local = signer.signer;
 		let configured_window = self.decisions.retention_window_ms;
 		let plan = AdmittedPlan::admit(&self.slab, &self.state_machine, move |state| {
@@ -2378,13 +2508,38 @@ impl WendelonDataServer {
 				batch,
 				given,
 				|start, end| {
-					leases.iter().any(|(low, high, lease_epoch)| {
+					let covered = leases.iter().any(|(low, high, lease_epoch)| {
 						Some(*lease_epoch) == epoch && *low <= start && end <= *high
-					})
+					});
+					if !covered && capturing {
+						*refused_at.lock().unwrap_or_else(|e| e.into_inner()) =
+							Some(((start, end), epoch));
+					}
+					covered
 				},
 			)
 		})
-		.await?;
+		.await;
+		let plan = match plan {
+			Err(ChildRefusal::LeaseMissing) => {
+				let checked = refused_check
+					.into_inner()
+					.unwrap_or_else(|e| e.into_inner());
+				if let (Some(sink), Some(capture), Some((actual, e_dec))) =
+					(&lease_evidence, &capture, checked)
+				{
+					sink.offer(super::lease_evidence::LeaseEvidence::build(
+						super::lease_evidence::LeaseSite::PlanAdmission,
+						capture,
+						e_dec,
+						actual,
+						sink.lease_witness(),
+					));
+				}
+				return Err(ChildRefusal::LeaseMissing);
+			}
+			other => other?,
+		};
 		persist_child_waiting(
 			self.slab.clone(),
 			self.state_machine.clone(),
@@ -2394,6 +2549,7 @@ impl WendelonDataServer {
 				signer,
 				role,
 				leases: (role == ChildRole::Holder).then(|| self.lease_source()),
+				lease_evidence,
 				#[cfg(test)]
 				before_sign: None,
 			},
@@ -2481,7 +2637,15 @@ impl WendelonDataServer {
 			Ok((meta, batch)) if role == ChildRole::Holder => {
 				let rows = Arc::new(rows.unwrap_or_default().to_vec());
 				match self
-					.holder_write(sender, meta, batch, rows, trailing, RetirementWait::NONE)
+					.holder_write(
+						sender,
+						meta,
+						batch,
+						rows,
+						trailing,
+						RetirementWait::NONE,
+						None,
+					)
 					.await
 				{
 					Ok(acks) => ChildWriteResponse::Acked(acks),
@@ -2498,6 +2662,7 @@ impl WendelonDataServer {
 					batch,
 					GivenKeys::of_section(&trailing),
 					RetirementWait::NONE,
+					None,
 				)
 				.await
 			{

@@ -217,6 +217,7 @@ use table_query::{
 };
 pub(crate) mod child_writes;
 pub(crate) mod coordinator;
+pub(crate) mod lease_evidence;
 mod observation;
 mod write_replication;
 pub(crate) mod write_stall_trace;

@@ -133,10 +133,13 @@ impl WendelonDataServer {
 				logical: 0,
 				node_id: self.local_node.id,
 			};
+			// Wendelon ADR 0127 D1: the tickets this chunk's issue took, kept here so that its
+			// outcome is written even when the bounded future is dropped at the budget.
+			let issued: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 			// The clock is read after the answer and before anything is cached: an
 			// answer that completes after the deadline is not accepted.
 			let answered = if leader == self.local_node.id {
-				pass.bounded(self.propose_own_leases(chunk, epoch, requested_hlc, ttl_ms))
+				pass.bounded(self.propose_own_leases(chunk, epoch, requested_hlc, ttl_ms, &issued))
 					.await
 			} else {
 				pass.bounded(self.request_remote_leases(
@@ -151,6 +154,21 @@ impl WendelonDataServer {
 				))
 				.await
 			};
+			let issued = issued.into_inner().unwrap_or_else(|e| e.into_inner());
+			if let Some(trace) = self.decisions.write_stall_trace.as_ref() {
+				use super::lease_evidence::IssueOutcome;
+				match &answered {
+					Some(Ok(granted)) => trace.leases.finish(&issued, |range_start| {
+						if granted.iter().any(|lease| lease.range_start == range_start) {
+							IssueOutcome::Granted
+						} else {
+							IssueOutcome::NotGranted
+						}
+					}),
+					Some(Err(_)) => trace.leases.finish(&issued, |_| IssueOutcome::Error),
+					None => trace.leases.finish(&issued, |_| IssueOutcome::Unanswered),
+				}
+			}
 			let Some(outcome) = answered else {
 				self.end_renewal_pass_at(
 					&starts,
@@ -218,6 +236,7 @@ impl WendelonDataServer {
 		epoch: u64,
 		requested_hlc: HybridTimestamp,
 		ttl_ms: u32,
+		issued: &std::sync::Mutex<Vec<(u64, u64)>>,
 	) -> std::io::Result<Vec<LeaseDescriptor>> {
 		let expiry_hlc = HybridTimestamp {
 			physical_ms: requested_hlc.physical_ms.saturating_add(ttl_ms as u64),
@@ -239,19 +258,34 @@ impl WendelonDataServer {
 		let stamp_ms = self.lease_batch_stamp().await?;
 		// ADR 0108 (wendelon): the holder's own store incarnation, carried.
 		let holder_incarnation = self.slab.owner_ref()?.incarnation();
+		#[cfg(test)]
+		let skew = self
+			.decisions
+			.skew_lease_generation
+			.swap(false, std::sync::atomic::Ordering::AcqRel);
+		#[cfg(not(test))]
+		let skew = false;
 		let grants = leases
 			.iter()
 			.zip(chunk)
 			.map(
 				|(lease, (_, _, expected_generation))| crate::consensus::LeaseBatchGrant {
 					lease: *lease,
-					expected_generation: *expected_generation,
+					expected_generation: if skew {
+						expected_generation.map(|generation| generation + 1_000)
+					} else {
+						*expected_generation
+					},
 					holder_incarnation,
 				},
 			)
 			.collect();
 		let batch = crate::consensus::LeaseBatch::new(stamp_ms, grants)
 			.ok_or_else(|| Error::other("lease batch over its bound"))?;
+		// Wendelon ADR 0127 D1: witnessed immediately before the call (reaching it, not submission).
+		if let Some(trace) = self.decisions.write_stall_trace.as_ref() {
+			*issued.lock().unwrap_or_else(|e| e.into_inner()) = trace.leases.issue(&leases);
+		}
 		let response = self
 			.raft
 			.client_write(WendelonRequest::AcquireLeases(batch))
@@ -272,7 +306,15 @@ impl WendelonDataServer {
 			)));
 		};
 		let results = results.results();
-		if results.len() != leases.len()
+		#[cfg(test)]
+		let malformed = self
+			.decisions
+			.malformed_lease_results
+			.swap(false, std::sync::atomic::Ordering::AcqRel);
+		#[cfg(not(test))]
+		let malformed = false;
+		if malformed
+			|| results.len() != leases.len()
 			|| results
 				.iter()
 				.zip(&leases)
