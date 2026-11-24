@@ -3116,3 +3116,9 @@ mod holder_retirement_fence {
 		assert_eq!(h.slab.holder_retirement_waits_for_test(), 0);
 	}
 }
+
+#[path = "verifier_semantics/tests.rs"]
+mod verifier_semantics;
+
+#[path = "verifier_charge/tests.rs"]
+mod verifier_charge;

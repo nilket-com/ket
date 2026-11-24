@@ -129,6 +129,25 @@ impl SlabManager {
 			.map(|entry| *entry.value())
 	}
 
+	/// Test-only: list one more location for `(tenant, key)`, first or last among its copies,
+	/// as an index that names a copy the ordinary write path would never store. The read path
+	/// is untouched: the listed location is resolved, pinned and read like any other.
+	#[cfg(test)]
+	pub(crate) fn list_location_for_test(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+		first: bool,
+	) {
+		let mut chain = self.key_index.entry((tenant_id, key_identity)).or_default();
+		if first {
+			chain.insert(0, location);
+		} else {
+			chain.push(location);
+		}
+	}
+
 	/// Test-only: drop every indexed location of one version, as a store that
 	/// lost it.
 	#[cfg(test)]
@@ -790,6 +809,47 @@ impl SlabManager {
 		self.holder_location_admission_waiting(wait).await?;
 		let locations = self.same_hlc_locations_admitted(tenant_id, key_identity, hlc);
 		self.rows_at_locations(locations, None).await
+	}
+
+	/// Wendelon ADR 0128: `stored_rows_at_version` (no wait) or
+	/// `stored_rows_at_version_for_holder` (a holder's wait) for a verification call that keeps
+	/// decoded frames in `frames`. The version's admission and location list are exactly those
+	/// entry points'; each listed copy, in the listed order, is then read through
+	/// [`SlabManager::stored_row_reusing_frame`]: resolved, pinned and verified against its own
+	/// target, with only a repeated read and decode of a frame still held skipped.
+	pub(crate) async fn stored_rows_at_version_keeping_frames(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		wait: super::tier_authority::RetirementWait,
+		frames: &mut super::lsm_driver::FrameReuse,
+	) -> std::io::Result<Vec<RecordBatch>> {
+		let locations = if wait == super::tier_authority::RetirementWait::NONE {
+			self.same_hlc_locations(tenant_id, key_identity, hlc)?
+		} else {
+			self.holder_location_admission_waiting(wait).await?;
+			self.same_hlc_locations_admitted(tenant_id, key_identity, hlc)
+		};
+		let mut rows = Vec::with_capacity(locations.len());
+		for location in locations {
+			rows.push(self.stored_row_reusing_frame(location, frames).await?);
+		}
+		Ok(rows)
+	}
+
+	/// Wendelon ADR 0128: a verification call's frame set, charged to this node's allowance.
+	pub(crate) fn verifier_frames(&self) -> super::lsm_driver::FrameReuse {
+		super::lsm_driver::FrameReuse::charged(
+			super::lsm_driver::VERIFIER_FRAME_ENTRIES,
+			self.verifier_frames.clone(),
+		)
+	}
+
+	/// Wendelon ADR 0128: the node's verification frame allowance.
+	#[cfg(test)]
+	pub(crate) fn verifier_frame_allowance(&self) -> &Arc<super::lsm_driver::FrameAllowance> {
+		&self.verifier_frames
 	}
 
 	/// Each location's one-row batch, read and decoded.

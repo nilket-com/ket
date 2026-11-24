@@ -70802,3 +70802,6 @@ fn indexed_evidence_membership_equals_the_existential_rule() {
 		"{steps} lookup steps"
 	);
 }
+
+#[path = "verifier_frames/tests.rs"]
+mod verifier_frames_tests;

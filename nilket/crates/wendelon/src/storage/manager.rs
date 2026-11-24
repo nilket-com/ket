@@ -286,6 +286,8 @@ mod index_publication;
 use index_publication::{IndexPublication, IndexPublicationState, SingleAppendEvidence};
 mod lsm_driver;
 pub(crate) use lsm_driver::AcceptedControlLsmCompletion;
+#[cfg(test)]
+pub(crate) use lsm_driver::{VERIFIER_FRAME_ALLOWANCE_BYTES, verifier_calls};
 use lsm_driver::{
 	cleanup_lsm_compaction_tmp_files, lsm_run_summary_from_index, refresh_lsm_level_metrics,
 	remove_non_live_lsm_rows_from_index,
@@ -689,6 +691,8 @@ pub struct SlabManager {
 	/// L0 sources whose class-preserving counter work made the current LSM plan
 	/// ineligible. Excluding just these inputs lets ordinary L0 work proceed.
 	counter_deferred_l0_slabs: DashSet<SlabId>,
+	/// Wendelon ADR 0128: the node's allowance for decoded frames kept by verification calls.
+	verifier_frames: Arc<lsm_driver::FrameAllowance>,
 	key_index: DashMap<TenantKey, Vec<RecordLocation>>,
 	/// Tenant-scoped locality membership index for range scans.
 	///

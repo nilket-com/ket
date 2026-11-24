@@ -1150,7 +1150,16 @@ pub(crate) async fn verify_owned_rows_waiting(
 	wait: RetirementWait,
 ) -> Result<(), ChildRefusal> {
 	let unverified = |detail: String| ChildRefusal::Unverified(detail);
-	for version in &intent.manifest {
+	// Wendelon ADR 0128: decoded frames kept for this call only, while the node's allowance
+	// holds them; released when the call returns on any path. Every copy is still resolved,
+	// pinned, verified and digested; a frame that cannot be kept is read as before.
+	let mut frames = slab.verifier_frames();
+	for (position, version) in intent.manifest.iter().enumerate() {
+		// Test only: a pause before this version is examined, for a store and position armed.
+		#[cfg(test)]
+		verify_pause::at(slab, position).await;
+		#[cfg(not(test))]
+		let _ = position;
 		// ADR 0699 S4b: a typed tombstone is proved by its stored tombstone
 		// locations and owner, never by the absence of a row.
 		if super::deletes::is_tombstone_version(descriptor, version) {
@@ -1182,7 +1191,14 @@ pub(crate) async fn verify_owned_rows_waiting(
 				"a manifest version is not owned by this child".into(),
 			));
 		}
-		let rows = stored_rows(slab, intent.tenant, version, wait)
+		let rows = slab
+			.stored_rows_at_version_keeping_frames(
+				intent.tenant,
+				Identity::new(version.key_identity),
+				version.hlc,
+				wait,
+				&mut frames,
+			)
 			.await
 			.map_err(|error| unverified(error.to_string()))?;
 		if rows.is_empty() {
@@ -1195,6 +1211,46 @@ pub(crate) async fn verify_owned_rows_waiting(
 		}
 	}
 	Ok(())
+}
+
+/// Test only: a pause inside `verify_owned_rows_waiting`, before the manifest version at an armed
+/// position is examined, so a control can change the store between two versions of one call.
+#[cfg(test)]
+pub(crate) mod verify_pause {
+	use std::sync::{Arc, Mutex};
+	use tokio::sync::Notify;
+
+	type Armed = (usize, usize, Arc<Notify>, Arc<Notify>);
+	static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+	/// Arms one pause for `store` before the version at `position`: (reached, release).
+	pub(crate) fn arm(
+		store: &crate::storage::manager::SlabManager,
+		position: usize,
+	) -> (Arc<Notify>, Arc<Notify>) {
+		let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+		ARMED.lock().unwrap().push((
+			store as *const _ as usize,
+			position,
+			reached.clone(),
+			release.clone(),
+		));
+		(reached, release)
+	}
+
+	pub(crate) async fn at(store: &crate::storage::manager::SlabManager, position: usize) {
+		let key = store as *const _ as usize;
+		let armed = {
+			let mut all = ARMED.lock().unwrap();
+			all.iter()
+				.position(|(at, armed, _, _)| *at == key && *armed == position)
+				.map(|index| all.remove(index))
+		};
+		if let Some((_, _, reached, release)) = armed {
+			reached.notify_one();
+			release.notified().await;
+		}
+	}
 }
 
 /// The holder's authority, re-read under the lock: its lineage is open and a

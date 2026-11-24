@@ -5049,10 +5049,204 @@ impl SlabManager {
 /// row bounds checked. At most ONE frame (its bytes and its decoded batch) is held: a caller
 /// visits copies in location order so a frame's copies meet its one read, and any other order
 /// only reads more often.
-#[derive(Default)]
 pub(crate) struct FrameReuse {
-	held: Option<HeldFrame>,
+	/// The decoded frames held: at most one unless `charged` allows more. The slots are part
+	/// of this value and each frame is its own allocation, so a set holding nothing retains
+	/// no heap of its own.
+	held: [Option<Box<HeldFrame>>; VERIFIER_FRAME_ENTRIES],
 	pub(crate) stats: FrameReuseStats,
+	/// Wendelon ADR 0128: a verifier's set. More than one frame may be held, each only while
+	/// its bytes are reserved from the node's allowance; `None` is the single uncharged frame.
+	charged: Option<(usize, Arc<FrameAllowance>)>,
+	/// A use counter: the least recently used frame leaves a full set first.
+	clock: u64,
+}
+
+impl Default for FrameReuse {
+	fn default() -> Self {
+		Self {
+			held: Default::default(),
+			stats: FrameReuseStats::default(),
+			charged: None,
+			clock: 0,
+		}
+	}
+}
+
+impl FrameReuse {
+	/// Wendelon ADR 0128: a verification call's set of at most `entries` decoded frames (never
+	/// more than [`VERIFIER_FRAME_ENTRIES`]), each kept only while `allowance` holds its bytes.
+	pub(crate) fn charged(entries: usize, allowance: Arc<FrameAllowance>) -> Self {
+		Self {
+			held: Default::default(),
+			stats: FrameReuseStats::default(),
+			charged: Some((entries.min(VERIFIER_FRAME_ENTRIES), allowance)),
+			clock: 0,
+		}
+	}
+
+	/// Releases the frame at `at`, then its reservation: the memory is freed before its
+	/// credit is available to another call.
+	fn release(&mut self, at: usize) {
+		let Some(frame) = self.held[at].take() else {
+			return;
+		};
+		let charged = frame.charged;
+		drop(frame);
+		if let Some((_, allowance)) = &self.charged {
+			allowance.release(charged);
+		}
+	}
+
+	/// Test only: for each held frame, whether the store its backing names is still alive
+	/// (`None` for an object, which names no store).
+	#[cfg(test)]
+	pub(crate) fn held_stores_alive_for_test(&self) -> Vec<Option<bool>> {
+		self.held
+			.iter()
+			.flatten()
+			.map(|frame| match &frame.backing {
+				HeldBacking::Local(store) | HeldBacking::Rehydrated(store, _) => {
+					Some(store.strong_count() > 0)
+				}
+				HeldBacking::L2(_) => None,
+			})
+			.collect()
+	}
+
+	/// Test only: each held frame's charge by part, and what the allowance holds for it.
+	#[cfg(test)]
+	pub(crate) fn held_charges_for_test(&self) -> Vec<(FrameCharge, u64)> {
+		self.held
+			.iter()
+			.flatten()
+			.map(|frame| (frame.charge(), frame.charged))
+			.collect()
+	}
+}
+
+impl Drop for FrameReuse {
+	/// Every frame is freed and its reservation returned when the set ends, on any path: a
+	/// refusal, an error, or the end of the work that owns it.
+	fn drop(&mut self) {
+		for at in 0..self.held.len() {
+			self.release(at);
+		}
+		#[cfg(test)]
+		if let Some((_, allowance)) = &self.charged {
+			verifier_calls::note(allowance, self.stats);
+		}
+	}
+}
+
+/// Test only: what each verification call's frame set did, per store (by its allowance), for
+/// a store a test watches. A call's own physical reads and hits, apart from any other reader's.
+#[cfg(test)]
+pub(crate) mod verifier_calls {
+	use super::{FrameAllowance, FrameReuseStats};
+	use std::sync::{Arc, Mutex};
+
+	static WATCHED: Mutex<Vec<(usize, Vec<FrameReuseStats>)>> = Mutex::new(Vec::new());
+
+	fn key(allowance: &Arc<FrameAllowance>) -> usize {
+		Arc::as_ptr(allowance) as usize
+	}
+
+	/// Starts (or restarts, empty) the record of calls charged to `allowance`.
+	pub(crate) fn watch(allowance: &Arc<FrameAllowance>) {
+		let mut watched = WATCHED.lock().unwrap();
+		watched.retain(|(at, _)| *at != key(allowance));
+		watched.push((key(allowance), Vec::new()));
+	}
+
+	/// The calls that ended since the watch began or was last taken, in the order they ended.
+	pub(crate) fn take(allowance: &Arc<FrameAllowance>) -> Vec<FrameReuseStats> {
+		WATCHED
+			.lock()
+			.unwrap()
+			.iter_mut()
+			.find(|(at, _)| *at == key(allowance))
+			.map(|(_, calls)| std::mem::take(calls))
+			.unwrap_or_default()
+	}
+
+	pub(super) fn note(allowance: &Arc<FrameAllowance>, stats: FrameReuseStats) {
+		if let Some((_, calls)) = WATCHED
+			.lock()
+			.unwrap()
+			.iter_mut()
+			.find(|(at, _)| *at == key(allowance))
+		{
+			calls.push(stats);
+		}
+	}
+}
+
+/// Wendelon ADR 0128: a node's allowance for decoded frames retained by verification calls,
+/// shared by every caller. Reservations never wait: a frame that cannot be reserved is not kept.
+pub(crate) struct FrameAllowance {
+	limit: std::sync::atomic::AtomicU64,
+	used: std::sync::atomic::AtomicU64,
+	peak: std::sync::atomic::AtomicU64,
+}
+
+/// The frames one verification call may keep (wendelon ADR 0128: a candidate sizing).
+pub(crate) const VERIFIER_FRAME_ENTRIES: usize = 4;
+/// The node's allowance for them, in bytes (wendelon ADR 0128: experimental, internal).
+pub(crate) const VERIFIER_FRAME_ALLOWANCE_BYTES: u64 = 8 * 1024 * 1024;
+
+impl FrameAllowance {
+	pub(crate) fn new(limit: u64) -> Arc<Self> {
+		Arc::new(Self {
+			limit: std::sync::atomic::AtomicU64::new(limit),
+			used: std::sync::atomic::AtomicU64::new(0),
+			peak: std::sync::atomic::AtomicU64::new(0),
+		})
+	}
+
+	/// Reserves `bytes` if they fit now; never waits.
+	fn try_reserve(&self, bytes: u64) -> bool {
+		use std::sync::atomic::Ordering::{AcqRel, Acquire};
+		let limit = self.limit.load(Acquire);
+		let reserved = self.used.fetch_update(AcqRel, Acquire, |used| {
+			used.checked_add(bytes).filter(|total| *total <= limit)
+		});
+		match reserved {
+			Ok(before) => {
+				self.peak.fetch_max(before + bytes, AcqRel);
+				true
+			}
+			Err(_) => false,
+		}
+	}
+
+	fn release(&self, bytes: u64) {
+		self.used
+			.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+	}
+
+	/// The allowance itself.
+	fn limit(&self) -> u64 {
+		self.limit.load(std::sync::atomic::Ordering::Acquire)
+	}
+
+	/// Bytes reserved now.
+	#[cfg(test)]
+	pub(crate) fn used(&self) -> u64 {
+		self.used.load(std::sync::atomic::Ordering::Acquire)
+	}
+
+	/// The most ever reserved at once.
+	#[cfg(test)]
+	pub(crate) fn peak(&self) -> u64 {
+		self.peak.load(std::sync::atomic::Ordering::Acquire)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn set_limit_for_test(&self, limit: u64) {
+		self.limit
+			.store(limit, std::sync::atomic::Ordering::Release);
+	}
 }
 
 /// What a [`FrameReuse`] did: physical frame reads (each decoded once), copies served by a held
@@ -5076,6 +5270,10 @@ pub(crate) struct FrameReuseStats {
 	pub(crate) peak_batch_bytes: u64,
 	pub(crate) peak_index_bytes: u64,
 	pub(crate) scratch_bytes: u64,
+	/// Wendelon ADR 0128: frames a charged set released to admit another.
+	pub(crate) evicted: u64,
+	/// Wendelon ADR 0128: frames read and decoded but not kept (no reservation, or no entry).
+	pub(crate) not_kept: u64,
 }
 
 impl FrameReuseStats {
@@ -5105,27 +5303,143 @@ struct HeldFrame {
 	header: SlabRecordHeader,
 	frame: Vec<u8>,
 	batch: RecordBatch,
+	/// What `batch` retains ([`batch_retained_bytes`]), computed once: a batch does not change.
+	/// 0 in an uncharged holder, which never uses it.
+	batch_bytes: u64,
 	/// The frame's multi-row index entries, parsed once when a copy first needs verifying.
 	entries: Option<Option<Vec<MultiRowIndexEntry>>>,
+	/// Wendelon ADR 0128: the bytes reserved for this frame (0 in an uncharged holder).
+	charged: u64,
+	/// Its last use, by the holder's clock.
+	used: u64,
 }
 
-/// The backing generation a frame was read from. A local store and a rehydrated copy are the
-/// same `Arc` (held, so the identity cannot be reused); an L2 object is its exact pointer.
+/// Wendelon ADR 0128: what keeping one frame retains, by part, in requested bytes (an
+/// allocator's own rounding and bookkeeping are not counted).
+/// - `record`: the frame's own allocation (its header, target and the other parts' handles).
+/// - `frame`: the stored frame's buffer, at capacity.
+/// - `batch`: the decoded batch ([`batch_retained_bytes`]).
+/// - `index`: the parsed index entries, at capacity; entries own no heap.
+/// - `backing`: what the backing reference keeps allocated: an object pointer's or a rehydrated
+///   generation's URI, and for a local or rehydrated store the emptied record a weak pointer
+///   holds ([`WEAK_STORE_BYTES`]). The store itself is the node's, never retained by the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameCharge {
+	pub(crate) record: u64,
+	pub(crate) frame: u64,
+	pub(crate) batch: u64,
+	pub(crate) index: u64,
+	pub(crate) backing: u64,
+}
+
+impl FrameCharge {
+	pub(crate) fn total(&self) -> u64 {
+		self.record + self.frame + self.batch + self.index + self.backing
+	}
+}
+
+impl HeldFrame {
+	fn charge(&self) -> FrameCharge {
+		let index = self
+			.entries
+			.as_ref()
+			.and_then(Option::as_ref)
+			.map_or(0, |entries| {
+				entries.capacity() * std::mem::size_of::<MultiRowIndexEntry>()
+			});
+		FrameCharge {
+			record: std::mem::size_of::<Self>() as u64,
+			frame: self.frame.capacity() as u64,
+			batch: self.batch_bytes,
+			index: index as u64,
+			backing: self.backing.heap_bytes() as u64,
+		}
+	}
+}
+
+/// Wendelon ADR 0128: what a decoded batch retains, by its actual ownership.
+/// - Each distinct allocation behind its arrays' buffers, once, at capacity, plus a bound on its
+///   owner record ([`BUFFER_OWNER_BYTES`]). A decoded stream
+///   keeps one body allocation that many columns' buffers point into; summing each buffer's
+///   capacity (as `get_array_memory_size` does) would count that body once per buffer.
+/// - Each column's own array record (its reported size less its buffers) and its shared
+///   pointer's counts.
+/// - The column list: a list built by pushing holds at most `max(4, 2 * len)` slots.
+/// - The schema: its record and shared pointer's counts, its fields (their names, types and
+///   metadata) and its own metadata, at capacity.
+/// A bound on the shared owner record behind one buffer allocation, which the buffer's capacity
+/// does not include and Arrow does not expose: two counts, a pointer, a length, how it is freed
+/// (at most a shared pointer and a size, tagged) and an optional pool reservation.
+pub(crate) const BUFFER_OWNER_BYTES: usize = 96;
+
+pub(crate) fn batch_retained_bytes(batch: &RecordBatch) -> u64 {
+	use arrow::array::{Array, ArrayData, ArrayRef};
+	use arrow::buffer::Buffer;
+	const COUNTS: usize = 2 * std::mem::size_of::<usize>();
+	fn buffer(buffer: &Buffer, seen: &mut Vec<usize>, bytes: &mut usize) {
+		let at = buffer.data_ptr().as_ptr() as usize;
+		if !seen.contains(&at) {
+			seen.push(at);
+			*bytes += buffer.capacity() + BUFFER_OWNER_BYTES;
+		}
+	}
+	fn data(array: &ArrayData, seen: &mut Vec<usize>, bytes: &mut usize) {
+		for held in array.buffers() {
+			buffer(held, seen, bytes);
+		}
+		if let Some(nulls) = array.nulls() {
+			buffer(nulls.buffer(), seen, bytes);
+		}
+		for child in array.child_data() {
+			data(child, seen, bytes);
+		}
+	}
+	let (mut seen, mut bytes) = (Vec::new(), 0usize);
+	for column in batch.columns() {
+		data(&column.to_data(), &mut seen, &mut bytes);
+		bytes += COUNTS
+			+ column
+				.get_array_memory_size()
+				.saturating_sub(column.get_buffer_memory_size())
+				.max(std::mem::size_of_val(column.as_ref()));
+	}
+	bytes += (2 * batch.num_columns()).max(4) * std::mem::size_of::<ArrayRef>();
+	let schema = batch.schema_ref();
+	let metadata = schema.metadata();
+	bytes += COUNTS
+		+ std::mem::size_of_val(schema.as_ref())
+		+ schema.fields().size()
+		+ metadata.capacity() * (std::mem::size_of::<(String, String)>() + 1)
+		+ metadata
+			.iter()
+			.map(|(key, value)| key.capacity() + value.capacity())
+			.sum::<usize>();
+	bytes as u64
+}
+
+/// The backing generation a frame was read from. A local store and a rehydrated copy are named
+/// by a weak pointer: it owns nothing of the store (its index, file and heap are released with
+/// the store's last owner), and while it lives the store's address cannot be given to another,
+/// so the identity cannot be reused. An L2 object is its exact pointer.
 enum HeldBacking {
-	Local(Arc<LocalSlabStore>),
+	Local(std::sync::Weak<LocalSlabStore>),
 	Rehydrated(
-		Arc<LocalSlabStore>,
+		std::sync::Weak<LocalSlabStore>,
 		crate::consensus::slab_ops::TierGeneration,
 	),
 	L2(TieredSlabPointer),
 }
 
+/// What a weak pointer to a store keeps allocated after the store itself is dropped.
+pub(crate) const WEAK_STORE_BYTES: usize =
+	std::mem::size_of::<LocalSlabStore>() + 2 * std::mem::size_of::<usize>();
+
 impl HeldBacking {
 	fn of(backing: &SlabBacking) -> Option<Self> {
 		match backing {
-			SlabBacking::Local(slab) => Some(Self::Local(slab.clone())),
+			SlabBacking::Local(slab) => Some(Self::Local(Arc::downgrade(slab))),
 			SlabBacking::Rehydrated(copy) => Some(Self::Rehydrated(
-				copy.store.clone(),
+				Arc::downgrade(&copy.store),
 				copy.generation.clone(),
 			)),
 			SlabBacking::L2(pointer) => Some(Self::L2(pointer.clone())),
@@ -5133,11 +5447,25 @@ impl HeldBacking {
 		}
 	}
 
+	/// What this reference can keep allocated by itself: a URI, at capacity, and for a weak
+	/// pointer the store's own record and counts, which stay allocated (emptied) until the last
+	/// weak pointer goes.
+	fn heap_bytes(&self) -> usize {
+		match self {
+			Self::Local(_) => WEAK_STORE_BYTES,
+			Self::Rehydrated(_, generation) => WEAK_STORE_BYTES + generation.l2_uri.capacity(),
+			Self::L2(pointer) => pointer.l2_uri.capacity(),
+		}
+	}
+
 	fn is(&self, backing: &SlabBacking) -> bool {
 		match (self, backing) {
-			(Self::Local(held), SlabBacking::Local(slab)) => Arc::ptr_eq(held, slab),
+			(Self::Local(held), SlabBacking::Local(slab)) => {
+				std::ptr::eq(held.as_ptr(), Arc::as_ptr(slab))
+			}
 			(Self::Rehydrated(held, generation), SlabBacking::Rehydrated(copy)) => {
-				Arc::ptr_eq(held, &copy.store) && *generation == copy.generation
+				std::ptr::eq(held.as_ptr(), Arc::as_ptr(&copy.store))
+					&& *generation == copy.generation
 			}
 			(Self::L2(held), SlabBacking::L2(pointer)) => held == pointer,
 			_ => false,
@@ -5210,26 +5538,67 @@ impl SlabManager {
 					}));
 				}
 			};
-			let held = reuse
-				.held
-				.as_ref()
-				.is_some_and(|held| held.serves(&backing, target));
-			if held {
-				let frame = reuse.held.as_mut().expect("held");
-				if verify {
-					if frame.entries.is_none() {
-						frame.entries =
-							Some(storage_multirow_index_entries_from_frame(&frame.frame)?);
-						reuse.stats.index_parses += 1;
-						reuse.stats.note_held(frame);
+			reuse.clock += 1;
+			let clock = reuse.clock;
+			let row = location.record_row_index.get() as usize;
+			let outside = || {
+				Error::new(
+					ErrorKind::InvalidData,
+					"a stored version's record index is outside its frame",
+				)
+			};
+			let held = reuse.held.iter().position(|slot| {
+				slot.as_ref()
+					.is_some_and(|held| held.serves(&backing, target))
+			});
+			if let Some(at) = held {
+				// Wendelon ADR 0128: a charged frame whose index entries are parsed now grows; a
+				// growth that cannot be reserved serves this copy and then leaves the set.
+				let mut leave = false;
+				let frame = reuse.held[at].as_deref_mut().expect("an occupied slot");
+				frame.used = clock;
+				if verify && frame.entries.is_none() {
+					// A parse that fails keeps nothing new.
+					frame.entries = Some(storage_multirow_index_entries_from_frame(&frame.frame)?);
+					reuse.stats.index_parses += 1;
+					reuse.stats.note_held(frame);
+					if let Some((_, allowance)) = &reuse.charged {
+						let grown = frame.charge().total().saturating_sub(frame.charged);
+						if allowance.try_reserve(grown) {
+							frame.charged += grown;
+						} else {
+							leave = true;
+						}
 					}
-					let entries = frame.entries.as_ref().expect("parsed").as_deref();
-					verify_entries_name_version(&frame.header, entries, target, expected)?;
 				}
-				reuse.stats.reused += 1;
+				let served = (|| {
+					if verify {
+						let entries = frame.entries.as_ref().expect("parsed").as_deref();
+						verify_entries_name_version(&frame.header, entries, target, expected)?;
+					}
+					if row >= frame.batch.num_rows() {
+						return Err(outside());
+					}
+					Ok(frame.batch.slice(row, 1))
+				})();
+				// On every outcome, a refusal included: a frame holding more than it is charged
+				// leaves the set before this call returns.
+				if leave {
+					reuse.release(at);
+					reuse.stats.evicted += 1;
+				}
+				if served.is_ok() {
+					reuse.stats.reused += 1;
+				}
+				// The slice shares the frame's decoded buffers: a caller holding one keeps them
+				// alive past the frame's release, as it does a slice of an ordinary read's batch.
+				return served;
 			} else {
-				// The previous frame is released before the next is read, parsed and decoded.
-				reuse.held = None;
+				// An uncharged holder releases its frame before the next is read, parsed and
+				// decoded. A charged set keeps its frames until the new one asks for room.
+				if reuse.charged.is_none() {
+					reuse.held = Default::default();
+				}
 				let read = match &backing {
 					SlabBacking::Local(slab) => {
 						let started = Instant::now();
@@ -5274,25 +5643,75 @@ impl SlabManager {
 				let batch = decode_record_batch(&frame)?;
 				reuse.stats.reads += 1;
 				reuse.stats.rows_decoded += batch.num_rows() as u64;
-				reuse.held = Some(HeldFrame {
+				if row >= batch.num_rows() {
+					return Err(outside());
+				}
+				let slice = batch.slice(row, 1);
+				let mut frame = Box::new(HeldFrame {
 					backing: HeldBacking::of(&backing).expect("not missing"),
 					target,
 					header,
 					frame,
+					batch_bytes: if reuse.charged.is_some() {
+						batch_retained_bytes(&batch)
+					} else {
+						0
+					},
 					batch,
 					entries,
+					charged: 0,
+					used: clock,
 				});
-				reuse.stats.note_held(reuse.held.as_ref().expect("held"));
+				match reuse.charged.clone() {
+					None => {
+						reuse.stats.note_held(&frame);
+						reuse.held[0] = Some(frame);
+					}
+					// Wendelon ADR 0128: keep the frame only with an entry and a reservation.
+					// This call's least recently used frames make room first; when the room
+					// is another call's, or the frame is larger than the allowance, the frame
+					// is used and dropped, which is the ordinary read.
+					Some((entries, allowance)) => {
+						let cost = frame.charge().total();
+						let kept = loop {
+							// A frame larger than the whole allowance evicts nothing.
+							if cost > allowance.limit() {
+								break false;
+							}
+							if reuse.held.iter().flatten().count() < entries
+								&& allowance.try_reserve(cost)
+							{
+								break true;
+							}
+							let Some(oldest) = reuse
+								.held
+								.iter()
+								.enumerate()
+								.filter_map(|(at, held)| Some((at, held.as_ref()?.used)))
+								.min_by_key(|(_, used)| *used)
+								.map(|(at, _)| at)
+							else {
+								break false;
+							};
+							reuse.release(oldest);
+							reuse.stats.evicted += 1;
+						};
+						if kept {
+							frame.charged = cost;
+							reuse.stats.note_held(&frame);
+							let free = reuse
+								.held
+								.iter()
+								.position(Option::is_none)
+								.expect("fewer frames than slots");
+							reuse.held[free] = Some(frame);
+						} else {
+							reuse.stats.not_kept += 1;
+						}
+					}
+				}
+				return Ok(slice);
 			}
-			let batch = &reuse.held.as_ref().expect("held").batch;
-			let row = location.record_row_index.get() as usize;
-			if row >= batch.num_rows() {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"a stored version's record index is outside its frame",
-				));
-			}
-			return Ok(batch.slice(row, 1));
 		}
 	}
 }

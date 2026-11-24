@@ -1101,6 +1101,9 @@ impl SlabManager {
 			counter_pending_guards,
 			slab_publication_revisions: DashMap::new(),
 			counter_deferred_l0_slabs: DashSet::new(),
+			verifier_frames: super::lsm_driver::FrameAllowance::new(
+				super::lsm_driver::VERIFIER_FRAME_ALLOWANCE_BYTES,
+			),
 			key_index,
 			locality_index: RwLock::new(locality_index),
 			key_localities,
