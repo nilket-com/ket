@@ -1,0 +1,12 @@
+#!/bin/sh
+# Run the commit history preflight (ci/commit-subjects.md) on every commit about
+# to be pushed. It reads refs/remotes/origin/main..candidate and changes nothing.
+status=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+	case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+	if ! report=$(python3 -B ci/commit_subjects.py --repo . --commit "$local_sha"); then
+		printf 'pre-push: refused %s, see ci/commit-subjects.md\n%s\n' "$local_sha" "$report" >&2
+		status=1
+	fi
+done
+exit $status
