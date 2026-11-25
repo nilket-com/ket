@@ -169,7 +169,7 @@ Command mode:
 - `:tab`, `:tabedit path` (`:te`), `:tabnext` (`:tn`), `:tabprev` (`:tp`), `:tabclose` (`:tc`) manage tabs
 - `:panehnew [language]` (`:paneh`, `:ph`, `:new`) and `:panevnew [language]` (`:panev`, `:pv`, `:vnew`) open an independent empty document; `:panehsplit` (`:phs`) and `:panevsplit` (`:pvs`) open another view of the current document; `:paneclose` (`:panec`, `:pc`) closes a pane; `:panediff [path|rev]` (`:paned`, `:pd`) diffs against another file or a Git revision of the current file (`HEAD` when omitted); `:diffstep older|newer|N` (`:dstep`) moves the snapshot through the file's history
 - `:tree` opens the file browser
-- `:mdpreview` opens a live markdown preview
+- `:mdpreview` opens a live Markdown preview. Baryon and Polariton display supported TeX in `$…$` and `$$…$$` as Unicode. For example, `$\infty$` displays as ∞ and `$\mathcal{B}_{\text{weak}}$` as ℬ_weak. Unsupported formulas keep their delimiters. Write `\$` for a literal dollar sign when mixing prices and formulas.
 - `:theme name` switches the color theme; `:language lang` overrides syntax detection
 - `:set option [value]` changes a setting and persists it to `settings.toml`
 - `:source path/to/plugin.rn` loads or reloads a Rune source; `:source!` unloads it

@@ -268,17 +268,23 @@ impl InlineStyleStack {
 	}
 }
 
-pub fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
-	let mut options = Options::empty();
-	options.insert(Options::ENABLE_TABLES);
-	options.insert(Options::ENABLE_TASKLISTS);
-	options.insert(Options::ENABLE_STRIKETHROUGH);
-	options.insert(Options::ENABLE_GFM);
+/// Parse the same Markdown dialect for preview blocks and source highlights.
+pub(super) fn markdown_parser(source: &str) -> Parser<'_> {
+	Parser::new_ext(
+		source,
+		Options::ENABLE_TABLES
+			| Options::ENABLE_TASKLISTS
+			| Options::ENABLE_STRIKETHROUGH
+			| Options::ENABLE_GFM
+			| Options::ENABLE_MATH,
+	)
+}
 
+pub fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
 	let mut stack: Vec<ActiveBlock> = Vec::new();
 	let mut style = InlineStyleStack::default();
 	let mut blocks = Vec::new();
-	for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+	for (event, range) in markdown_parser(source).into_offset_iter() {
 		match event {
 			Event::Start(Tag::Paragraph) => stack.push(ActiveBlock::Paragraph {
 				text: MarkdownInlineText::new(),
@@ -498,7 +504,7 @@ pub fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
 					});
 				}
 			}
-			Event::Text(text) | Event::InlineMath(text) => {
+			Event::Text(text) => {
 				append_text(&mut stack, style.style(false), text.as_ref());
 			}
 			Event::Code(text) => {
@@ -507,8 +513,11 @@ pub fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
 			Event::Html(text) | Event::InlineHtml(text) => {
 				append_text(&mut stack, style.style(false), text.as_ref());
 			}
-			Event::DisplayMath(text) => {
-				append_text(&mut stack, style.style(false), text.as_ref());
+			Event::InlineMath(tex) => {
+				append_text(&mut stack, style.style(false), &math_text(&tex, "$"))
+			}
+			Event::DisplayMath(tex) => {
+				append_text(&mut stack, style.style(false), &math_text(&tex, "$$"))
 			}
 			Event::SoftBreak => append_text(&mut stack, style.style(false), " "),
 			Event::HardBreak => append_text(&mut stack, style.style(false), "\n"),
@@ -559,6 +568,10 @@ pub fn parse_markdown_blocks(source: &str) -> Vec<MarkdownBlock> {
 	}
 	blocks.sort_by_key(|block| block.source_range().start);
 	blocks
+}
+
+fn math_text(tex: &str, delimiter: &str) -> String {
+	super::markdown_math::render_math(tex).unwrap_or_else(|| format!("{delimiter}{tex}{delimiter}"))
 }
 
 fn append_text(stack: &mut [ActiveBlock], style: MarkdownInlineStyle, text: &str) {
@@ -733,6 +746,56 @@ mod tests {
 			MarkdownBlock::Paragraph { text, .. } => text,
 			other => panic!("expected a paragraph, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn boron_math_renders_in_prose_and_bold_table_cells() {
+		let source = r"Ring $\mathcal{B}_{\text{weak}} \ltimes_K \mathcal{B}_{\text{strong}}$.
+
+| Consensus |
+| --- |
+| **$\infty$** |
+";
+		let blocks = parse_markdown_blocks(source);
+		assert_eq!(
+			paragraph(&blocks, 0).plain_text(),
+			"Ring ℬ_weak ⋉_K ℬ_strong."
+		);
+		assert_eq!(
+			&source[blocks[0].source_range().clone()],
+			&source[..source.find("\n\n").unwrap() + 1]
+		);
+		let MarkdownBlock::Table { rows, .. } = &blocks[1] else {
+			panic!("expected a table");
+		};
+		let cell = &rows[1][0];
+		assert_eq!(cell.plain_text(), "∞");
+		assert!(cell.spans()[0].style.strong);
+	}
+
+	#[test]
+	fn math_preserves_literal_markdown_and_unknown_tex() {
+		let prices = parse_markdown_blocks("Prices are $5 and $10.");
+		assert_eq!(paragraph(&prices, 0).plain_text(), "Prices are $5 and $10.");
+
+		let source = r"Price \$5, `$\infty$`, $\infty$*, $\unknown{x}$.
+
+```tex
+$\infty$
+```
+
+$$\infty$$
+
+$$\unknown{x}$$";
+		let blocks = parse_markdown_blocks(source);
+		assert_eq!(
+			paragraph(&blocks, 0).plain_text(),
+			r"Price $5, $\infty$, ∞*, $\unknown{x}$."
+		);
+		assert!(paragraph(&blocks, 0).spans()[1].style.code);
+		assert!(matches!(&blocks[1], MarkdownBlock::CodeBlock {text, ..} if text == r"$\infty$"));
+		assert_eq!(paragraph(&blocks, 2).plain_text(), "∞");
+		assert_eq!(paragraph(&blocks, 3).plain_text(), r"$$\unknown{x}$$");
 	}
 
 	#[test]

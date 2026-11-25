@@ -16,9 +16,10 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Tag, TagEnd};
 
 use crate::core::DocByte;
+use crate::svp::markdown_blocks::markdown_parser;
 use crate::svp::markdown_highlight::{MarkdownConstruct, markdown_category};
 use crate::svp::rust_highlight::HighlightSpan;
 
@@ -49,12 +50,6 @@ impl TextContext {
 }
 
 pub fn markdown_semantic_highlights(source: &str, global_offset: DocByte) -> Vec<HighlightSpan> {
-	let mut options = Options::empty();
-	options.insert(Options::ENABLE_TABLES);
-	options.insert(Options::ENABLE_TASKLISTS);
-	options.insert(Options::ENABLE_STRIKETHROUGH);
-	options.insert(Options::ENABLE_GFM);
-
 	let mut out = Vec::new();
 	let mut context: Vec<TextContext> = Vec::new();
 	let mut emit = |range: Range<usize>, construct: MarkdownConstruct| {
@@ -71,7 +66,7 @@ pub fn markdown_semantic_highlights(source: &str, global_offset: DocByte) -> Vec
 		));
 	};
 
-	for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+	for (event, range) in markdown_parser(source).into_offset_iter() {
 		match event {
 			Event::Start(Tag::Heading { .. }) => {
 				// Markers and text alike: `#` is part of the heading.
@@ -322,6 +317,20 @@ mod tests {
 			!categories.contains(&TokenCategory::Operator),
 			"no emphasis survives anywhere on the line: {categories:?}"
 		);
+	}
+
+	#[test]
+	fn math_markers_do_not_split_source_emphasis() {
+		let source = r"$A_{a} + B_{b}$ and $x*y*z$ **$\infty$**";
+		let categories = merged_categories(source);
+		let bold = source.find("**").unwrap();
+		assert!(
+			categories[..bold]
+				.iter()
+				.all(|&c| c == TokenCategory::BodyText)
+		);
+		let emphasis = markdown_category(MarkdownConstruct::Emphasis).unwrap();
+		assert!(categories[bold..].iter().all(|&c| c == emphasis));
 	}
 
 	#[test]

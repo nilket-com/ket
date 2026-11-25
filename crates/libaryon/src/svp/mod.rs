@@ -19,6 +19,7 @@ pub mod json_provider;
 pub mod line_index;
 pub mod markdown_blocks;
 pub mod markdown_highlight;
+mod markdown_math;
 pub mod markdown_parse;
 pub mod markdown_provider;
 pub mod markdown_semantic;

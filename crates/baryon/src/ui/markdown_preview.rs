@@ -808,6 +808,7 @@ fn choose_face(
 }
 
 struct TextRenderer {
+	math: Option<Font>,
 	sans: FontFaces,
 	serif: FontFaces,
 	mono: FontFaces,
@@ -848,6 +849,19 @@ impl TextRenderer {
 		];
 
 		Self {
+			math: load_preview_font(
+				&db,
+				&[
+					fontdb::Family::Name("Noto Sans Math"),
+					fontdb::Family::Name("Cambria Math"),
+					fontdb::Family::Name("STIX Two Math"),
+					fontdb::Family::Name("DejaVu Math TeX Gyre"),
+					fontdb::Family::Name("Apple Symbols"),
+					fontdb::Family::Name("DejaVu Sans"),
+				],
+				fontdb::Weight::NORMAL,
+				fontdb::Style::Normal,
+			),
 			sans: FontFaces::load(&db, &sans_families),
 			serif: FontFaces::load(&db, &serif_families),
 			mono: FontFaces::load(&db, &mono_families),
@@ -865,6 +879,51 @@ impl TextRenderer {
 		primary
 			.pick(spec.bold, spec.italic)
 			.or_else(|| self.sans.pick(spec.bold, spec.italic))
+	}
+
+	/// Draw and measure with identical font runs. A change of face also
+	/// starts a new kerning run.
+	fn for_each_font_run(
+		&self,
+		text: &str,
+		spec: TextSpec,
+		mut visit: impl FnMut(&str, Option<(&Font, bool)>),
+	) {
+		let primary = self.font_for(spec);
+		if text.is_ascii() {
+			visit(text, primary);
+			return;
+		}
+
+		// A math face can cover script capitals yet lack subscript letters.
+		// Reuse the loaded prose faces for any glyph it cannot supply.
+		let faces = [
+			primary,
+			self.math.as_ref().map(|font| (font, spec.bold)),
+			self.sans.regular.as_ref().map(|font| (font, spec.bold)),
+			self.serif.regular.as_ref().map(|font| (font, spec.bold)),
+			self.mono.regular.as_ref().map(|font| (font, spec.bold)),
+		];
+		let mut start = 0;
+		let mut current = 0;
+		for (index, ch) in text.char_indices() {
+			let next = if ch.is_ascii() {
+				0
+			} else {
+				faces
+					.iter()
+					.position(|face| face.is_some_and(|(font, _)| font.has_glyph(ch)))
+					.unwrap_or(0)
+			};
+			if next != current {
+				if start < index {
+					visit(&text[start..index], faces[current]);
+				}
+				start = index;
+				current = next;
+			}
+		}
+		visit(&text[start..], faces[current]);
 	}
 }
 
@@ -2332,22 +2391,35 @@ fn draw_plain_text(
 	text: &str,
 	spec: TextSpec,
 ) -> u32 {
-	if let Some((font, synthetic_bold)) = text_renderer.font_for(spec) {
-		return draw_rasterized_text(canvas, x, y, text, spec, font, synthetic_bold);
-	}
-	draw_bitmap_text(canvas, x, y, text, spec)
+	let mut cursor = x;
+	text_renderer.for_each_font_run(text, spec, |run, face| {
+		let width = match face {
+			Some((font, bold)) => draw_rasterized_text(canvas, cursor, y, run, spec, font, bold),
+			None => draw_bitmap_text(canvas, cursor, y, run, spec),
+		};
+		cursor = cursor.saturating_add(width);
+	});
+	cursor.saturating_sub(x)
 }
 
 fn measure_text_width(text_renderer: &TextRenderer, text: &str, spec: TextSpec) -> u32 {
-	let Some((font, _)) = text_renderer.font_for(spec) else {
-		return text.chars().fold(0u32, |width, ch| {
-			width.saturating_add(
-				spec.glyph_w()
-					.saturating_mul(if ch == '\t' { 4 } else { 1 }),
-			)
-		});
-	};
+	let mut width = 0u32;
+	text_renderer.for_each_font_run(text, spec, |run, face| {
+		let advance = match face {
+			Some((font, _)) => measure_rasterized_text(font, run, spec),
+			None => run.chars().fold(0u32, |width, ch| {
+				width.saturating_add(
+					spec.glyph_w()
+						.saturating_mul(if ch == '\t' { 4 } else { 1 }),
+				)
+			}),
+		};
+		width = width.saturating_add(advance);
+	});
+	width
+}
 
+fn measure_rasterized_text(font: &Font, text: &str, spec: TextSpec) -> u32 {
 	let mut width = 0.0f32;
 	let mut previous = None;
 	for ch in text.chars() {
