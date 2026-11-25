@@ -1919,6 +1919,11 @@ impl<'a> MaintenanceProposals<'a> {
 		self.step.select(step);
 	}
 
+	/// DC-296: this task's stop, for the certification build's own observations.
+	pub(crate) fn stop_signal(&self) -> &tokio::sync::watch::Receiver<bool> {
+		&self.stop
+	}
+
 	/// DC-296: this task's step word, for the certification phases.
 	pub(crate) fn step(&self) -> &MaintenanceStepCell {
 		&self.step

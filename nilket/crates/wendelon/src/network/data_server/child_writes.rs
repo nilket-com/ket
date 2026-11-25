@@ -1790,6 +1790,8 @@ pub(crate) enum PauseStage {
 	/// DC-296: in a certification step whose same-gid candidate this process already built
 	/// (neither built nor staged again), before its staged readback.
 	CertificationReusedReadback,
+	/// DC-296: in a certification build, at the boundary between two children's proofs.
+	CertificationBetweenProofs,
 	/// In a cleanup step, after its plan reclaims something and before the
 	/// rewrite.
 	CleanupBeforeRewrite,

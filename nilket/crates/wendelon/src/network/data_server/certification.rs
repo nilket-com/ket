@@ -43,6 +43,8 @@ pub(crate) enum BuildRefusal {
 	/// A covered table has a retention floor: the frozen policy is violated.
 	Policy,
 	Storage(String),
+	/// DC-296: the maintenance stop was observed between two proofs: nothing was staged.
+	Stopped,
 }
 
 impl BuildRefusal {
@@ -53,6 +55,7 @@ impl BuildRefusal {
 			BuildRefusal::NotInPlan => "a closed child outside this store's plan".into(),
 			BuildRefusal::Policy => "a covered table has a retention floor".into(),
 			BuildRefusal::Storage(why) => format!("storage: {why}"),
+			BuildRefusal::Stopped => "the maintenance stop was observed".into(),
 		}
 	}
 }
@@ -265,6 +268,7 @@ impl WendelonDataServer {
 				// the winners it inherits (ADR 0107 C5 keeps that unchanged).
 				reprove_inherited: false,
 				step: Some(maintenance.step()),
+				stop: Some(maintenance.stop_signal()),
 				#[cfg(test)]
 				peer: Some(&self.decisions),
 			}),
@@ -388,6 +392,10 @@ pub(crate) struct CandidateBuild<'a> {
 	/// phase of this build; `None` for any other caller (a recovering replacement), which
 	/// never writes it.
 	pub(crate) step: Option<&'a crate::network::decision_proposals::MaintenanceStepCell>,
+	/// DC-296: the decision maintenance stop, observed before the build begins, between its
+	/// proofs and before it stages; `None` for any other caller (a recovering replacement),
+	/// whose build nothing stops.
+	pub(crate) stop: Option<&'a tokio::sync::watch::Receiver<bool>>,
 	/// Test-only: the data server's pause seams.
 	#[cfg(test)]
 	pub(crate) peer: Option<&'a super::child_writes::DecisionPeer>,
@@ -399,6 +407,12 @@ impl CandidateBuild<'_> {
 		if let Some(word) = self.step {
 			word.select(step);
 		}
+	}
+
+	/// DC-296: whether the maintenance stop is set. A build that sees it returns nothing to
+	/// report, through its step's ordinary path, so its lifecycle permit completes.
+	fn stopping(&self) -> bool {
+		self.stop.is_some_and(|stop| *stop.borrow())
 	}
 }
 
@@ -565,6 +579,10 @@ impl StoreCertification<'_> {
 		let Some(index) = self.slab.persistent_index() else {
 			return Ok(None);
 		};
+		// DC-296: a step that reaches its build after the stop builds nothing.
+		if build.stopping() {
+			return Ok(None);
+		}
 		let signer = build.repair.signer.clone();
 		let local = signer.signer;
 		let configured_window = build.configured_window_ms;
@@ -727,6 +745,11 @@ impl StoreCertification<'_> {
 						);
 						return Ok(None);
 					}
+					// DC-296: the last observation; a stop after it lets the submitted
+					// stage finish under its owner.
+					if build.stopping() {
+						return Ok(None);
+					}
 					build.select(crate::network::decision_proposals::MaintenanceStep::CertifyStage);
 					if let Err(refusal) = index.restage_base(staged.clone(), entries, aged).await? {
 						tracing::warn!(
@@ -764,6 +787,11 @@ impl StoreCertification<'_> {
 						.map(|_| crate::storage::index::certified_base::aged_evidence(&aged)),
 				};
 				let staged = entries.len() as u64;
+				// DC-296: the last observation; a stop after it lets the submitted stage
+				// finish under its owner.
+				if build.stopping() {
+					return Ok(None);
+				}
 				build.select(crate::network::decision_proposals::MaintenanceStep::CertifyStage);
 				if index.stage_base(candidate, entries, aged).await?.is_err() {
 					return Ok(None);
@@ -941,6 +969,18 @@ impl StoreCertification<'_> {
 			.collect();
 		let mut descriptors = BTreeMap::new();
 		for (at, child) in children.iter().enumerate() {
+			// Test-only: a pause at the boundary between two children's proofs.
+			#[cfg(test)]
+			if at > 0
+				&& let Some(peer) = build.peer
+			{
+				peer.pause_at(super::child_writes::PauseStage::CertificationBetweenProofs)
+					.await;
+			}
+			// DC-296: the stop is observed between proofs; nothing is staged yet.
+			if build.stopping() {
+				return Err(BuildRefusal::Stopped);
+			}
 			let (tenant, table, generation) = (child.tenant, child.table, child.generation);
 			let descriptor = self
 				.state_machine
@@ -1016,6 +1056,9 @@ impl StoreCertification<'_> {
 		// Prove every survivor that comes from a child; repair a child once.
 		let mut repaired = std::collections::BTreeSet::new();
 		for (entry, source) in winners.values_mut() {
+			if build.stopping() {
+				return Err(BuildRefusal::Stopped);
+			}
 			let Some(at) = *source else {
 				// ADR 0107 C5: a recovered replacement proves what it inherits
 				// from its own stored data before it signs for it.

@@ -6819,6 +6819,8 @@ mod drop_prepare;
 mod holder_retirement_wait;
 #[path = "parent_decisions_cluster_tests/lease_late_apply_tests.rs"]
 mod lease_late_apply;
+#[path = "parent_decisions_cluster_tests/maintenance_drain.rs"]
+mod maintenance_drain;
 #[path = "parent_decisions_cluster_tests/maintenance_step.rs"]
 mod maintenance_step;
 #[path = "parent_decisions_cluster_tests/multi_row_delete.rs"]

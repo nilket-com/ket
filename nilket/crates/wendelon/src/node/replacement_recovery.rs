@@ -469,6 +469,7 @@ impl RecoveryDriver {
 				// signing for them.
 				reprove_inherited: true,
 				step: None,
+				stop: None,
 				#[cfg(test)]
 				peer: None,
 			}),
