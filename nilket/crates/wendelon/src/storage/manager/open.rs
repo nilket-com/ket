@@ -254,6 +254,10 @@ impl SlabManager {
 				),
 			));
 		}
+		// ADR 0703: the durable mode obligation, read before the index is opened or
+		// recovered. A marker that is malformed or of another version refuses the open
+		// here, with the index untouched; the answer is the one the open then uses.
+		let contained = crate::consensus::decision_mode::store_is_marked(&config.dir)?;
 
 		#[cfg(not(any(test, feature = "test-support")))]
 		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::with_isolated_blocking(
@@ -391,10 +395,9 @@ impl SlabManager {
 			},
 			None => None,
 		};
-		// ADR 0703: the durable mode obligation, known before any install is
-		// reconciled. A marked (ParentDecisions) store installs only certified
-		// compactions; an unreadable marker refuses the open.
-		let contained = crate::consensus::decision_mode::store_is_marked(&config.dir)?;
+		// ADR 0703: the durable mode obligation (`contained`, read above) is known
+		// before any install is reconciled. A marked (ParentDecisions) store installs
+		// only certified compactions.
 		// Local intent recovery runs before filename discovery. It removes an
 		// intent only after proving its input/output files and preserving any
 		// unpublished output under a non-discoverable quarantine name.

@@ -15513,6 +15513,164 @@ async fn repair_still_removes_an_unreferenced_empty_slab_with_no_marker() {
 	assert!(!slab_path(&dir, SlabId::new(0x300)).exists());
 }
 
+fn marker_open_config(dir: &std::path::Path, io: IoRingHandle) -> SlabManagerConfig {
+	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	}
+}
+
+fn snapshot_delta(
+	before: &[(String, u64, String)],
+	after: &[(String, u64, String)],
+) -> Vec<String> {
+	after
+		.iter()
+		.filter(|entry| !before.contains(entry))
+		.map(|entry| format!("+{}", entry.0))
+		.chain(
+			before
+				.iter()
+				.filter(|entry| !after.contains(entry))
+				.map(|entry| format!("-{}", entry.0)),
+		)
+		.collect()
+}
+
+/// A caller that takes the directory with a raw owner (no format admission) and then opens
+/// the store through `open_with_owner`. Returns the open's result (whether the opened store
+/// is contained), what taking the owner changed in the directory, and what the open changed.
+async fn open_under_a_raw_owner(
+	label: &str,
+	dir: &std::path::Path,
+	io: IoRingHandle,
+) -> (std::io::Result<bool>, Vec<String>, Vec<String>) {
+	let before = repair_guard_snapshot(dir);
+	let owner = crate::storage::ownership::DataDirectoryOwner::acquire_existing(dir).unwrap();
+	let owned = repair_guard_snapshot(dir);
+	let result = SlabManager::open_with_owner(marker_open_config(dir, io), owner.clone())
+		.await
+		.map(|manager| manager.versions_contained());
+	let opened = repair_guard_snapshot(dir);
+	let (by_owner, by_open) = (
+		snapshot_delta(&before, &owned),
+		snapshot_delta(&owned, &opened),
+	);
+	match &result {
+		Ok(contained) => eprintln!(
+			"MARKER-OPEN {label}: opened, contained {contained}; entries changed by taking the owner {by_owner:?}; by the open {by_open:?}"
+		),
+		Err(error) => eprintln!(
+			"MARKER-OPEN {label}: Err kind {:?} \"{error}\"; entries changed by taking the owner {by_owner:?}; by the open {by_open:?}",
+			error.kind()
+		),
+	}
+	let _ = owner.close(Duration::from_secs(30)).await;
+	(result, by_owner, by_open)
+}
+
+/// The marker is read before the index is opened or recovered: under a raw owner, a store of
+/// another marker version is refused and the refused open changes nothing. What taking the
+/// raw owner itself changed has already happened and is reported, not undone. The marker
+/// here is synthetic: bytes this test writes.
+#[tokio::test]
+async fn open_with_a_raw_owner_refuses_a_foreign_marker_before_the_index_is_opened() {
+	let (dir, io) = repair_guard_fixture("marker-open-foreign", false).await;
+	std::fs::write(dir.join("PARENT_DECISIONS"), b"parent-decisions-v27\n").unwrap();
+	let (result, by_owner, by_open) =
+		open_under_a_raw_owner("foreign marker, raw owner", &dir, io).await;
+	let error = result.expect_err("a store of another marker version is not opened");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error.to_string().contains("decision mode marker")
+			&& error
+				.to_string()
+				.contains("malformed or of another version"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(
+		by_open.is_empty(),
+		"the refused open ran before any index open or recovery: {by_open:?}"
+	);
+	assert!(
+		by_owner.iter().any(|entry| entry == "+LOCK"),
+		"the raw owner's own effect is already made: {by_owner:?}"
+	);
+}
+
+#[tokio::test]
+async fn open_with_a_raw_owner_refuses_a_malformed_marker_before_the_index_is_opened() {
+	let (dir, io) = repair_guard_fixture("marker-open-malformed", false).await;
+	std::fs::write(dir.join("PARENT_DECISIONS"), b"not a marker").unwrap();
+	let (result, _, by_open) =
+		open_under_a_raw_owner("malformed marker, raw owner", &dir, io).await;
+	let error = result.expect_err("a malformed marker is not opened past");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error
+			.to_string()
+			.contains("malformed or of another version"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(
+		by_open.is_empty(),
+		"nothing changed by the refused open: {by_open:?}"
+	);
+}
+
+/// With no owner at all, the refused open leaves the whole directory as it was.
+#[tokio::test]
+async fn an_unowned_open_refuses_a_foreign_marker_and_changes_nothing() {
+	let (dir, io) = repair_guard_fixture("marker-open-unowned", false).await;
+	std::fs::write(dir.join("PARENT_DECISIONS"), b"parent-decisions-v27\n").unwrap();
+	let before = repair_guard_snapshot(&dir);
+	let result = SlabManager::open(marker_open_config(&dir, io)).await;
+	let changed = snapshot_delta(&before, &repair_guard_snapshot(&dir));
+	let error = result
+		.err()
+		.expect("a store of another marker version is not opened");
+	eprintln!(
+		"MARKER-OPEN foreign marker, no owner: Err kind {:?} \"{error}\"; entries changed {changed:?}",
+		error.kind()
+	);
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error
+			.to_string()
+			.contains("malformed or of another version"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(changed.is_empty(), "nothing changed: {changed:?}");
+}
+
+/// The answer read ahead of the index is the one the open uses: this build's marker opens
+/// contained, and a store with no marker opens uncontained.
+#[tokio::test]
+async fn an_open_keeps_its_mode_under_this_builds_marker_and_with_none() {
+	let (dir, io) = repair_guard_fixture("marker-open-current", false).await;
+	crate::consensus::decision_mode::write_mode_marker_for_test(&dir);
+	let (result, _, _) = open_under_a_raw_owner("this build's marker, raw owner", &dir, io).await;
+	assert!(result.expect("a store with this build's marker opens"));
+
+	let (dir, io) = repair_guard_fixture("marker-open-absent", false).await;
+	assert!(!dir.join("PARENT_DECISIONS").exists());
+	let (result, _, _) = open_under_a_raw_owner("no marker, raw owner", &dir, io).await;
+	assert!(!result.expect("a store with no marker opens"));
+}
+
 /// ADR 0089 range discoverability. Row membership in the locality index is
 /// per row — `(routing_locality, key_identity)` is inserted individually — so a
 /// scan interval must yield exactly the rows whose localities fall inside it,
