@@ -5495,6 +5495,18 @@ impl SlabManager {
 		location: RecordLocation,
 		reuse: &mut FrameReuse,
 	) -> std::io::Result<RecordBatch> {
+		self.stored_row_resolved(location, reuse, None).await
+	}
+
+	/// [`Self::stored_row_reusing_frame`], with its first resolution already made by the caller
+	/// (Wendelon ADR 0130: a witnessed read resolves, decides from the backing whether it reads
+	/// at all, and then reads through exactly that resolution). A later attempt resolves anew.
+	pub(super) async fn stored_row_resolved(
+		&self,
+		location: RecordLocation,
+		reuse: &mut FrameReuse,
+		mut resolved: Option<ReadTarget>,
+	) -> std::io::Result<RecordBatch> {
 		let mut attempts = 0;
 		loop {
 			attempts += 1;
@@ -5503,7 +5515,10 @@ impl SlabManager {
 				location: target,
 				tiered,
 				_pin,
-			} = self.resolve_read_target(location, true).await?;
+			} = match resolved.take() {
+				Some(resolved) => resolved,
+				None => self.resolve_read_target(location, true).await?,
+			};
 			// As `read_expected_version_once` with no named version: a local frame is verified
 			// when its slab is tiered; a rehydrated or L2 frame always, against its tenant.
 			let (verify, expected) = match &backing {

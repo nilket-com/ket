@@ -620,6 +620,77 @@ fn accepted_children_in(
 	Ok(children)
 }
 
+/// Wendelon ADR 0130: [`proved_location_in`] for a certification build's early proof, its reads
+/// made through `frames` with one witness per copy left in `witnesses`. The same listing, the
+/// same digest check of every stored copy, the same locality and selected location. `None`,
+/// with `witnesses` empty, when there is nothing to save: the version is not stored, is the
+/// typed tombstone case (which reads nothing), has a copy that is not a local store's or more
+/// copies than `witnesses` holds, or a stored copy differs.
+pub(super) async fn proved_location_witnessed(
+	slab: &SlabManager,
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	key: Identity,
+	hlc: HybridTimestamp,
+	row_digest: [u8; 32],
+	frames: &mut crate::storage::manager::FrameReuse,
+	witnesses: &mut Vec<crate::storage::manager::CopyWitness>,
+) -> Result<Option<(Locality, RecordLocation)>, ReadRefusal> {
+	let transient = |error: std::io::Error| ReadRefusal::Transient(error.to_string());
+	witnesses.clear();
+	let locations = slab
+		.version_locations(tenant, key, hlc)
+		.map_err(transient)?;
+	let Some(first) = locations.first().copied() else {
+		return Ok(None);
+	};
+	if locations.iter().all(|location| location.is_tombstone) {
+		return Ok(None);
+	}
+	let Some(stored) = slab
+		.stored_rows_witnessed(tenant, key, hlc, frames, witnesses)
+		.await
+		.map_err(transient)?
+	else {
+		return Ok(None);
+	};
+	let proved = (|| {
+		for row in &stored {
+			match stored_row_digest(descriptor, row) {
+				Ok(digest) if digest == row_digest => {}
+				_ => return Ok(None),
+			}
+		}
+		let Some(row) = stored.first() else {
+			return Ok(None);
+		};
+		Ok(Some((
+			version_locality(tenant, descriptor, key, hlc, row)?,
+			first,
+		)))
+	})();
+	if !matches!(proved, Ok(Some(_))) {
+		witnesses.clear();
+	}
+	proved
+}
+
+/// Wendelon ADR 0130: whether [`proved_location_in`], run now, would read exactly what an early
+/// proof's `witnesses` record, without reading it. A refusal of a listing or of a resolution is
+/// mapped as that proof maps its own.
+pub(super) async fn still_proved(
+	slab: &SlabManager,
+	tenant: TenantId,
+	key: Identity,
+	hlc: HybridTimestamp,
+	first: RecordLocation,
+	witnesses: &[crate::storage::manager::CopyWitness],
+) -> Result<bool, ReadRefusal> {
+	slab.version_resolves_as_witnessed(tenant, key, hlc, first, witnesses)
+		.await
+		.map_err(|error| ReadRefusal::Transient(error.to_string()))
+}
+
 /// The routing locality of a selected version, derived from its own verified
 /// bytes by the admission the writer ran, never from the key's current
 /// locality, which a later version may have moved.

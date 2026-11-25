@@ -17,7 +17,7 @@ use crate::schema::Identity;
 use arrow::array::ArrayRef;
 use std::time::{Duration, Instant};
 
-fn lineitem_like() -> TableSchemaDescriptor {
+pub(super) fn lineitem_like() -> TableSchemaDescriptor {
 	let mut fields = Vec::new();
 	for name in ["l_orderkey", "l_partkey", "l_suppkey", "l_linenumber"] {
 		fields.push(Field::new(name, DataType::Int64, false));
@@ -52,7 +52,11 @@ fn lineitem_like() -> TableSchemaDescriptor {
 }
 
 /// Rows `from..from + n` of the table.
-fn lineitem_rows(descriptor: &TableSchemaDescriptor, from: i64, n: usize) -> RecordBatch {
+pub(super) fn lineitem_rows(
+	descriptor: &TableSchemaDescriptor,
+	from: i64,
+	n: usize,
+) -> RecordBatch {
 	let ids: Vec<i64> = (from..from + n as i64).collect();
 	let int = |f: fn(i64) -> i64| -> ArrayRef {
 		Arc::new(Int64Array::from(

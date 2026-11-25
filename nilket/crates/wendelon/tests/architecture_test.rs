@@ -9454,6 +9454,10 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"data_server.rs",
 			// Wendelon ADR 0106: a recovering replacement's certified-base pages.
 			"base_fetch.rs",
+			// Wendelon ADR 0130: a certification build's early survivor proofs
+			// (`certification/survivor_proofs.rs`, which sorts ahead of its parent's
+			// file), kept out of the bounded root.
+			"survivor_proofs.rs",
 			// ADR 0699 S5a: a store's part in certified generations.
 			"certification.rs",
 			// ADR 0699 S3b: child writes under the ParentDecisions authority, kept
@@ -9816,6 +9820,9 @@ fn adr078_manager_source_concatenates_submodules() {
 			"tiered_io.rs",
 			// ADR 0692: class-scoped version identity and tier verification.
 			"version_identity.rs",
+			// Wendelon ADR 0130: a version's copies read with a witness of each read, and
+			// the check that it still resolves to what was read.
+			"witnessed_reads.rs",
 		],
 		"ADR 078 production source manifest changed; update this guard deliberately \
 		 (tests.rs is excluded — it is not production source)"

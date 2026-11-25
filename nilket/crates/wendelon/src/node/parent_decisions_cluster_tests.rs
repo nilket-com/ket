@@ -6833,6 +6833,8 @@ mod query_cancel;
 mod resolve;
 #[path = "parent_decisions_cluster_tests/retention_window.rs"]
 mod retention_window;
+#[path = "parent_decisions_cluster_tests/survivor_proofs_tests.rs"]
+mod survivor_proofs;
 #[path = "parent_decisions_cluster_tests/verifier_frames_tests.rs"]
 mod verifier_frames;
 #[path = "parent_decisions_cluster_tests/write_attempt_trace_tests.rs"]

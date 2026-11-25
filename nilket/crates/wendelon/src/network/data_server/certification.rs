@@ -17,6 +17,9 @@ use crate::storage::index::certified_base::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Wendelon ADR 0130: the build's early survivor proofs.
+pub(crate) mod survivor_proofs;
+
 /// The pending target and the closed set's Accepted children, as recorded.
 struct Work {
 	pending: Pending,
@@ -269,6 +272,7 @@ impl WendelonDataServer {
 				reprove_inherited: false,
 				step: Some(maintenance.step()),
 				stop: Some(maintenance.stop_signal()),
+				early_proof_reads: true,
 				#[cfg(test)]
 				peer: Some(&self.decisions),
 			}),
@@ -396,6 +400,10 @@ pub(crate) struct CandidateBuild<'a> {
 	/// proofs and before it stages; `None` for any other caller (a recovering replacement),
 	/// whose build nothing stops.
 	pub(crate) stop: Option<&'a tokio::sync::watch::Receiver<bool>>,
+	/// Wendelon ADR 0130: the survivors' proof reads are made early, a window at a time, in an
+	/// order that meets each frame once. The decision maintenance pass asks for it; any other
+	/// caller (a recovering replacement) proves each survivor at its turn, as before.
+	pub(crate) early_proof_reads: bool,
 	/// Test-only: the data server's pause seams.
 	#[cfg(test)]
 	pub(crate) peer: Option<&'a super::child_writes::DecisionPeer>,
@@ -411,7 +419,7 @@ impl CandidateBuild<'_> {
 
 	/// DC-296: whether the maintenance stop is set. A build that sees it returns nothing to
 	/// report, through its step's ordinary path, so its lifecycle permit completes.
-	fn stopping(&self) -> bool {
+	pub(super) fn stopping(&self) -> bool {
 		self.stop.is_some_and(|stop| *stop.borrow())
 	}
 }
@@ -770,10 +778,32 @@ impl StoreCertification<'_> {
 				{
 					Ok(built) => built,
 					Err(refusal) => {
+						#[cfg(test)]
+						if let Some(peer) = build.peer {
+							peer.build_refusals.lock().unwrap().push(refusal.describe());
+						}
 						tracing::debug!(reason = %refusal.describe(), "no candidate base for the pending generation");
 						return Ok(None);
 					}
 				};
+				// Test-only (Wendelon ADR 0130): the same candidate from the same inputs with
+				// every survivor proved on the ordinary path, compared whole.
+				#[cfg(test)]
+				if let Some(peer) = build.peer
+					&& peer
+						.compare_ungrouped
+						.swap(false, std::sync::atomic::Ordering::AcqRel)
+				{
+					use std::sync::atomic::Ordering::Release;
+					peer.ungrouped_proofs.store(true, Release);
+					let ungrouped = self
+						.build_candidate(build, &index, &children, exclusion, aged_floor)
+						.await;
+					peer.ungrouped_proofs.store(false, Release);
+					*peer.ungrouped_equal.lock().unwrap() = Some(
+						matches!(&ungrouped, Ok((other, other_aged)) if *other == entries && *other_aged == aged),
+					);
+				}
 				let oldest_visible = self
 					.oldest_visible(&pending.target.retention, &entries)
 					.await;
@@ -928,7 +958,7 @@ impl StoreCertification<'_> {
 		exclusion: Option<u64>,
 		aged_floor: Option<crate::schema::HybridTimestamp>,
 	) -> Result<(Vec<BaseEntry>, Vec<BaseEntry>), BuildRefusal> {
-		type Slot = (TenantId, TableObjectId, [u8; 32]);
+		use survivor_proofs::{ProofWindow, Slot};
 		let storage = |error: std::io::Error| BuildRefusal::Storage(error.to_string());
 		let unproved =
 			|refusal: super::reader::ReadRefusal| BuildRefusal::Incomplete(format!("{refusal:?}"));
@@ -1054,63 +1084,142 @@ impl StoreCertification<'_> {
 			aged = omit_aged(&mut winners, &governed, floor);
 		}
 		// Prove every survivor that comes from a child; repair a child once.
+		//
+		// Wendelon ADR 0130: with early proof reads the candidate is taken a window of its
+		// logical order at a time. A window's reads are made first, in an order that meets each
+		// frame once, and their proofs saved; then this loop visits the window in logical order,
+		// as it always has. Without them there is one window, the whole candidate, and no early
+		// proof.
+		#[cfg(test)]
+		let early_proof_reads = build.early_proof_reads
+			&& !build.peer.is_some_and(|peer| {
+				peer.ungrouped_proofs
+					.load(std::sync::atomic::Ordering::Acquire)
+			});
+		#[cfg(not(test))]
+		let early_proof_reads = build.early_proof_reads;
+		let mut early = early_proof_reads.then(|| ProofWindow::reserved(winners.len()));
+		#[cfg(test)]
+		if let (Some(window), Some(peer)) = (early.as_mut(), build.peer) {
+			window.report_to(peer.proof_reads.clone());
+		}
+		let window_rows = early.as_ref().map_or(usize::MAX, ProofWindow::rows);
 		let mut repaired = std::collections::BTreeSet::new();
-		for (entry, source) in winners.values_mut() {
-			if build.stopping() {
-				return Err(BuildRefusal::Stopped);
-			}
-			let Some(at) = *source else {
-				// ADR 0107 C5: a recovered replacement proves what it inherits
-				// from its own stored data before it signs for it.
-				if build.reprove_inherited {
-					entry_is_stored(self.slab, self.state_machine, entry)
-						.await
-						.map_err(BuildRefusal::Incomplete)?;
+		let mut after: Option<Slot> = None;
+		loop {
+			let from = match after {
+				Some(slot) => std::ops::Bound::Excluded(slot),
+				None => std::ops::Bound::Unbounded,
+			};
+			if let Some(window) = early.as_mut() {
+				window
+					.prove_early(self.slab, &winners, from, &descriptors, build)
+					.await?;
+				// Test-only: a pause with the window's early proofs made and none used.
+				#[cfg(test)]
+				if let Some(peer) = build.peer {
+					peer.pause_at(super::child_writes::PauseStage::CertificationEarlyProofsMade)
+						.await;
 				}
-				continue;
-			};
-			let child = &children[at];
-			let descriptor = &descriptors[&(entry.tenant, entry.table)];
-			let key = Identity::new(entry.key_identity);
-			let prove = || {
-				super::reader::proved_location_in(
-					self.slab,
-					entry.tenant,
-					descriptor,
-					key,
-					entry.hlc,
-					entry.row_digest,
-					None,
-				)
-			};
-			let mut proved = prove().await.map_err(unproved)?;
-			if proved.is_none() && repaired.insert(at) {
-				super::repair::repair_child_in(
-					build.repair,
-					child.recorded.rsv,
-					child.recorded.ordinal,
-					child.generation,
-				)
-				.await
-				.map_err(|refusal| BuildRefusal::Incomplete(format!("{refusal:?}")))?;
-				proved = prove().await.map_err(unproved)?;
 			}
-			let Some((locality, location)) = proved else {
-				return Err(BuildRefusal::Incomplete(
-					"a survivor is not stored here with its content".into(),
-				));
-			};
-			if location.is_tombstone != entry.tombstone {
-				return Err(BuildRefusal::Incomplete(
-					"a survivor is stored as the other kind".into(),
-				));
+			let mut visited = 0usize;
+			for (slot, (entry, source)) in winners
+				.range_mut::<Slot, _>((from, std::ops::Bound::Unbounded))
+				.take(window_rows)
+			{
+				let saved = early.as_mut().and_then(|window| window.take(visited));
+				visited += 1;
+				after = Some(*slot);
+				if build.stopping() {
+					return Err(BuildRefusal::Stopped);
+				}
+				let Some(at) = *source else {
+					// ADR 0107 C5: a recovered replacement proves what it inherits
+					// from its own stored data before it signs for it.
+					if build.reprove_inherited {
+						entry_is_stored(self.slab, self.state_machine, entry)
+							.await
+							.map_err(BuildRefusal::Incomplete)?;
+					}
+					continue;
+				};
+				let child = &children[at];
+				let descriptor = &descriptors[&(entry.tenant, entry.table)];
+				let key = Identity::new(entry.key_identity);
+				let prove = || {
+					super::reader::proved_location_in(
+						self.slab,
+						entry.tenant,
+						descriptor,
+						key,
+						entry.hlc,
+						entry.row_digest,
+						None,
+					)
+				};
+				// Wendelon ADR 0130: an early proof stands only if the ordinary proof, made
+				// now, would read exactly what it read. A refusal of that check's listings or
+				// resolutions is the ordinary proof's refusal here; a difference leaves the
+				// survivor to the ordinary proof.
+				let mut proved = None;
+				if let (Some(window), Some(saved)) = (early.as_ref(), saved.as_ref()) {
+					proved = window
+						.confirm(self.slab, entry, saved)
+						.await
+						.map_err(unproved)?;
+					#[cfg(test)]
+					window.note(|stats| match proved {
+						Some(_) => stats.used += 1,
+						None => stats.fallbacks += 1,
+					});
+				}
+				if proved.is_none() {
+					#[cfg(test)]
+					if let Some(window) = early.as_ref() {
+						window.note(|stats| stats.ordinary += 1);
+					}
+					proved = prove().await.map_err(unproved)?;
+				}
+				if proved.is_none() && repaired.insert(at) {
+					super::repair::repair_child_in(
+						build.repair,
+						child.recorded.rsv,
+						child.recorded.ordinal,
+						child.generation,
+					)
+					.await
+					.map_err(|refusal| BuildRefusal::Incomplete(format!("{refusal:?}")))?;
+					// The repair may have changed what is stored: no early proof made
+					// before it is used after it.
+					if let Some(window) = early.as_mut() {
+						window.discard();
+					}
+					#[cfg(test)]
+					if let Some(window) = early.as_ref() {
+						window.note(|stats| stats.ordinary += 1);
+					}
+					proved = prove().await.map_err(unproved)?;
+				}
+				let Some((locality, location)) = proved else {
+					return Err(BuildRefusal::Incomplete(
+						"a survivor is not stored here with its content".into(),
+					));
+				};
+				if location.is_tombstone != entry.tombstone {
+					return Err(BuildRefusal::Incomplete(
+						"a survivor is stored as the other kind".into(),
+					));
+				}
+				entry.position = if entry.tombstone {
+					crate::consensus::decisions::delete_row_position(entry.tenant, descriptor, key)
+						.ok_or(BuildRefusal::Conflict)?
+				} else {
+					super::coordinator::row_position(descriptor, locality).map_err(storage)?
+				};
 			}
-			entry.position = if entry.tombstone {
-				crate::consensus::decisions::delete_row_position(entry.tenant, descriptor, key)
-					.ok_or(BuildRefusal::Conflict)?
-			} else {
-				super::coordinator::row_position(descriptor, locality).map_err(storage)?
-			};
+			if visited < window_rows {
+				break;
+			}
 		}
 		Ok((
 			winners.into_values().map(|(entry, _)| entry).collect(),

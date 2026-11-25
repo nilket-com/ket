@@ -461,6 +461,7 @@ impl RecoveryDriver {
 			progress: &self.progress,
 			locks: &self.locks,
 			build: Some(CandidateBuild {
+				early_proof_reads: false,
 				repair: &repair,
 				retention: self.retention,
 				now_ms: self.clock.now_ms(),

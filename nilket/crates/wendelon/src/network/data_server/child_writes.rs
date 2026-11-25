@@ -1731,6 +1731,24 @@ pub(crate) struct DecisionPeer {
 	/// different key at the same position.
 	#[cfg(test)]
 	pub(crate) kv_position_override: Arc<std::sync::Mutex<Option<(Vec<u8>, u64)>>>,
+	/// Test-only (Wendelon ADR 0130): what each certification build's survivor proofs did, in
+	/// the order the builds began, and each build refusal's reason, in order.
+	#[cfg(test)]
+	pub(crate) proof_reads:
+		Arc<std::sync::Mutex<Vec<super::certification::survivor_proofs::ProofReadStats>>>,
+	#[cfg(test)]
+	pub(crate) build_refusals: Arc<std::sync::Mutex<Vec<String>>>,
+	/// Test-only (Wendelon ADR 0130): certification builds prove every survivor on the ordinary
+	/// path, for a comparison on the same store.
+	#[cfg(test)]
+	pub(crate) ungrouped_proofs: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (Wendelon ADR 0130): the next new candidate is computed a second time, from
+	/// the same inputs, with every survivor proved on the ordinary path; whether the two
+	/// computations gave the same entries and the same aged omission is left here.
+	#[cfg(test)]
+	pub(crate) compare_ungrouped: Arc<std::sync::atomic::AtomicBool>,
+	#[cfg(test)]
+	pub(crate) ungrouped_equal: Arc<std::sync::Mutex<Option<bool>>>,
 	/// Test-only pause points in the coordinator, taken once each, in order.
 	#[cfg(test)]
 	pub(crate) pauses: Arc<
@@ -1792,6 +1810,11 @@ pub(crate) enum PauseStage {
 	CertificationReusedReadback,
 	/// DC-296: in a certification build, at the boundary between two children's proofs.
 	CertificationBetweenProofs,
+	/// Wendelon ADR 0130: in a certification build, between two early survivor proofs.
+	CertificationBetweenEarlyProofs,
+	/// Wendelon ADR 0130: in a certification build, after a window's early proofs and before
+	/// the logical loop takes its first survivor.
+	CertificationEarlyProofsMade,
 	/// In a cleanup step, after its plan reclaims something and before the
 	/// rewrite.
 	CleanupBeforeRewrite,
@@ -1888,6 +1911,16 @@ impl Default for DecisionPeer {
 			debt_cursor: Default::default(),
 			#[cfg(test)]
 			pauses: Default::default(),
+			#[cfg(test)]
+			proof_reads: Default::default(),
+			#[cfg(test)]
+			build_refusals: Default::default(),
+			#[cfg(test)]
+			ungrouped_proofs: Default::default(),
+			#[cfg(test)]
+			compare_ungrouped: Default::default(),
+			#[cfg(test)]
+			ungrouped_equal: Default::default(),
 			#[cfg(test)]
 			held_outcomes: Default::default(),
 			#[cfg(test)]
@@ -2161,6 +2194,42 @@ impl WendelonDataServer {
 	#[cfg(test)]
 	pub(crate) fn clear_pauses_for_test(&self) {
 		self.decisions.pauses.lock().unwrap().clear();
+	}
+
+	/// Wendelon ADR 0130: what each certification build's survivor proofs did, and each build
+	/// refusal's reason.
+	#[cfg(test)]
+	pub(crate) fn proof_reads_for_test(
+		&self,
+	) -> Arc<std::sync::Mutex<Vec<super::certification::survivor_proofs::ProofReadStats>>> {
+		self.decisions.proof_reads.clone()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn build_refusals_for_test(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+		self.decisions.build_refusals.clone()
+	}
+
+	/// Wendelon ADR 0130: certification builds prove every survivor on the ordinary path.
+	#[cfg(test)]
+	pub(crate) fn prove_ungrouped_for_test(&self) {
+		self.decisions
+			.ungrouped_proofs
+			.store(true, std::sync::atomic::Ordering::Release);
+	}
+
+	/// Wendelon ADR 0130: the next new candidate is computed again on the ordinary path from
+	/// the same inputs; [`Self::ungrouped_equal_for_test`] then says whether the two agree.
+	#[cfg(test)]
+	pub(crate) fn compare_ungrouped_for_test(&self) {
+		self.decisions
+			.compare_ungrouped
+			.store(true, std::sync::atomic::Ordering::Release);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn ungrouped_equal_for_test(&self) -> Option<bool> {
+		*self.decisions.ungrouped_equal.lock().unwrap()
 	}
 
 	/// Test-only: queue a pause in this node's coordinator.

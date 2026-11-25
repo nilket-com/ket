@@ -232,12 +232,15 @@ mod lock_recovery;
 mod tier_plan;
 mod tier_transition;
 mod version_identity;
+mod witnessed_reads;
 use lock_recovery::{recover_rwlock_read, recover_rwlock_write};
+pub(crate) use lsm_driver::{FrameReuse, WEAK_STORE_BYTES};
 use tier_generation::{ReadTarget, TierLayout};
 pub use tier_generation::{
 	StaleLocation, StaleLocationReason, stale_location, stale_location_error,
 };
 use version_identity::IncomingVersion;
+pub(crate) use witnessed_reads::CopyWitness;
 mod slab_file_quarantine;
 mod tiered_io;
 use relocation::{
