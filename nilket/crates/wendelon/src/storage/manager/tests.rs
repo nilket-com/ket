@@ -15314,6 +15314,205 @@ async fn adr0084_repair_refuses_without_a_durable_index() {
 	);
 }
 
+/// The directory's whole state: every file under it with its length and content hash,
+/// and every subdirectory by name. Symlinks and anything unreadable fail the fixture.
+fn repair_guard_snapshot(dir: &std::path::Path) -> Vec<(String, u64, String)> {
+	fn walk(root: &std::path::Path, at: &std::path::Path, out: &mut Vec<(String, u64, String)>) {
+		for entry in std::fs::read_dir(at).unwrap() {
+			let entry = entry.unwrap();
+			let path = entry.path();
+			let name = path.strip_prefix(root).unwrap().display().to_string();
+			let kind = entry.file_type().unwrap();
+			if kind.is_dir() {
+				out.push((format!("{name}/"), 0, String::new()));
+				walk(root, &path, out);
+			} else {
+				assert!(
+					kind.is_file(),
+					"the fixture holds only files and directories: {name}"
+				);
+				let bytes = std::fs::read(&path).unwrap();
+				out.push((
+					name,
+					bytes.len() as u64,
+					blake3::hash(&bytes).to_hex().to_string(),
+				));
+			}
+		}
+	}
+	let mut out = Vec::new();
+	walk(dir, dir, &mut out);
+	out.sort();
+	out
+}
+
+/// A stopped store with a durable index and one row. `litter` adds two empty slabs above
+/// every real one: the higher becomes the preserved active slab and the lower is an
+/// unreferenced empty sealed slab the repair would remove. The ownership sentinel is removed
+/// so that a run that never takes the directory leaves none.
+async fn repair_guard_fixture(
+	tag: &str,
+	litter: bool,
+) -> (crate::test_support::TestDir, IoRingHandle) {
+	let dir = fresh_dir(tag);
+	let io = spawn_io_thread(16).unwrap();
+	let manager = repair_fixture_manager(&dir, io.clone(), true).await;
+	manager
+		.append(tenant(), id(0xd000), hlc(1), b"row")
+		.await
+		.unwrap();
+	drop(manager);
+	if litter {
+		std::fs::File::create(slab_path(&dir, SlabId::new(0x300))).unwrap();
+		std::fs::File::create(slab_path(&dir, SlabId::new(0x301))).unwrap();
+	}
+	let _ = std::fs::remove_file(dir.join("LOCK"));
+	assert!(
+		!dir.join("LOCK").exists(),
+		"the fixture starts with no LOCK"
+	);
+	(dir, io)
+}
+
+/// Runs the repair and reports what it did, for the base and the candidate alike.
+async fn repair_guard_run(
+	label: &str,
+	dir: &std::path::Path,
+	io: IoRingHandle,
+) -> (std::io::Result<EmptySlabRepairReport>, bool, bool) {
+	let before = repair_guard_snapshot(dir);
+	let result = SlabManager::repair_empty_slabs(dir, io).await;
+	let after = repair_guard_snapshot(dir);
+	let unchanged = before == after;
+	let lock = dir.join("LOCK").exists();
+	let changed: Vec<String> = after
+		.iter()
+		.filter(|entry| !before.contains(entry))
+		.map(|entry| format!("+{}", entry.0))
+		.chain(
+			before
+				.iter()
+				.filter(|entry| !after.contains(entry))
+				.map(|entry| format!("-{}", entry.0)),
+		)
+		.collect();
+	match &result {
+		Ok(report) => eprintln!(
+			"REPAIR-GUARD {label}: Ok removed {:?} referenced_refused {:?} slab_files {}; directory unchanged {unchanged}; LOCK present {lock}; entries changed {changed:?}",
+			report.removed, report.referenced_refused, report.slab_files
+		),
+		Err(error) => eprintln!(
+			"REPAIR-GUARD {label}: Err kind {:?} \"{error}\"; directory unchanged {unchanged}; LOCK present {lock}; entries changed {changed:?}",
+			error.kind()
+		),
+	}
+	(result, unchanged, lock)
+}
+
+/// A marker that is not this build's refuses the repair before it takes the directory. The
+/// marker here is synthetic: bytes this test writes, not a store another build created.
+#[tokio::test]
+async fn repair_refuses_a_foreign_marker_with_no_candidate_and_changes_nothing() {
+	let (dir, io) = repair_guard_fixture("repair-guard-foreign-idle", false).await;
+	std::fs::write(dir.join("PARENT_DECISIONS"), b"parent-decisions-v27\n").unwrap();
+	let (result, unchanged, lock) =
+		repair_guard_run("foreign marker, no candidate", &dir, io).await;
+	let error = result.expect_err("a store of another marker version is not repaired");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error.to_string().contains("decision mode marker")
+			&& error
+				.to_string()
+				.contains("malformed or of another version"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(
+		unchanged,
+		"a refused repair changes nothing in the directory"
+	);
+	assert!(!lock, "a refused repair never opens the ownership sentinel");
+}
+
+#[tokio::test]
+async fn repair_refuses_a_foreign_marker_and_keeps_a_removable_slab() {
+	let (dir, io) = repair_guard_fixture("repair-guard-foreign-litter", true).await;
+	std::fs::write(dir.join("PARENT_DECISIONS"), b"parent-decisions-v27\n").unwrap();
+	let (result, unchanged, lock) =
+		repair_guard_run("foreign marker, removable slab", &dir, io).await;
+	let error = result.expect_err("a store of another marker version is not repaired");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error
+			.to_string()
+			.contains("malformed or of another version"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(
+		slab_path(&dir, SlabId::new(0x300)).exists(),
+		"the slab stays"
+	);
+	assert!(unchanged, "the index and every other file are untouched");
+	assert!(!lock);
+}
+
+#[tokio::test]
+async fn repair_refuses_malformed_marker_bytes_and_changes_nothing() {
+	let (dir, io) = repair_guard_fixture("repair-guard-malformed", true).await;
+	std::fs::write(dir.join("PARENT_DECISIONS"), b"not a marker").unwrap();
+	let (result, unchanged, lock) = repair_guard_run("malformed marker bytes", &dir, io).await;
+	let error = result.expect_err("a malformed marker is not repaired past");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error
+			.to_string()
+			.contains("malformed or of another version"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(slab_path(&dir, SlabId::new(0x300)).exists());
+	assert!(unchanged);
+	assert!(!lock);
+}
+
+#[tokio::test]
+async fn repair_refuses_a_marker_that_is_not_a_regular_file() {
+	let (dir, io) = repair_guard_fixture("repair-guard-marker-dir", true).await;
+	std::fs::create_dir(dir.join("PARENT_DECISIONS")).unwrap();
+	let (result, unchanged, lock) = repair_guard_run("a directory as the marker", &dir, io).await;
+	let error = result.expect_err("a marker that is not a file is not repaired past");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error.to_string().contains("is not a regular file"),
+		"the refusal is the marker's: {error}"
+	);
+	assert!(slab_path(&dir, SlabId::new(0x300)).exists());
+	assert!(unchanged);
+	assert!(!lock);
+}
+
+/// The admission keeps what the repair does for a store it may open: this build's marker.
+#[tokio::test]
+async fn repair_still_removes_an_unreferenced_empty_slab_under_this_builds_marker() {
+	let (dir, io) = repair_guard_fixture("repair-guard-current", true).await;
+	crate::consensus::decision_mode::write_mode_marker_for_test(&dir);
+	let (result, _, _) = repair_guard_run("this build's marker", &dir, io).await;
+	let report = result.expect("a store with this build's marker is repaired");
+	assert_eq!(report.removed, vec![SlabId::new(0x300)]);
+	assert_eq!(report.preserved_active, Some(SlabId::new(0x301)));
+	assert!(!slab_path(&dir, SlabId::new(0x300)).exists());
+}
+
+/// And for a store with no marker at all.
+#[tokio::test]
+async fn repair_still_removes_an_unreferenced_empty_slab_with_no_marker() {
+	let (dir, io) = repair_guard_fixture("repair-guard-absent", true).await;
+	assert!(!dir.join("PARENT_DECISIONS").exists());
+	let (result, _, _) = repair_guard_run("no marker", &dir, io).await;
+	let report = result.expect("a store with no marker is repaired");
+	assert_eq!(report.removed, vec![SlabId::new(0x300)]);
+	assert_eq!(report.preserved_active, Some(SlabId::new(0x301)));
+	assert!(!slab_path(&dir, SlabId::new(0x300)).exists());
+}
+
 /// ADR 0089 range discoverability. Row membership in the locality index is
 /// per row — `(routing_locality, key_identity)` is inserted individually — so a
 /// scan interval must yield exactly the rows whose localities fall inside it,

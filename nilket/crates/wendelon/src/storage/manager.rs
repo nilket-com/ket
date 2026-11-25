@@ -2121,7 +2121,9 @@ impl SlabManager {
 		// owner would close the caller's ring). Repair only needs metadata
 		// operations, so it runs them through its own owner-gated executor.
 		let _ = io;
-		let owner = DataDirectoryOwner::acquire_existing(dir)?;
+		let owner = DataDirectoryOwner::acquire_existing_admitted(dir, |dir| {
+			crate::consensus::decision_mode::store_is_marked(dir).map(|_| ())
+		})?;
 		let result = Self::repair_empty_slabs_owned(dir, owner.clone()).await;
 		// Close like a node does: drain and join before releasing the lock, and
 		// leave the clean-shutdown record exactly when the directory was clean.
