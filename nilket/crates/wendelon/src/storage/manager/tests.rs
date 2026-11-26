@@ -71162,3 +71162,85 @@ fn indexed_evidence_membership_equals_the_existential_rule() {
 
 #[path = "verifier_frames/tests.rs"]
 mod verifier_frames_tests;
+
+/// The consuming match over a large rewrite's member counts (21,868 distinct input members, 4,375
+/// of them kept) allocates per member the outputs name, not per input member: this thread's
+/// allocation calls and requested bytes across the call, against the per-member vectors on the
+/// same input. The counters are this thread's own, so other tests in the process neither change
+/// them nor are changed. Inputs, outputs and the comparison of the two results are outside the
+/// measured calls.
+#[test]
+fn the_consuming_match_allocates_for_the_members_its_outputs_name() {
+	use super::certified_lsm::{
+		CertifiedMemberKey, residual_after_outputs, residual_after_outputs_by_member_vectors,
+		row_member_key,
+	};
+	use crate::storage::mutation_visibility::tests::b1_assay::{thread_alloc_bytes, thread_allocs};
+	const INPUTS: u64 = 21_868;
+	const KEPT: u64 = 4_375;
+	let inputs: Vec<PersistentRecordRow> = (0..INPUTS)
+		.map(|at| PersistentRecordRow {
+			tenant_id: TenantId::ZERO,
+			key_identity: id(1),
+			routing_locality: Locality::new(0),
+			table_object_id: Some(TableObjectId::new([0x73; 16])),
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
+			location: RecordLocation {
+				slab_id: SlabId::new(1),
+				offset: at,
+				length: 10,
+				hlc: hlc(1_000 + at),
+				record_row_index: RecordRowIndex::new(0),
+				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
+			},
+		})
+		.collect();
+	let outputs: Vec<CertifiedMemberKey> = inputs[(INPUTS - KEPT) as usize..]
+		.iter()
+		.map(row_member_key)
+		.collect();
+	type Match = fn(
+		&[PersistentRecordRow],
+		&[CertifiedMemberKey],
+	) -> Result<Vec<PersistentRecordRow>, &'static str>;
+	let measure = |run: Match| {
+		let (calls, bytes) = (thread_allocs(), thread_alloc_bytes());
+		let residual = run(&inputs, &outputs).unwrap();
+		(
+			thread_allocs() - calls,
+			thread_alloc_bytes() - bytes,
+			residual,
+		)
+	};
+	let (was_calls, was_bytes, was) = measure(residual_after_outputs_by_member_vectors);
+	let (is_calls, is_bytes, is) = measure(residual_after_outputs);
+	println!(
+		"RESIDUAL_MATCH row_bytes={} member_key_bytes={} inputs={INPUTS} outputs={KEPT} residual={} per_member_vectors: allocations={was_calls} requested_bytes={was_bytes}; counted: allocations={is_calls} requested_bytes={is_bytes}",
+		std::mem::size_of::<PersistentRecordRow>(),
+		std::mem::size_of::<CertifiedMemberKey>(),
+		is.len(),
+	);
+	assert_eq!(is.len() as u64, INPUTS - KEPT);
+	let by_offset = |mut rows: Vec<PersistentRecordRow>| {
+		rows.sort_by_key(|row| row.location.offset);
+		rows
+	};
+	assert!(by_offset(was) == by_offset(is), "the same residual rows");
+	// One residual vector and the map over the outputs' members: far fewer calls than one vector
+	// per input member, and fewer bytes requested.
+	assert!(
+		is_calls < KEPT,
+		"fewer allocation calls than members the outputs name: {is_calls}"
+	);
+	assert!(
+		was_calls > INPUTS,
+		"premise: the per-member vectors allocate at least once per input member: {was_calls}"
+	);
+	assert!(
+		is_bytes < was_bytes,
+		"fewer requested bytes: {is_bytes} against {was_bytes}"
+	);
+}

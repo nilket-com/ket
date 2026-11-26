@@ -636,34 +636,55 @@ pub(super) fn certified_drop_at_capture(
 /// match on (tenant, key, HLC, kind). An output with nothing left to consume,
 /// or a residual identity that an output also holds (a member is all or
 /// nothing), refuses.
+///
+/// Only the members the outputs name are counted: the outputs are consumed in
+/// their own order against those counts, so the first refusal is the one that
+/// order meets, and a partly consumed member is refused only once every output
+/// has found its copy. The residual is then every input row of a member no
+/// output names, in input order; its consumers canonicalize it.
 pub(super) fn residual_after_outputs(
 	inputs: &[PersistentRecordRow],
 	outputs: &[CertifiedMemberKey],
 ) -> Result<Vec<PersistentRecordRow>, &'static str> {
-	let mut remaining: BTreeMap<CertifiedMemberKey, Vec<PersistentRecordRow>> = BTreeMap::new();
-	for row in inputs {
-		remaining.entry(row_member_key(row)).or_default().push(*row);
+	/// One member the outputs name: its input copies, and how many are consumed.
+	#[derive(Default)]
+	struct Copies {
+		inputs: u64,
+		consumed: u64,
 	}
-	let mut produced: BTreeSet<CertifiedMemberKey> = BTreeSet::new();
+	let mut named: BTreeMap<CertifiedMemberKey, Copies> = BTreeMap::new();
 	for output in outputs {
-		let Some(copies) = remaining.get_mut(output) else {
+		named.entry(*output).or_default();
+	}
+	let mut unnamed = 0usize;
+	for row in inputs {
+		match named.get_mut(&row_member_key(row)) {
+			Some(copies) => copies.inputs += 1,
+			None => unnamed += 1,
+		}
+	}
+	for output in outputs {
+		let copies = named
+			.get_mut(output)
+			.expect("every output's member was entered above");
+		if copies.inputs == 0 {
 			return Err("an output row has no input row");
-		};
-		if copies.pop().is_none() {
+		}
+		if copies.consumed == copies.inputs {
 			return Err("an output row has no input row left");
 		}
-		produced.insert(*output);
+		copies.consumed += 1;
 	}
-	let mut residual = Vec::new();
-	for (member, copies) in remaining {
-		if copies.is_empty() {
-			continue;
-		}
-		if produced.contains(&member) {
-			return Err("a version both survives and is dropped");
-		}
-		residual.extend(copies);
+	if named.values().any(|copies| copies.consumed < copies.inputs) {
+		return Err("a version both survives and is dropped");
 	}
+	let mut residual = Vec::with_capacity(unnamed);
+	residual.extend(
+		inputs
+			.iter()
+			.filter(|row| !named.contains_key(&row_member_key(row)))
+			.copied(),
+	);
 	Ok(residual)
 }
 
@@ -901,6 +922,41 @@ impl SlabManager {
 	}
 }
 
+/// The consuming match as it stood before the per-member vectors were removed: one vector of
+/// row copies per distinct input member. Kept as the oracle the current helper is compared with.
+#[cfg(test)]
+pub(super) fn residual_after_outputs_by_member_vectors(
+	inputs: &[PersistentRecordRow],
+	outputs: &[CertifiedMemberKey],
+) -> Result<Vec<PersistentRecordRow>, &'static str> {
+	let mut remaining: BTreeMap<CertifiedMemberKey, Vec<PersistentRecordRow>> = BTreeMap::new();
+	for row in inputs {
+		remaining.entry(row_member_key(row)).or_default().push(*row);
+	}
+	let mut produced: std::collections::BTreeSet<CertifiedMemberKey> =
+		std::collections::BTreeSet::new();
+	for output in outputs {
+		let Some(copies) = remaining.get_mut(output) else {
+			return Err("an output row has no input row");
+		};
+		if copies.pop().is_none() {
+			return Err("an output row has no input row left");
+		}
+		produced.insert(*output);
+	}
+	let mut residual = Vec::new();
+	for (member, copies) in remaining {
+		if copies.is_empty() {
+			continue;
+		}
+		if produced.contains(&member) {
+			return Err("a version both survives and is dropped");
+		}
+		residual.extend(copies);
+	}
+	Ok(residual)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1093,6 +1149,130 @@ mod tests {
 		assert!(residual_after_outputs(&inputs, &[kept(1, 10), kept(2, 20), kept(2, 20)]).is_err());
 		// An output no input names.
 		assert!(residual_after_outputs(&inputs, &[kept(9, 90)]).is_err());
+	}
+
+	/// A residual as a multiset of physical rows: member, then slab and offset.
+	fn as_multiset(mut rows: Vec<PersistentRecordRow>) -> Vec<PersistentRecordRow> {
+		rows.sort_by_key(|row| {
+			(
+				row_member_key(row),
+				row.location.slab_id,
+				row.location.offset,
+			)
+		});
+		rows
+	}
+
+	/// Every input sequence of up to four rows and every output sequence of up to four members,
+	/// over two data versions and one version's tombstone kind, each at two physical locations, and
+	/// one member no input names: the consuming match refuses with exactly the text the per-member
+	/// vectors gave (so the first refusal in output order, and a partly consumed member only after
+	/// every output found its copy), and otherwise leaves the same physical rows and the same
+	/// canonical drop.
+	#[test]
+	fn the_consuming_match_agrees_with_per_member_vectors_on_every_small_case() {
+		let rows = [
+			row(1, 10, 1, false),
+			row(1, 10, 2, false),
+			row(1, 10, 1, true),
+			row(1, 10, 2, true),
+			row(2, 20, 1, false),
+			row(2, 20, 2, false),
+		];
+		let members: [CertifiedMemberKey; 4] = [
+			(TenantId::ZERO, key(1), hlc(10), false),
+			(TenantId::ZERO, key(1), hlc(10), true),
+			(TenantId::ZERO, key(2), hlc(20), false),
+			(TenantId::ZERO, key(9), hlc(90), false),
+		];
+		/// Every sequence over `0..base` of length `0..=4`, as digit vectors.
+		fn sequences(base: usize) -> Vec<Vec<usize>> {
+			let mut all = vec![Vec::new()];
+			let mut last = vec![Vec::new()];
+			for _ in 0..4 {
+				let mut next = Vec::new();
+				for prefix in &last {
+					for digit in 0..base {
+						let mut longer = prefix.clone();
+						longer.push(digit);
+						next.push(longer);
+					}
+				}
+				all.extend(next.iter().cloned());
+				last = next;
+			}
+			all
+		}
+		let input_cases = sequences(rows.len());
+		let output_cases = sequences(members.len());
+		let (mut cases, mut accepted) = (0u64, 0u64);
+		let mut refusals: BTreeMap<&'static str, u64> = BTreeMap::new();
+		for input in &input_cases {
+			let inputs: Vec<PersistentRecordRow> = input.iter().map(|at| rows[*at]).collect();
+			for output in &output_cases {
+				let outputs: Vec<CertifiedMemberKey> =
+					output.iter().map(|at| members[*at]).collect();
+				let was = residual_after_outputs_by_member_vectors(&inputs, &outputs);
+				let is = residual_after_outputs(&inputs, &outputs);
+				cases += 1;
+				match (was, is) {
+					(Err(was), Err(is)) => {
+						assert_eq!(was, is, "inputs {input:?} outputs {output:?}");
+						*refusals.entry(is).or_default() += 1;
+					}
+					(Ok(was), Ok(is)) => {
+						accepted += 1;
+						assert_eq!(
+							canonical_drop(&was, typed).unwrap(),
+							canonical_drop(&is, typed).unwrap(),
+							"inputs {input:?} outputs {output:?}"
+						);
+						assert!(
+							as_multiset(was) == as_multiset(is),
+							"the same physical rows: inputs {input:?} outputs {output:?}"
+						);
+					}
+					(was, is) => panic!(
+						"inputs {input:?} outputs {output:?}: was {:?}, is {:?}",
+						was.map(|rows| rows.len()),
+						is.map(|rows| rows.len())
+					),
+				}
+			}
+		}
+		assert_eq!(cases, 1_555 * 341, "every pair was compared");
+		assert!(accepted > 0, "some cases are accepted");
+		assert_eq!(refusals.len(), 3, "each refusal occurs: {refusals:?}");
+		// Order of refusal, the cases a count-first check would get wrong.
+		let (a, b) = (members[0], members[3]);
+		let two = [rows[0], rows[1]];
+		assert_eq!(
+			residual_after_outputs(&two, &[a, b]),
+			Err("an output row has no input row"),
+			"an absent member is met before the partly consumed one is checked"
+		);
+		assert_eq!(
+			residual_after_outputs(&two[..1], &[a, a, b]),
+			Err("an output row has no input row left"),
+			"the exhausted member comes first in output order"
+		);
+		assert_eq!(
+			residual_after_outputs(&two[..1], &[b, a, a]),
+			Err("an output row has no input row"),
+			"the absent member comes first in output order"
+		);
+		assert_eq!(
+			residual_after_outputs(&two, &[a]),
+			Err("a version both survives and is dropped")
+		);
+		assert_eq!(residual_after_outputs(&[], &[]), Ok(Vec::new()));
+		assert_eq!(
+			residual_after_outputs(&[], &[a]),
+			Err("an output row has no input row")
+		);
+		assert!(
+			as_multiset(residual_after_outputs(&two, &[]).unwrap()) == as_multiset(two.to_vec())
+		);
 	}
 
 	/// ADR 0703: the selection keeps every protected class and selects a
