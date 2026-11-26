@@ -3003,6 +3003,8 @@ impl SlabManager {
 			}
 			self.record_retained_pointer_transition(&old, replacement.as_ref(), locally_published)
 				.await?;
+			#[cfg(test)]
+			self.pointer_transition_recorded_pause_point().await;
 		}
 		for mut pointer in to_stage {
 			if let Some(tokens) = self.pending_metadata_tokens.get(&pointer.slab_id) {

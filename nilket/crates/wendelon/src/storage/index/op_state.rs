@@ -398,6 +398,37 @@ pub(crate) struct RejectedTierCandidate {
 	pub payload_hash: [u8; 32],
 }
 
+/// What the resolution of a rejected rewrite pair is decided under, checked at its commit:
+/// the snapshot epoch the caller observed with no install in flight, the gate that epoch
+/// moves under, the caller's own "still quiet" test, and the guards the caller took for the
+/// decision, which the transaction keeps until it has ended.
+/// `on_commit` is given the durable records of the two names as they stand once the pair is
+/// resolved (by this call or an earlier one) and runs inside the transaction's own task, under
+/// those guards, so the caller's cache follows the commit whatever happens to the caller.
+pub(crate) struct RejectedPairDecision {
+	pub quiet: Box<dyn Fn() -> bool + Send>,
+	pub epoch: u64,
+	pub current_epoch: Arc<std::sync::atomic::AtomicU64>,
+	pub epoch_gate: Arc<std::sync::RwLock<()>>,
+	pub held: Box<dyn std::any::Any + Send>,
+	pub on_commit: Box<dyn FnOnce(&[(String, Option<RetainedObjectIntent>)]) + Send>,
+}
+
+#[cfg(test)]
+impl RejectedPairDecision {
+	/// Test-only: a decision that always holds and carries no guard.
+	pub(crate) fn unguarded_for_test() -> Self {
+		Self {
+			quiet: Box::new(|| true),
+			epoch: 0,
+			current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+			epoch_gate: Arc::new(std::sync::RwLock::new(())),
+			held: Box::new(()),
+			on_commit: Box::new(|_| {}),
+		}
+	}
+}
+
 /// The sole argument a committer can submit: its durable intent exists and is
 /// `MayBeSubmitted`. Only this module constructs one, so a proposal without a
 /// durable intent, or a reserved operation that skipped its transition, does not
@@ -2622,6 +2653,236 @@ impl PersistentLocalIndex {
 				Ok(true)
 			})
 			.await
+	}
+
+	/// A paired rewrite candidate whose operation ended Rejected: resolve exactly the
+	/// old-object record's edge to that candidate, and the candidate's own provisional
+	/// record, in one transaction. The authority is the durable rejected-candidate row for
+	/// this slab and URI (as for [`Self::remove_standalone_rejected_provisional`]): such a
+	/// candidate can never become the slab's pointer, so the edge could otherwise never
+	/// resolve and would fence the slab for good.
+	///
+	/// `None`, with nothing changed, when that row is absent (an outcome still unknown stays
+	/// fenced), when the candidate was ever recorded published, when the records are not
+	/// exactly this pair, or when `decision` no longer holds at the commit. Neither object is
+	/// deleted and the rejected-candidate row stays.
+	///
+	/// The caller decides this only while the old object is still the slab's pointer (read under
+	/// the guards `decision` carries). Its record keeps its publication and retirement history
+	/// and returns to the state that history gives it; one with no history is removed, as
+	/// before its staging: a live pointer is not a retained object.
+	///
+	/// The slab's records are read by key range and only the two named ones are kept. The
+	/// decision is checked last, under the snapshot epoch gate held through the commit, so no
+	/// install begins between the check and the commit. Returns the durable records of the two
+	/// names as they now stand, also when an earlier call already resolved the pair, so a
+	/// caller that lost its answer after the commit converges its cache; and the guards, which
+	/// stay held until the commit has ended whatever happens to the caller.
+	pub(crate) async fn resolve_rejected_paired_tier_candidate(
+		&self,
+		slab_id: SlabId,
+		old_uri: String,
+		candidate_uri: String,
+		decision: RejectedPairDecision,
+	) -> std::io::Result<(
+		Option<Vec<(String, Option<RetainedObjectIntent>)>>,
+		Box<dyn std::any::Any + Send>,
+	)> {
+		self.require_cleanup_authority()?;
+		let prefix = slab_id.get().to_be_bytes();
+		let _write = self.write_lock.lock().await;
+		#[cfg(test)]
+		let after_commit = self.op_after_commit_hold.lock().unwrap().take();
+		self.db
+			.run(move |db| {
+				let RejectedPairDecision {
+					quiet,
+					epoch,
+					current_epoch,
+					epoch_gate,
+					held,
+					on_commit,
+				} = decision;
+				let mut tx = Some(db.begin_write().map_err(redb_to_io)?);
+				let standing = 'decided: {
+					let open = tx.as_ref().expect("opened above");
+					let rejected = open
+						.open_table(REJECTED_TIER_CANDIDATES_TABLE)
+						.map_err(redb_to_io)?;
+					let mut recorded = false;
+					for row in rejected.iter().map_err(redb_to_io)? {
+						let (_, bytes) = row.map_err(redb_to_io)?;
+						let candidate: RejectedTierCandidate =
+							postcard::from_bytes(bytes.value()).map_err(Error::other)?;
+						if candidate.slab_id == slab_id && candidate.l2_uri == candidate_uri {
+							recorded = true;
+							break;
+						}
+					}
+					if !recorded || old_uri == candidate_uri {
+						return Ok((None, held));
+					}
+					let mut table = open
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let (mut old, mut provisional) = (None, None);
+					let (mut published, mut other_parent) = (false, false);
+					for row in table.range(prefix.as_slice()..).map_err(redb_to_io)? {
+						let (key, value) = row.map_err(redb_to_io)?;
+						if !key.value().starts_with(&prefix) {
+							break;
+						}
+						let name = std::str::from_utf8(&key.value()[8..])
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+						let record: RetainedObjectIntent = postcard::from_bytes(value.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+						published |= record.was_published(&candidate_uri);
+						let names_candidate =
+							record.replacement_uri.as_deref() == Some(candidate_uri.as_str());
+						if name == candidate_uri {
+							provisional = Some(record);
+						} else if name == old_uri {
+							old = Some(record);
+						} else {
+							other_parent |= names_candidate;
+						}
+					}
+					if published || other_parent {
+						return Ok((None, held));
+					}
+					let old_names_candidate = old.as_ref().is_some_and(|record| {
+						record.state == RetainedObjectIntentState::Unresolved
+							&& record.replacement_uri.as_deref() == Some(candidate_uri.as_str())
+					});
+					if provisional.is_none() && !old_names_candidate {
+						// No candidate record and no edge to it, on this evidence, is this
+						// resolution already made.
+						break 'decided vec![(old_uri, old), (candidate_uri, None)];
+					}
+					let exact = old_names_candidate
+						&& provisional.as_ref().is_none_or(|record| {
+							record.state == RetainedObjectIntentState::Unresolved
+								&& record.replacement_uri.as_deref() == Some(candidate_uri.as_str())
+								&& record.published_replacements.is_empty()
+								&& record.retirement_source.is_none()
+						});
+					if !exact {
+						return Ok((None, held));
+					}
+					let mut record = old.expect("it names the candidate");
+					let next = if record.published_replacements.is_empty()
+						&& record.retirement_source.is_none()
+					{
+						None
+					} else {
+						record.replacement_uri = None;
+						record.replacement_bytes = None;
+						record.state = if record.retirement_source.is_some() {
+							RetainedObjectIntentState::RetirementPublished
+						} else {
+							RetainedObjectIntentState::ReplacementPublished
+						};
+						Some(record)
+					};
+					// The decision, last: an install takes this gate to advance the epoch
+					// and raise its fence, so with it held through the commit none begins
+					// between this check and the commit.
+					let _epoch = epoch_gate.read().unwrap_or_else(|e| e.into_inner());
+					if current_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch || !quiet()
+					{
+						return Ok((None, held));
+					}
+					let mut changes = Vec::new();
+					for (name, record) in [(old_uri, next), (candidate_uri, None)] {
+						let mut key = prefix.to_vec();
+						key.extend_from_slice(name.as_bytes());
+						match &record {
+							Some(record) => {
+								let bytes = postcard::to_stdvec(record)
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+								table
+									.insert(key.as_slice(), bytes.as_slice())
+									.map_err(redb_to_io)?;
+							}
+							None => {
+								table.remove(key.as_slice()).map_err(redb_to_io)?;
+							}
+						}
+						changes.push((name, record));
+					}
+					drop(table);
+					drop(rejected);
+					tx.take()
+						.expect("opened above")
+						.commit()
+						.map_err(redb_to_io)?;
+					changes
+				};
+				// The durable decision is made, the epoch gate released and the write
+				// transaction ended: the cache follows now, in this same task and still under
+				// the guards `held` owns, with neither the gate nor the transaction held over
+				// the cache's own lock and totals.
+				drop(tx);
+				#[cfg(test)]
+				if let Some((entered, release)) = after_commit {
+					let _ = entered.send(());
+					let _ = release.recv();
+				}
+				on_commit(&standing);
+				Ok((Some(standing), held))
+			})
+			.await
+	}
+
+	/// Test-only: one slab's cleanup record written as given, whatever stood there.
+	#[cfg(test)]
+	pub(crate) async fn overwrite_snapshot_cleanup_intent_for_test(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		intent: RetainedObjectIntent,
+	) {
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let bytes = postcard::to_stdvec(&intent)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					table
+						.insert(key.as_slice(), bytes.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+			.unwrap();
+	}
+
+	/// Test-only: a rejected-candidate row written as `hand_off_rejected_tier` writes one.
+	#[cfg(test)]
+	pub(crate) async fn record_rejected_tier_candidate_for_test(
+		&self,
+		candidate: RejectedTierCandidate,
+	) {
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let bytes = postcard::to_stdvec(&candidate).map_err(Error::other)?;
+				tx.open_table(REJECTED_TIER_CANDIDATES_TABLE)
+					.map_err(redb_to_io)?
+					.insert(&candidate.op_seq, bytes.as_slice())
+					.map_err(redb_to_io)?;
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+			.unwrap();
 	}
 
 	/// Every rejected tier candidate still accounted for.

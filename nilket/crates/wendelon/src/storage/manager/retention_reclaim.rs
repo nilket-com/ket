@@ -1511,7 +1511,7 @@ impl SlabManager {
 					.await
 			}
 			CleanupWork::Intent(slab_id, uri) => {
-				let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+				let claim = self.cleanup_claim(slab_id).lock_owned().await;
 				let Some(intent) = self
 					.unresolved_tier_cleanup
 					.intents
@@ -1563,6 +1563,109 @@ impl SlabManager {
 						intents.snapshot.remove(&(slab_id, uri));
 					});
 					return Ok(());
+				}
+				// DC-289: a rewrite's candidate whose operation ended Rejected can never
+				// become this slab's pointer either, so its pair would fence the slab for
+				// good. The durable rejected-candidate row resolves exactly this edge and
+				// the candidate's provisional record, in one transaction; nothing is
+				// deleted from the object store, and an outcome still unknown stays
+				// fenced. Decided only with every guard taken without waiting: no worker
+				// holds the slab's rewrite claim (a healthy rewrite between its candidate
+				// and its publication does, and is never looked up), no publication of
+				// the slab is under way, no snapshot install is in flight, and nothing is
+				// unapplied, pending or retired for the slab, whose pointer is still the old
+				// object (a pointer that has moved on leaves the records as they are). The transaction rechecks
+				// the install fence at its commit and keeps the guards until it ends.
+				if uri != replacement
+					&& intent.state == RetainedObjectIntentState::Unresolved
+					&& let Some(index) = self.persistent_index.as_ref()
+					&& let Ok(rewrite) = self.slab_rewrite_claim(slab_id).try_write_owned()
+					&& let Ok(publication) = self.tier_publication_lock(slab_id).try_lock_owned()
+					&& let Some(epoch) = self.unfenced_snapshot_epoch()
+					&& self.unapplied_tier_pointer(slab_id).is_none()
+					&& !self.tier_authority.pending.contains_key(&slab_id)
+					&& !self.retired_tier_slabs.contains(&slab_id)
+					&& self
+						.tier_pointer(slab_id)
+						.await
+						.is_some_and(|live| live.l2_uri == uri)
+				{
+					let names = [uri.clone(), replacement.to_owned()];
+					let expected = {
+						let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+						let staging = names
+							.iter()
+							.any(|name| intents.pending.contains(&(slab_id, name.clone())));
+						(!staging).then(|| {
+							names
+								.iter()
+								.filter_map(|name| {
+									intents
+										.snapshot
+										.get(&(slab_id, name.clone()))
+										.map(|record| (name.clone(), record.clone()))
+								})
+								.collect::<BTreeMap<_, _>>()
+						})
+					};
+					if let Some(expected) = expected {
+						#[cfg(test)]
+						self.continuity_test_holds
+							.rejected_pair_lookups
+							.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+						let authority = self.tier_authority.clone();
+						let decision = crate::storage::index::RejectedPairDecision {
+							quiet: Box::new(move || {
+								!authority.snapshot_reconciliation_pending()
+									&& !authority.pending.contains_key(&slab_id)
+							}),
+							epoch,
+							current_epoch: self.snapshot_epoch.clone(),
+							epoch_gate: self.snapshot_epoch_gate.clone(),
+							held: Box::new((claim, rewrite, publication)),
+							// The cache follows the commit in the transaction's own task, under the
+							// guards above: a caller dropped after the commit leaves no stale edge
+							// for the slab's next pointer transition to record again.
+							on_commit: Box::new({
+								let cleanup = self.unresolved_tier_cleanup.clone();
+								move |standing| {
+									cleanup.update(|intents| {
+										for (name, record) in standing {
+											let key = (slab_id, name.clone());
+											// A record staged or published since this call read it
+											// stands.
+											if intents.snapshot.get(&key) != expected.get(name) {
+												continue;
+											}
+											match record {
+												Some(record) => {
+													intents.snapshot.insert(key, record.clone());
+												}
+												None => {
+													intents.snapshot.remove(&key);
+												}
+											}
+										}
+									});
+								}
+							}),
+						};
+						let (changes, held) = index
+							.resolve_rejected_paired_tier_candidate(
+								slab_id,
+								uri.clone(),
+								replacement.to_owned(),
+								decision,
+							)
+							.await?;
+						let resolved = changes.is_some();
+						drop(held);
+						return if resolved {
+							Ok(())
+						} else {
+							Err(stale_location_error(slab_id, StaleLocationReason::Fenced))
+						};
+					}
 				}
 				if self.unapplied_tier_pointer(slab_id).is_some()
 					|| self

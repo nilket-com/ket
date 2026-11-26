@@ -872,6 +872,8 @@ impl SlabManager {
 				if let Some(old) = local.as_ref().filter(|old| old.l2_uri != pointer.l2_uri) {
 					self.record_retained_pointer_transition(old, Some(&pointer), true)
 						.await?;
+					#[cfg(test)]
+					self.pointer_transition_recorded_pause_point().await;
 				}
 				// A replayable fence of exactly this pointer is resolved by
 				// replaying its own callback, as the authority worker does.

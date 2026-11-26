@@ -23,6 +23,8 @@ pub(crate) struct TestPauses {
 	pub(super) tier_observer_before_gate_pause: std::sync::Mutex<Option<IndexRelocationPause>>,
 	pub(super) snapshot_before_marker_clear_pause: std::sync::Mutex<Option<IndexRelocationPause>>,
 	pub(super) snapshot_after_retirement_mark_pause: std::sync::Mutex<Option<IndexRelocationPause>>,
+	/// A pointer transition recorded in the cleanup records, its pointer not yet moved.
+	pub(super) pointer_transition_recorded_pause: std::sync::Mutex<Option<IndexRelocationPause>>,
 	pub(super) snapshot_before_retirement_apply_pause:
 		std::sync::Mutex<Option<IndexRelocationPause>>,
 	pub(super) read_backing_selection_pause: std::sync::Mutex<Option<IndexRelocationPause>>,
@@ -464,6 +466,14 @@ impl SlabManager {
 		Self::fire_async_pause(&self.test_pauses.snapshot_before_retirement_apply_pause).await;
 	}
 
+	pub(crate) fn pause_after_pointer_transition_recorded_once(&self) -> IndexRelocationPause {
+		Self::arm_async_pause(&self.test_pauses.pointer_transition_recorded_pause)
+	}
+
+	pub(super) async fn pointer_transition_recorded_pause_point(&self) {
+		Self::fire_async_pause(&self.test_pauses.pointer_transition_recorded_pause).await;
+	}
+
 	pub(crate) fn pause_snapshot_after_retirement_mark_once(&self) -> IndexRelocationPause {
 		Self::arm_async_pause(&self.test_pauses.snapshot_after_retirement_mark_pause)
 	}
@@ -801,6 +811,8 @@ pub(super) struct TestHolds {
 	pub(super) aged_pruned: std::sync::Mutex<[super::certified_tier::AgedRows; 2]>,
 	/// Wendelon ADR 0124 controls: while set, the op driver acknowledges nothing.
 	pub(super) acks_held: std::sync::atomic::AtomicBool,
+	/// How many times reconciliation looked a rejected rewrite pair up in the index.
+	pub(super) rejected_pair_lookups: std::sync::atomic::AtomicUsize,
 	/// ADR 0704 §5: the source objects (URI, bytes) the certified path retained.
 	pub(super) certified_retained: std::sync::Mutex<Vec<(String, u64)>>,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,

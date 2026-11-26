@@ -890,7 +890,7 @@ pub struct SlabManager {
 	#[cfg(test)]
 	continuity_test_holds: pause_hooks::TestHolds,
 	/// Durable cleanup intents that cannot be resolved from a stale local pointer.
-	unresolved_tier_cleanup: retention_reclaim::UnresolvedTierCleanup,
+	unresolved_tier_cleanup: Arc<retention_reclaim::UnresolvedTierCleanup>,
 	deferred_table_drop_l2: retention_reclaim::DeferredTableDropL2,
 	cleanup_scan_schedule: retention_reclaim::CleanupScanSchedule,
 	/// Local slab files open found disagreeing with the committed tier state;

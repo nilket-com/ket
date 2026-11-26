@@ -516,13 +516,14 @@ pub(crate) mod parent_intents;
 pub use op_state::OpTicket;
 pub(crate) use op_state::{
 	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpEvidence,
-	OpOwnership, OpProgress, OpProgressUpdate, RejectedClaim, ReservationRefused, ReservedIdState,
-	ReservedOp, TerminalBacklog, is_op_state_invalid,
+	OpOwnership, OpProgress, OpProgressUpdate, RejectedClaim, RejectedPairDecision,
+	ReservationRefused, ReservedIdState, ReservedOp, TerminalBacklog, is_op_state_invalid,
 };
 #[cfg(test)]
 pub(crate) use op_state::{
-	OpHolderState, OpIntent, OpPhase, OpTxnCut, op_row_bytes_at, op_row_progress_offset,
-	remove_op_state_meta_for_test, set_op_row_bytes_at, set_op_state_version_for_test,
+	OpHolderState, OpIntent, OpPhase, OpTxnCut, RejectedTierCandidate, op_row_bytes_at,
+	op_row_progress_offset, remove_op_state_meta_for_test, set_op_row_bytes_at,
+	set_op_state_version_for_test,
 };
 
 const META_STORE_INCARNATION_HIGH: &str = "store_incarnation_high_v1";
