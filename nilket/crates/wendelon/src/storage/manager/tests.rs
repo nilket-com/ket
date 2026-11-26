@@ -71244,3 +71244,240 @@ fn the_consuming_match_allocates_for_the_members_its_outputs_name() {
 		"fewer requested bytes: {is_bytes} against {was_bytes}"
 	);
 }
+
+/// Appends one multirow frame of `rows` (key, HLC in ms) to the active slab.
+async fn append_slab_rows_frame(mgr: &SlabManager, rows: &[(u64, u64)]) {
+	let rows: Vec<_> = rows
+		.iter()
+		.map(|(key, at)| (id(*key), Locality::new(*at), hlc(*at), *key, false))
+		.collect();
+	let frame = encode_test_append_only_storage_frame(TableObjectId::new([0x75; 16]), &rows);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+}
+
+/// The snapshot's rows of one slab, as the claim took them before: every row of the index built
+/// and sorted, then filtered. The oracle for `persistent_record_rows_of_slab`.
+fn slab_rows_by_filtering_the_snapshot(
+	mgr: &SlabManager,
+	slab: SlabId,
+) -> Vec<PersistentRecordRow> {
+	mgr.persistent_record_rows_snapshot()
+		.into_iter()
+		.filter(|row| row.location.slab_id == slab)
+		.collect()
+}
+
+/// A slab's rows collected for that slab alone are the snapshot's rows of it, field for field and
+/// in the snapshot's order, and so hash to the same digest: over slabs that hold several rows of
+/// one frame (one offset, distinct row indices), several versions of one key in one slab and
+/// across slabs, keys shared between slabs, a slab of one raw-locality row and one partitioned row,
+/// and a slab that holds nothing. The location's placement stamp and partition are compared pair
+/// by pair as well: a location's own equality leaves them out.
+#[tokio::test]
+async fn a_slabs_rows_are_the_snapshots_rows_of_it_in_its_order() {
+	let (_dir, mgr) = fresh_manager().await;
+	let mut slabs = Vec::new();
+	// Slab A: two frames; key 1 twice in the slab (two versions), keys 2 to 5 once.
+	append_slab_rows_frame(&mgr, &[(1, 10), (2, 11), (3, 12), (4, 13)]).await;
+	append_slab_rows_frame(&mgr, &[(1, 20), (5, 21)]).await;
+	slabs.push(mgr.force_seal_active_for_test().await);
+	// Slab B: later versions of keys 1 and 3 (keys shared with A) and new keys, one frame, in an
+	// order that is not the sort order.
+	append_slab_rows_frame(&mgr, &[(9, 34), (3, 30), (1, 31), (8, 32), (7, 33)]).await;
+	slabs.push(mgr.force_seal_active_for_test().await);
+	// Slab C: one raw-locality row and one partitioned row.
+	append_slab_rows_frame(&mgr, &[(6, 40)]).await;
+	let partition = crate::schema::PartitionId::new(0x00AB_0000_0000_0000);
+	{
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(arrow::array::Int64Array::from(vec![7_i64]))],
+		)
+		.unwrap();
+		let source = vec![crate::storage::multirow::MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity: id(0xF020),
+			routing_locality: Locality::new(partition.get() | 0x1234),
+			row_hlc: hlc(41),
+			is_tombstone: false,
+			partition: Some(partition),
+			table_object_id: None,
+		}];
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors(&batch, &source).unwrap();
+		let entries = crate::storage::multirow::storage_index_entries_from_batch(
+			&crate::storage::multirow::decode_batch(&encoded.frame).unwrap(),
+		)
+		.unwrap();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
+			.await
+			.unwrap();
+	}
+	slabs.push(mgr.force_seal_active_for_test().await);
+	// Slab D: many single-row and multirow frames interleaved, with a third version of key 1.
+	for at in 0..40u64 {
+		append_slab_rows_frame(&mgr, &[(100 + at, 50 + at)]).await;
+		append_slab_rows_frame(
+			&mgr,
+			&[(200 + at, 100 + at), (300 + at, 100 + at), (1, 200 + at)],
+		)
+		.await;
+	}
+	slabs.push(mgr.force_seal_active_for_test().await);
+	// A slab id that holds no row.
+	slabs.push(SlabId::new(9_999));
+	let whole = mgr.persistent_record_rows_snapshot();
+	let mut seen = 0;
+	for slab in &slabs {
+		let was = slab_rows_by_filtering_the_snapshot(&mgr, *slab);
+		let is = mgr.persistent_record_rows_of_slab(*slab);
+		assert_eq!(is.len(), was.len(), "slab {slab:?}: the same count");
+		assert!(
+			is == was,
+			"slab {slab:?}: the same rows, every field, in the same order"
+		);
+		// The stamps a location's equality does not compare, and the row's own copies of them.
+		for (at, (is, was)) in is.iter().zip(&was).enumerate() {
+			assert_eq!(
+				(
+					is.location.placement,
+					is.location.partition,
+					is.placement,
+					is.partition
+				),
+				(
+					was.location.placement,
+					was.location.partition,
+					was.placement,
+					was.partition
+				),
+				"slab {slab:?} row {at}: the same placement stamps and partitions"
+			);
+		}
+		assert_eq!(
+			crate::storage::index::lsm_rows_digest(is.iter().copied()),
+			crate::storage::index::lsm_rows_digest(was.iter().copied()),
+			"slab {slab:?}: the same digest"
+		);
+		seen += is.len();
+	}
+	assert_eq!(
+		slabs
+			.iter()
+			.map(|slab| mgr.persistent_record_rows_of_slab(*slab).len())
+			.collect::<Vec<_>>(),
+		vec![6, 5, 2, 160, 0],
+		"premise: the populations named above"
+	);
+	assert_eq!(seen, whole.len(), "the slabs partition the snapshot");
+	// The partitioned row is there, stamped, with its partition, in the location and in the row.
+	let c = mgr.persistent_record_rows_of_slab(slabs[2]);
+	let partitioned: Vec<_> = c
+		.iter()
+		.filter(|row| row.key_identity == id(0xF020))
+		.collect();
+	assert_eq!(
+		partitioned.len(),
+		1,
+		"premise: one partitioned row in slab C"
+	);
+	assert_eq!(
+		(
+			partitioned[0].location.placement,
+			partitioned[0].location.partition,
+			partitioned[0].placement,
+			partitioned[0].partition
+		),
+		(
+			crate::schema::table::PlacementSemantics::Partitioned,
+			Some(partition),
+			crate::schema::table::PlacementSemantics::Partitioned,
+			Some(partition)
+		),
+		"premise: a non-default stamp is among the compared rows"
+	);
+	// One frame's rows share an offset and differ by row index, in index order.
+	let b = mgr.persistent_record_rows_of_slab(slabs[1]);
+	assert!(
+		b.iter()
+			.all(|row| row.location.offset == b[0].location.offset),
+		"premise: slab B is one frame"
+	);
+	let mut indices: Vec<_> = b.iter().map(|row| row.location.record_row_index).collect();
+	indices.sort();
+	indices.dedup();
+	assert_eq!(
+		indices.len(),
+		5,
+		"premise: five distinct row indices at one offset"
+	);
+}
+
+/// Collecting one slab's rows builds and sorts that slab's rows only: with the target slab fixed,
+/// this thread's allocation calls and requested bytes across the collection do not grow with the
+/// rows of other slabs, where filtering the whole snapshot grows with them. Synchronous calls, so
+/// the thread's counts are the collection's own, during it and not only its final capacity.
+#[tokio::test]
+async fn collecting_a_slabs_rows_allocates_for_that_slab_alone() {
+	use crate::storage::mutation_visibility::tests::b1_assay::{thread_alloc_bytes, thread_allocs};
+	const TARGET: u64 = 2_000;
+	const OTHERS: u64 = 40_000;
+	let (_dir, mgr) = fresh_manager().await;
+	for frame in 0..TARGET / 400 {
+		let rows: Vec<(u64, u64)> = (frame * 400..(frame + 1) * 400)
+			.map(|at| (at, 1_000 + at))
+			.collect();
+		append_slab_rows_frame(&mgr, &rows).await;
+	}
+	let target = mgr.force_seal_active_for_test().await;
+	type Collect = fn(&SlabManager, SlabId) -> Vec<PersistentRecordRow>;
+	let measure = |collect: Collect| {
+		let (calls, bytes) = (thread_allocs(), thread_alloc_bytes());
+		let rows = collect(&mgr, target);
+		(thread_allocs() - calls, thread_alloc_bytes() - bytes, rows)
+	};
+	let of_slab: Collect = |mgr, slab| mgr.persistent_record_rows_of_slab(slab);
+	let (alone_calls, alone_bytes, alone) = measure(of_slab);
+	let (alone_was_calls, alone_was_bytes, alone_was) =
+		measure(slab_rows_by_filtering_the_snapshot);
+	assert!(alone == alone_was, "the same rows with the target alone");
+	assert_eq!(alone.len() as u64, TARGET);
+	// Other slabs' rows, twenty times the target's.
+	for frame in 0..OTHERS / 400 {
+		let rows: Vec<(u64, u64)> = (frame * 400..(frame + 1) * 400)
+			.map(|at| (1_000_000 + at, 5_000_000 + at))
+			.collect();
+		append_slab_rows_frame(&mgr, &rows).await;
+		if frame % 20 == 19 {
+			mgr.force_seal_active_for_test().await;
+		}
+	}
+	let (among_calls, among_bytes, among) = measure(of_slab);
+	let (among_was_calls, among_was_bytes, among_was) =
+		measure(slab_rows_by_filtering_the_snapshot);
+	assert!(among == among_was, "the same rows among the others");
+	assert!(among == alone, "the target's rows did not change");
+	println!(
+		"SLAB_ROWS row_bytes={} target={TARGET} others={OTHERS} of_slab: alone allocations={alone_calls} requested_bytes={alone_bytes}, among allocations={among_calls} requested_bytes={among_bytes}; snapshot_filter: alone allocations={alone_was_calls} requested_bytes={alone_was_bytes}, among allocations={among_was_calls} requested_bytes={among_was_bytes}",
+		std::mem::size_of::<PersistentRecordRow>(),
+	);
+	// The slab's own collection is no larger among twenty times as many other rows (a small
+	// allowance for the index's own iteration), and the snapshot filter is many times larger.
+	assert!(
+		among_bytes <= alone_bytes + alone_bytes / 8,
+		"requested bytes do not grow with other slabs: {among_bytes} against {alone_bytes}"
+	);
+	assert!(
+		among_calls <= alone_calls + 64,
+		"allocation calls do not grow with other slabs: {among_calls} against {alone_calls}"
+	);
+	assert!(
+		among_was_bytes > 10 * among_bytes,
+		"premise: filtering the snapshot grows with the other slabs: {among_was_bytes} against {among_bytes}"
+	);
+}

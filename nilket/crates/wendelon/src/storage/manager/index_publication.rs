@@ -456,6 +456,36 @@ impl SlabManager {
 		rows
 	}
 
+	/// The rows `persistent_record_rows_snapshot` holds for `slab_id`, in the snapshot's order,
+	/// with only that slab's locations built into rows and sorted: one pass over the same index,
+	/// the same row constructor and the same stable sort key, so equal keys keep the traversal's
+	/// order as they do there. The index is still walked whole; what is materialized is the slab.
+	pub(super) fn persistent_record_rows_of_slab(
+		&self,
+		slab_id: SlabId,
+	) -> Vec<PersistentRecordRow> {
+		let mut rows = Vec::new();
+		for entry in self.key_index.iter() {
+			let (tenant_id, key_identity) = *entry.key();
+			for location in entry.value().iter() {
+				if location.slab_id == slab_id {
+					rows.push(self.persistent_record_row(tenant_id, key_identity, *location));
+				}
+			}
+		}
+		rows.sort_by_key(|row| {
+			(
+				row.location.slab_id,
+				row.tenant_id,
+				row.key_identity,
+				row.location.hlc,
+				row.location.offset,
+				row.location.record_row_index,
+			)
+		});
+		rows
+	}
+
 	pub(super) fn has_rows_for_slab(&self, slab_id: SlabId) -> bool {
 		self.key_index.iter().any(|entry| {
 			entry

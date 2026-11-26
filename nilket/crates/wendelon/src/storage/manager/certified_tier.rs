@@ -954,11 +954,7 @@ impl SlabManager {
 		};
 		let slab = self.owner_ref()?.slab(slab_id);
 		let source_generation = TierGeneration::from(&source);
-		let source_rows: Vec<PersistentRecordRow> = self
-			.persistent_record_rows_snapshot()
-			.into_iter()
-			.filter(|row| row.location.slab_id == slab_id)
-			.collect();
+		let source_rows = self.persistent_record_rows_of_slab(slab_id);
 		let source_rows_digest =
 			crate::storage::index::lsm_rows_digest(source_rows.iter().copied());
 		let Some(l2) = self.config.l2.clone() else {
