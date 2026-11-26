@@ -217,6 +217,15 @@ impl RetirementSource {
 	}
 }
 
+/// A producer's decision, at a pointer transition, that a displaced object's unresolved edge
+/// to `expected_candidate` gives way to its real `successor`. `held` is whatever authorized
+/// the decision (the slab's rewrite claim, taken without waiting); the transaction keeps it
+/// until it has ended, whatever happens to the caller.
+pub(crate) struct SnapshotRetarget {
+	pub expected_candidate: String,
+	pub successor: String,
+	pub held: Box<dyn std::any::Any + Send>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RetainedObjectIntentState {
 	Unresolved,
@@ -3598,20 +3607,36 @@ impl PersistentLocalIndex {
 	/// Stage a snapshot-superseded live object without remote I/O.
 	/// If its prior publication has an unresolved predecessor, record that
 	/// evidence in the same transaction as the new retained record.
+	/// With `retarget`, the producer's explicit decision replaces the object's unresolved edge
+	/// to a candidate by its real successor, only against the durable record that decision was
+	/// made for; `retained` is then not written. Returns the record left standing.
 	pub(crate) async fn stage_snapshot_retained_object(
 		&self,
 		slab_id: SlabId,
 		uri: String,
 		retained: RetainedObjectIntent,
 		evidence: Vec<(String, RetainedObjectIntent)>,
-	) -> std::io::Result<()> {
+		retarget: Option<SnapshotRetarget>,
+	) -> std::io::Result<RetainedObjectIntent> {
 		self.require_cleanup_authority()?;
 		let mut key = slab_id.get().to_be_bytes().to_vec();
 		key.extend_from_slice(uri.as_bytes());
 		let _write = self.write_lock.lock().await;
 		self.db
 			.run(move |db| {
+				let mut retained = retained;
+				// What authorized a retarget stays held until this transaction has ended.
+				let (retarget, _held) = match retarget {
+					Some(SnapshotRetarget {
+						expected_candidate,
+						successor,
+						held,
+					}) => (Some((expected_candidate, successor)), Some(held)),
+					None => (None, None),
+				};
 				let tx = db.begin_write().map_err(redb_to_io)?;
+				// The record left standing when a proposed change is declined.
+				let mut kept: Option<RetainedObjectIntent> = None;
 				{
 					let mut table = tx
 						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
@@ -3625,7 +3650,66 @@ impl PersistentLocalIndex {
 						})
 						.transpose()?;
 					let mut write_retained = true;
-					if let Some(prior) = existing {
+					if let Some((expected_candidate, successor)) = &retarget {
+						// The producer's explicit decision: this object's unresolved edge to
+						// `expected_candidate` gives way to `successor`. It is applied only
+						// to the durable record it was made for, never inferred from a
+						// difference between the proposed and the durable record.
+						let Some(prior) = existing else {
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"conflicting snapshot retained record",
+							));
+						};
+						let unresolved = prior.state == RetainedObjectIntentState::Unresolved;
+						let names = |uri: &str| prior.replacement_uri.as_deref() == Some(uri);
+						let expected = unresolved && names(expected_candidate);
+						// The candidate's own provisional record (one keyed read) keeps the
+						// slab fenced until that candidate's own outcome is known. Without
+						// it this edge is the only unresolved obligation and stays.
+						let candidate_fences = expected && {
+							let mut candidate_key = slab_id.get().to_be_bytes().to_vec();
+							candidate_key.extend_from_slice(expected_candidate.as_bytes());
+							table
+								.get(candidate_key.as_slice())
+								.map_err(redb_to_io)?
+								.map(|v| {
+									postcard::from_bytes::<RetainedObjectIntent>(v.value())
+										.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+								})
+								.transpose()?
+								.is_some_and(|own| {
+									matches!(
+										own.state,
+										RetainedObjectIntentState::Unresolved
+											| RetainedObjectIntentState::CandidateNotSubmitted
+									) && own.replacement_uri.as_deref()
+										== Some(expected_candidate.as_str())
+								})
+						};
+						if candidate_fences {
+							// Nothing else of the durable record changes, and no publication
+							// is recorded.
+							let mut next = prior;
+							next.replacement_uri = Some(successor.clone());
+							next.replacement_bytes = None;
+							retained = next;
+						} else if expected || (unresolved && names(successor)) {
+							// The expected edge whose candidate has no record of its own (it
+							// is then the only unresolved obligation), or exactly this
+							// transition already made (a replay; a past publication to the
+							// successor is not one): the durable record stands as it is.
+							write_retained = false;
+							kept = Some(prior);
+						} else {
+							// Any other durable record is not the one this decision was made
+							// for: refused, before anything of this transition is written.
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"conflicting snapshot retained record",
+							));
+						}
+					} else if let Some(prior) = existing {
 						let provisional = matches!(
 							prior.state,
 							RetainedObjectIntentState::Unresolved
@@ -3694,7 +3778,8 @@ impl PersistentLocalIndex {
 							.map_err(redb_to_io)?;
 					}
 				}
-				tx.commit().map_err(redb_to_io)
+				tx.commit().map_err(redb_to_io)?;
+				Ok(kept.unwrap_or(retained))
 			})
 			.await
 	}

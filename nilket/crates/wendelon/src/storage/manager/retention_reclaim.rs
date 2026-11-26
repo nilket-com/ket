@@ -1298,12 +1298,42 @@ impl SlabManager {
 		})?;
 		self.unresolved_tier_cleanup
 			.begin_snapshot(slab_id, &old.l2_uri);
-		index
+		// An unresolved edge to a candidate that is not the object now displacing this one:
+		// the producer knows the real successor, so it decides, explicitly, that the record
+		// takes it (keeping its size and its publication history; publication is recorded
+		// later, by the path that establishes it). The candidate keeps its own provisional
+		// record, which then stands alone and resolves on its own outcome. Decided only when
+		// no worker drives the slab: its rewrite claim is tried without waiting, only for a
+		// record of this shape, and moves into the write, which applies the decision only
+		// to the durable edge named here and otherwise leaves the record as it stands.
+		let retarget = match (&retained, replacement) {
+			(record, Some(pointer))
+				if record.state == RetainedObjectIntentState::Unresolved
+					&& record
+						.replacement_uri
+						.as_deref()
+						.is_some_and(|candidate| candidate != pointer.l2_uri) =>
+			{
+				self.slab_rewrite_claim(slab_id)
+					.try_write_owned()
+					.ok()
+					.map(|claim| crate::storage::index::SnapshotRetarget {
+						expected_candidate: record.replacement_uri.clone().unwrap_or_default(),
+						successor: pointer.l2_uri.clone(),
+						held: Box::new(claim),
+					})
+			}
+			_ => None,
+		};
+		// What the write left standing: the proposed record, the retargeted durable record,
+		// or the durable record it kept.
+		let retained = index
 			.stage_snapshot_retained_object(
 				slab_id,
 				old.l2_uri.clone(),
-				retained.clone(),
+				retained,
 				evidence.clone(),
+				retarget,
 			)
 			.await?;
 		self.unresolved_tier_cleanup.update(|intents| {
@@ -1533,9 +1563,22 @@ impl SlabManager {
 				let Some(replacement) = intent.replacement_uri.as_deref() else {
 					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
 				};
-				if self
-					.unresolved_tier_cleanup
-					.published(slab_id, &uri, replacement)
+				// A replacement already in this record's history settles nothing while the
+				// record is Unresolved toward it again: only that replacement being the live
+				// pointer now does, by the publication step below.
+				let republished = uri != replacement
+					&& intent.state == RetainedObjectIntentState::Unresolved
+					&& self.unapplied_tier_pointer(slab_id).is_none()
+					&& self
+						.tier_pointer(slab_id)
+						.await
+						.as_ref()
+						.map(|p| p.l2_uri.as_str())
+						== Some(replacement);
+				if !republished
+					&& self
+						.unresolved_tier_cleanup
+						.published(slab_id, &uri, replacement)
 				{
 					return Ok(());
 				}

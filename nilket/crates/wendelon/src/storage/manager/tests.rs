@@ -72201,6 +72201,21 @@ async fn rejected_pair_on_manager() -> (
 	String,
 	TieredSlabPointer,
 ) {
+	staged_pair_on_manager(true).await
+}
+
+/// [`rejected_pair_on_manager`]; with `rejected` false the candidate's outcome is not yet known:
+/// no rejected-candidate row is written.
+async fn staged_pair_on_manager(
+	rejected: bool,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	String,
+	TieredSlabPointer,
+) {
 	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let candidate = l2.put("tier/rejected-candidate.wnd", &bytes).await.unwrap();
@@ -72214,16 +72229,9 @@ async fn rejected_pair_on_manager() -> (
 	mgr.prepare_tier_candidate_proposal(old.slab_id, &candidate)
 		.await
 		.unwrap();
-	mgr.persistent_index
-		.as_ref()
-		.unwrap()
-		.record_rejected_tier_candidate_for_test(crate::storage::index::RejectedTierCandidate {
-			op_seq: 9001,
-			slab_id: old.slab_id,
-			l2_uri: candidate.clone(),
-			payload_hash: old.payload_hash,
-		})
-		.await;
+	if rejected {
+		record_candidate_rejected(&mgr, old.slab_id, &candidate, old.payload_hash).await;
+	}
 	assert!(mgr.refuse_unresolved_cleanup(old.slab_id).is_err());
 	let mut replacement = old.clone();
 	replacement.l2_uri = committed;
@@ -72415,10 +72423,13 @@ async fn a_rejected_pair_is_not_resolved_between_a_recorded_transition_and_its_p
 			0,
 			"direct {direct}: no lookup"
 		);
+		// The displaced object's own record is untouched at the cut. (The rejected
+		// candidate's record, once it stands alone, may be cleared on its rejection at any
+		// time: that is the existing standalone rule and deletes nothing.)
 		assert_eq!(
-			manager_cleanup_records(&mgr, slab).await,
-			at_cut,
-			"direct {direct}: no record changed at the cut"
+			manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
+			at_cut.get(&old.l2_uri),
+			"direct {direct}: the displaced object's record did not change at the cut"
 		);
 		cut.resume.notify_one();
 		publication
@@ -72496,4 +72507,634 @@ async fn a_publication_after_a_rejected_pair_resolution_accounts_for_the_displac
 		);
 		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
 	}
+}
+
+/// A rejected-candidate row for `candidate`, as recovery's rejected handoff writes one.
+async fn record_candidate_rejected(
+	mgr: &SlabManager,
+	slab: SlabId,
+	candidate: &str,
+	payload_hash: [u8; 32],
+) {
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.record_rejected_tier_candidate_for_test(crate::storage::index::RejectedTierCandidate {
+			op_seq: 9001,
+			slab_id: slab,
+			l2_uri: candidate.to_owned(),
+			payload_hash,
+		})
+		.await;
+}
+
+/// The committed pointer `replacement` published for its slab: by a snapshot install, or by
+/// the direct reconciliation of a committed pointer.
+async fn publish_replacement(mgr: &SlabManager, replacement: &TieredSlabPointer, direct: bool) {
+	if direct {
+		let epoch = mgr.capture_snapshot_epoch();
+		let committed = replacement.clone();
+		mgr.reconcile_tier_slab_at_snapshot_epoch(replacement.slab_id, epoch, move |_| {
+			Ok(Some(committed.clone()))
+		})
+		.await
+		.unwrap();
+	} else {
+		install_snapshot_pointer(mgr, replacement.clone(), 910).await;
+	}
+}
+
+/// DC-289, publication first: a publication of X displaces O while O's record is still
+/// Unresolved toward a candidate C that was durably rejected. The transition gives O's record
+/// its real successor; ordinary reconciliation then publishes O to X and clears C's own
+/// record on its rejection. Through a snapshot install and the direct reconciliation: the
+/// fence is released, O is retained exactly once with its known size, nothing names C, both
+/// hold after a reopen, and a new rewrite can be staged. No object is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_over_a_rejected_pair_releases_its_fence_and_keeps_the_displaced_size() {
+	for direct in [false, true] {
+		let (dirs, mgr, l2, old, candidate, replacement) = rejected_pair_on_manager().await;
+		let slab = old.slab_id;
+		let old_bytes = l2.head(&old.l2_uri).await.unwrap().size_bytes;
+		publish_replacement(&mgr, &replacement, direct).await;
+		assert_eq!(mgr.tier_pointer(slab).await, Some(replacement.clone()));
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap_or_else(|error| panic!("direct {direct}: the fence is released: {error}"));
+		let check = |records: BTreeMap<String, crate::storage::index::RetainedObjectIntent>,
+		             accounting: (u64, u64, u64)| {
+			assert_eq!(
+				records.keys().collect::<Vec<_>>(),
+				vec![&old.l2_uri],
+				"direct {direct}: the displaced object, once, and nothing else: {records:?}"
+			);
+			let retained = &records[&old.l2_uri];
+			assert_eq!(
+				retained.bytes,
+				Some(old_bytes),
+				"direct {direct}: {retained:?}"
+			);
+			assert_eq!(
+				retained.state,
+				crate::storage::index::RetainedObjectIntentState::ReplacementPublished,
+				"direct {direct}: {retained:?}"
+			);
+			assert!(
+				retained.was_published(&replacement.l2_uri) && !retained.was_published(&candidate),
+				"direct {direct}: published to its real successor only: {retained:?}"
+			);
+			assert_eq!(
+				accounting,
+				(1, old_bytes, 0),
+				"direct {direct}: one retained object of known size"
+			);
+		};
+		check(
+			manager_cleanup_records(&mgr, slab).await,
+			mgr.retained_cleanup_test_accounting(),
+		);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
+		for uri in [&old.l2_uri, &candidate, &replacement.l2_uri] {
+			l2.get(uri).await.expect("no object is deleted");
+		}
+		let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+		mgr.wait_tier_authority_ready().await.unwrap();
+		check(
+			manager_cleanup_records(&mgr, slab).await,
+			mgr.retained_cleanup_test_accounting(),
+		);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
+		let next = l2
+			.put(
+				&format!("tier/next-after-publication-{direct}.wnd"),
+				&l2.get(&replacement.l2_uri).await.unwrap(),
+			)
+			.await
+			.unwrap();
+		mgr.persist_table_drop_l2_cleanup(slab, &replacement.l2_uri, Some(&next))
+			.await
+			.unwrap_or_else(|error| panic!("direct {direct}: a new rewrite stages: {error}"));
+	}
+}
+
+/// DC-289, publication first, the candidate's outcome not yet known at the transition. O is
+/// still given its real successor and published to X with its size; C's own record stands
+/// alone and Unresolved, so the slab stays fenced: an unknown outcome clears nothing. Once the
+/// rejection is recorded, the next pass clears C and releases the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_over_an_undecided_pair_stays_fenced_until_the_candidate_is_rejected() {
+	use crate::storage::index::RetainedObjectIntentState;
+	for direct in [false, true] {
+		let (_dirs, mgr, l2, old, candidate, replacement) = staged_pair_on_manager(false).await;
+		let slab = old.slab_id;
+		let old_bytes = l2.head(&old.l2_uri).await.unwrap().size_bytes;
+		publish_replacement(&mgr, &replacement, direct).await;
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.expect_err("an undecided candidate keeps the slab fenced");
+		let records = manager_cleanup_records(&mgr, slab).await;
+		let retained = &records[&old.l2_uri];
+		assert_eq!(
+			(retained.state, retained.bytes),
+			(
+				RetainedObjectIntentState::ReplacementPublished,
+				Some(old_bytes)
+			),
+			"direct {direct}: the displaced object is published to its successor: {records:?}"
+		);
+		assert!(retained.was_published(&replacement.l2_uri), "{retained:?}");
+		assert_eq!(
+			records.get(&candidate).map(|record| {
+				(
+					record.state,
+					record.replacement_uri.as_deref() == Some(candidate.as_str()),
+				)
+			}),
+			Some((RetainedObjectIntentState::Unresolved, true)),
+			"direct {direct}: the candidate's own record stands, undecided: {records:?}"
+		);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_err());
+		record_candidate_rejected(&mgr, slab, &candidate, old.payload_hash).await;
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap_or_else(|error| panic!("direct {direct}: the rejection clears it: {error}"));
+		let records = manager_cleanup_records(&mgr, slab).await;
+		assert_eq!(
+			records.keys().collect::<Vec<_>>(),
+			vec![&old.l2_uri],
+			"direct {direct}: {records:?}"
+		);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
+	}
+}
+
+/// DC-289, publication first, stopped between the recorded transition and the pointer. At
+/// that cut O's record already names its real successor X, with O's size, and is not
+/// published; the pointer is still O and the slab stays fenced. Completed, a pass publishes O
+/// to X and releases the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_transition_names_the_real_successor_before_the_pointer_moves() {
+	use crate::storage::index::RetainedObjectIntentState;
+	for direct in [false, true] {
+		let (_dirs, mgr, l2, old, _candidate, replacement) = rejected_pair_on_manager().await;
+		let slab = old.slab_id;
+		let old_bytes = l2.head(&old.l2_uri).await.unwrap().size_bytes;
+		let cut = mgr.pause_after_pointer_transition_recorded_once();
+		let publication = {
+			let (mgr, replacement) = (mgr.clone(), replacement.clone());
+			tokio::spawn(async move { publish_replacement(&mgr, &replacement, direct).await })
+		};
+		tokio::time::timeout(Duration::from_secs(60), cut.reached.notified())
+			.await
+			.unwrap_or_else(|_| panic!("direct {direct}: the publication reaches the cut"));
+		assert_eq!(mgr.tier_pointer(slab).await, Some(old.clone()));
+		let at_cut = manager_cleanup_records(&mgr, slab).await;
+		let retained = &at_cut[&old.l2_uri];
+		assert_eq!(
+			(
+				retained.state,
+				retained.replacement_uri.as_deref(),
+				retained.bytes,
+				retained.was_published(&replacement.l2_uri)
+			),
+			(
+				RetainedObjectIntentState::Unresolved,
+				Some(replacement.l2_uri.as_str()),
+				Some(old_bytes),
+				false
+			),
+			"direct {direct}: the successor is recorded, not yet published: {at_cut:?}"
+		);
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.expect_err("nothing is published before the pointer moves");
+		assert_eq!(
+			manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
+			at_cut.get(&old.l2_uri),
+			"direct {direct}: the displaced object's record did not change at the cut"
+		);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_err());
+		cut.resume.notify_one();
+		publication.await.unwrap();
+		mgr.wait_tier_authority_ready().await.unwrap();
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap_or_else(|error| panic!("direct {direct}: released after the switch: {error}"));
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
+	}
+}
+
+/// DC-289, publication first, a candidate with no fencing record of its own. A rewrite staged
+/// toward a URI that already has retained history gets no provisional record, so O's edge to
+/// it is the slab's only unresolved obligation; nothing records a rejection. A real
+/// publication of a fresh X then leaves O's record exactly as it stands and the slab fenced:
+/// the edge is not given up on a transition alone. Through a snapshot install and the direct
+/// reconciliation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_keeps_an_edge_whose_candidate_has_no_record_of_its_own() {
+	use crate::storage::index::RetainedObjectIntentState;
+	for direct in [false, true] {
+		let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+		let slab = old.slab_id;
+		let bytes = l2.get(&old.l2_uri).await.unwrap();
+		let earlier = l2.put("tier/earlier-x.wnd", &bytes).await.unwrap();
+		let historical = l2.put("tier/historical-a.wnd", &bytes).await.unwrap();
+		let fresh = l2.put("tier/fresh-committed.wnd", &bytes).await.unwrap();
+		// O -> earlier -> historical, each published; then a snapshot makes O live again.
+		for (from, to) in [(&old.l2_uri, &earlier), (&earlier, &historical)] {
+			mgr.persist_table_drop_l2_cleanup(slab, from, Some(to))
+				.await
+				.unwrap();
+			let mut pointer = old.clone();
+			pointer.l2_uri = to.clone();
+			mgr.apply_tier_slab(pointer).await.unwrap();
+			mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+				.await
+				.unwrap();
+		}
+		install_snapshot_pointer(&mgr, old.clone(), 920).await;
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap();
+		// A rewrite of O staged toward the historical URI: no provisional record for it.
+		mgr.persist_table_drop_l2_cleanup(slab, &old.l2_uri, Some(&historical))
+			.await
+			.unwrap();
+		let staged = manager_cleanup_records(&mgr, slab).await;
+		assert_eq!(
+			staged[&old.l2_uri].state,
+			RetainedObjectIntentState::Unresolved,
+			"{staged:?}"
+		);
+		assert_eq!(
+			staged[&old.l2_uri].replacement_uri.as_deref(),
+			Some(historical.as_str())
+		);
+		assert!(
+			!staged.get(&historical).is_some_and(|own| {
+				matches!(
+					own.state,
+					RetainedObjectIntentState::Unresolved
+						| RetainedObjectIntentState::CandidateNotSubmitted
+				) && own.replacement_uri.as_deref() == Some(historical.as_str())
+			}),
+			"direct {direct}: premise: the candidate has no fencing record of its own: {staged:?}"
+		);
+		let mut replacement = old.clone();
+		replacement.l2_uri = fresh;
+		publish_replacement(&mgr, &replacement, direct).await;
+		let _ = mgr
+			.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await;
+		assert_eq!(
+			manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
+			staged.get(&old.l2_uri),
+			"direct {direct}: the edge stands"
+		);
+		assert!(
+			mgr.refuse_unresolved_cleanup(slab).is_err(),
+			"direct {direct}: still fenced"
+		);
+	}
+}
+
+/// DC-289, publication first, the successor already in the displaced object's history. O was
+/// once published to X, then made live again; a fresh rewrite O -> C was prepared and its
+/// candidate rejected; a real publication of X then displaces O again. While O is still the
+/// pointer (the recorded transition, before the switch) the record is Unresolved toward X
+/// and the slab fenced: the historical publication settles nothing. Once X is installed the
+/// record is published, with its history and size, through a reopen, and a new rewrite can
+/// be staged. Through a snapshot install and the direct reconciliation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_to_an_earlier_successor_settles_only_once_it_is_live_again() {
+	use crate::storage::index::RetainedObjectIntentState;
+	for direct in [false, true] {
+		let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+		let slab = old.slab_id;
+		let bytes = l2.get(&old.l2_uri).await.unwrap();
+		let old_bytes = l2.head(&old.l2_uri).await.unwrap().size_bytes;
+		let successor = l2.put("tier/earlier-successor.wnd", &bytes).await.unwrap();
+		let candidate = l2.put("tier/fresh-candidate.wnd", &bytes).await.unwrap();
+		let mut replacement = old.clone();
+		replacement.l2_uri = successor.clone();
+		// O -> X published; then a snapshot makes O live again.
+		mgr.persist_table_drop_l2_cleanup(slab, &old.l2_uri, Some(&successor))
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(replacement.clone()).await.unwrap();
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap();
+		install_snapshot_pointer(&mgr, old.clone(), 930).await;
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap();
+		// A fresh rewrite O -> C, prepared, its candidate rejected.
+		mgr.persist_table_drop_l2_cleanup(slab, &old.l2_uri, Some(&candidate))
+			.await
+			.unwrap();
+		mgr.prepare_tier_candidate_proposal(slab, &candidate)
+			.await
+			.unwrap();
+		record_candidate_rejected(&mgr, slab, &candidate, old.payload_hash).await;
+		let staged = manager_cleanup_records(&mgr, slab).await;
+		assert!(
+			staged[&old.l2_uri]
+				.published_replacements
+				.contains(&successor),
+			"direct {direct}: premise: X is in O's history: {staged:?}"
+		);
+		// A real publication of X, parked after its recorded transition.
+		let cut = mgr.pause_after_pointer_transition_recorded_once();
+		let publication = {
+			let (mgr, replacement) = (mgr.clone(), replacement.clone());
+			tokio::spawn(async move { publish_replacement(&mgr, &replacement, direct).await })
+		};
+		tokio::time::timeout(Duration::from_secs(60), cut.reached.notified())
+			.await
+			.unwrap_or_else(|_| panic!("direct {direct}: the publication reaches the cut"));
+		assert_eq!(mgr.tier_pointer(slab).await, Some(old.clone()));
+		let _ = mgr
+			.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await;
+		let at_cut = manager_cleanup_records(&mgr, slab).await;
+		assert_eq!(
+			(
+				at_cut[&old.l2_uri].state,
+				at_cut[&old.l2_uri].replacement_uri.as_deref()
+			),
+			(
+				RetainedObjectIntentState::Unresolved,
+				Some(successor.as_str())
+			),
+			"direct {direct}: unresolved toward X while O is still live: {at_cut:?}"
+		);
+		assert!(
+			mgr.refuse_unresolved_cleanup(slab).is_err(),
+			"direct {direct}: a historical publication does not release the fence"
+		);
+		cut.resume.notify_one();
+		publication.await.unwrap();
+		mgr.wait_tier_authority_ready().await.unwrap();
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.unwrap_or_else(|error| panic!("direct {direct}: settled once X is live: {error}"));
+		let check = |records: BTreeMap<String, crate::storage::index::RetainedObjectIntent>| {
+			let retained = &records[&old.l2_uri];
+			assert_eq!(
+				(
+					retained.state,
+					retained.replacement_uri.as_deref(),
+					retained.bytes
+				),
+				(
+					RetainedObjectIntentState::ReplacementPublished,
+					Some(successor.as_str()),
+					Some(old_bytes)
+				),
+				"direct {direct}: {records:?}"
+			);
+			assert!(retained.published_replacements.contains(&successor));
+			assert!(
+				!records.contains_key(&candidate),
+				"direct {direct}: the rejected candidate's record is gone: {records:?}"
+			);
+		};
+		check(manager_cleanup_records(&mgr, slab).await);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
+		let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+		mgr.wait_tier_authority_ready().await.unwrap();
+		check(manager_cleanup_records(&mgr, slab).await);
+		assert!(mgr.refuse_unresolved_cleanup(slab).is_ok());
+		let next = l2
+			.put(&format!("tier/next-after-earlier-{direct}.wnd"), &bytes)
+			.await
+			.unwrap();
+		mgr.persist_table_drop_l2_cleanup(slab, &successor, Some(&next))
+			.await
+			.unwrap_or_else(|error| panic!("direct {direct}: a new rewrite stages: {error}"));
+	}
+}
+
+/// DC-289: a pointer transition leaves a live worker's edge to it. A real certified rewrite
+/// is parked after its acceptance, still holding the slab's rewrite claim, its record for O
+/// Unresolved toward its own candidate. The production transition function is then called
+/// for O with another successor (a pointer value only: this fixture has no second committed
+/// object, so this exercises the guard against the real worker, not a real publication):
+/// O's record is unchanged. Released, the worker publishes its own candidate and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pointer_transition_leaves_a_live_certified_rewrites_edge_to_its_worker() {
+	use crate::storage::manager::certified_tier::{CertifiedTierCut, CertifiedTierStep};
+	let store = certified_partial_store("certified-live-rewrite-transition").await;
+	let old = store.pointer.clone();
+	let (reached, release) = store
+		.mgr
+		.hold_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	let mut worker = {
+		let (mgr, plain) = (store.mgr.clone(), store.plain.clone());
+		let decider = store.decider(None, false);
+		tokio::spawn(async move {
+			mgr.run_certified_tier_step(plain.as_ref(), &decider, &TableSchemaCatalog::default())
+				.await
+		})
+	};
+	tokio::select! {
+		parked = tokio::time::timeout(Duration::from_secs(60), reached.acquire()) => {
+			parked.expect("the worker parks after acceptance").unwrap().forget();
+		}
+		ended = &mut worker => panic!("the worker ended before its hold: {:?}", ended.unwrap()),
+	}
+	let before = slab_cleanup_records(&store).await;
+	let mut elsewhere = old.clone();
+	elsewhere.l2_uri = format!("{}-another-successor", old.l2_uri);
+	store
+		.mgr
+		.record_retained_pointer_transition(&old, Some(&elsewhere), true)
+		.await
+		.unwrap();
+	assert_eq!(
+		slab_cleanup_records(&store).await,
+		before,
+		"the live worker's edge is left to it"
+	);
+	release.add_permits(1);
+	let step = tokio::time::timeout(Duration::from_secs(60), &mut worker)
+		.await
+		.expect("the released worker ends")
+		.unwrap()
+		.expect("the worker publishes its own candidate");
+	assert!(
+		matches!(step, CertifiedTierStep::Rewritten { slab, .. } if slab == store.slab),
+		"{step:?}"
+	);
+	assert!(store.mgr.refuse_unresolved_cleanup(store.slab).is_ok());
+	store.close().await;
+}
+
+/// The rejected-pair fixture with its durable records made to differ from the manager's
+/// cache: on disk O names another candidate D, which has a provisional record of its own
+/// (all other fields as for C); the cache still says O -> C. Returns the fixture, D's URI,
+/// and the durable records of O and D.
+async fn pair_with_another_durable_candidate() -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	String,
+	TieredSlabPointer,
+	String,
+	crate::storage::index::RetainedObjectIntent,
+	crate::storage::index::RetainedObjectIntent,
+) {
+	let (dirs, mgr, l2, old, candidate, replacement) = rejected_pair_on_manager().await;
+	let slab = old.slab_id;
+	let other = l2
+		.put(
+			"tier/other-candidate.wnd",
+			&l2.get(&old.l2_uri).await.unwrap(),
+		)
+		.await
+		.unwrap();
+	let cached = manager_cleanup_records(&mgr, slab).await;
+	let mut old_names_other = cached[&old.l2_uri].clone();
+	old_names_other.replacement_uri = Some(other.clone());
+	let mut other_own = cached[&candidate].clone();
+	other_own.replacement_uri = Some(other.clone());
+	let index = mgr.persistent_index.as_ref().unwrap();
+	index
+		.overwrite_snapshot_cleanup_intent_for_test(
+			slab,
+			old.l2_uri.clone(),
+			old_names_other.clone(),
+		)
+		.await;
+	index
+		.overwrite_snapshot_cleanup_intent_for_test(slab, other.clone(), other_own.clone())
+		.await;
+	(
+		dirs,
+		mgr,
+		l2,
+		old,
+		candidate,
+		replacement,
+		other,
+		old_names_other,
+		other_own,
+	)
+}
+
+/// DC-289: a transition that decides no retarget cannot use the retarget's write. With the
+/// same divergence (cache O -> C, disk O -> D with D fencing), a displacement with no
+/// successor (a retirement) and a displacement while a worker holds the slab's rewrite claim
+/// both keep their prior record; the write refuses the stale cached record as it always did,
+/// and the durable edge to D, and D's own record, are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transition_without_a_retarget_decision_cannot_overwrite_another_durable_edge() {
+	for busy_worker in [false, true] {
+		let (_dirs, mgr, _l2, old, _candidate, replacement, other, old_names_other, other_own) =
+			pair_with_another_durable_candidate().await;
+		let slab = old.slab_id;
+		let worker = if busy_worker {
+			Some(mgr.slab_rewrite_claim(slab).write_owned().await)
+		} else {
+			None
+		};
+		let successor = busy_worker.then_some(&replacement);
+		mgr.record_retained_pointer_transition(&old, successor, true)
+			.await
+			.expect_err("the stale cached record is refused, as before");
+		drop(worker);
+		let durable = manager_cleanup_records(&mgr, slab).await;
+		assert_eq!(
+			(durable.get(&old.l2_uri), durable.get(&other)),
+			(Some(&old_names_other), Some(&other_own)),
+			"busy worker {busy_worker}: the durable edge and its fence are unchanged: {durable:?}"
+		);
+	}
+}
+
+/// DC-289: the retarget is the producer's explicit decision for one edge, and a durable
+/// record that is not the one it was made for refuses the transition, as on the delivered
+/// base. The cache says O -> C; at the producer (the transition function, with a real
+/// successor X):
+/// - on disk O names another candidate D that fences on its own: refused; O -> D and D's own
+///   record unchanged; nothing names X; the pointer has not moved;
+/// - on disk O is already published to another object Y: refused; the record unchanged;
+/// - on disk O already names X, unresolved (exactly this transition, already made): accepted
+///   as a replay, nothing rewritten, and the cache converges to the durable record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retarget_is_applied_or_replayed_only_against_its_own_durable_edge() {
+	use crate::storage::index::RetainedObjectIntentState;
+	// Another candidate, fencing on its own.
+	let (_dirs, mgr, _l2, old, candidate, replacement, other, old_names_other, other_own) =
+		pair_with_another_durable_candidate().await;
+	let slab = old.slab_id;
+	mgr.record_retained_pointer_transition(&old, Some(&replacement), true)
+		.await
+		.expect_err("a durable edge to another candidate refuses the transition");
+	let durable = manager_cleanup_records(&mgr, slab).await;
+	assert_eq!(
+		(durable.get(&old.l2_uri), durable.get(&other)),
+		(Some(&old_names_other), Some(&other_own)),
+		"the durable edge and its fence are unchanged: {durable:?}"
+	);
+	assert!(
+		!durable.contains_key(&replacement.l2_uri)
+			&& !durable.values().any(|record| {
+				record.replacement_uri.as_deref() == Some(replacement.l2_uri.as_str())
+					|| record.was_published(&replacement.l2_uri)
+			}) && durable[&old.l2_uri].replacement_uri.as_deref() != Some(candidate.as_str()),
+		"nothing names the successor, and the cached candidate is not written: {durable:?}"
+	);
+	assert_eq!(mgr.tier_pointer(slab).await, Some(old.clone()));
+	assert!(mgr.refuse_unresolved_cleanup(slab).is_err());
+
+	// Already published to another object.
+	let (_dirs, mgr, _l2, old, _candidate, replacement) = rejected_pair_on_manager().await;
+	let slab = old.slab_id;
+	let mut terminal = manager_cleanup_records(&mgr, slab).await[&old.l2_uri].clone();
+	terminal.state = RetainedObjectIntentState::ReplacementPublished;
+	terminal.replacement_uri = Some("another-published-object".to_owned());
+	terminal.replacement_bytes = None;
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.overwrite_snapshot_cleanup_intent_for_test(slab, old.l2_uri.clone(), terminal.clone())
+		.await;
+	mgr.record_retained_pointer_transition(&old, Some(&replacement), true)
+		.await
+		.expect_err("a record already published elsewhere refuses the transition");
+	assert_eq!(
+		manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
+		Some(&terminal)
+	);
+
+	// Exactly this transition, already made.
+	let (_dirs, mgr, _l2, old, _candidate, replacement) = rejected_pair_on_manager().await;
+	let slab = old.slab_id;
+	let mut made = manager_cleanup_records(&mgr, slab).await[&old.l2_uri].clone();
+	made.replacement_uri = Some(replacement.l2_uri.clone());
+	made.replacement_bytes = None;
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.overwrite_snapshot_cleanup_intent_for_test(slab, old.l2_uri.clone(), made.clone())
+		.await;
+	mgr.record_retained_pointer_transition(&old, Some(&replacement), true)
+		.await
+		.expect("a replay of the transition already made");
+	assert_eq!(
+		manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
+		Some(&made),
+		"nothing is rewritten"
+	);
+	// The cache now holds the durable record: the same call again decides nothing new.
+	mgr.record_retained_pointer_transition(&old, Some(&replacement), true)
+		.await
+		.expect("the cache converged to the durable record");
+	assert_eq!(
+		manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
+		Some(&made)
+	);
 }
