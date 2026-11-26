@@ -1141,7 +1141,7 @@ impl SlabManager {
 		self.certified_observer
 			.enter(step, super::certified_observer::TierJobStage::Allocating);
 		let observed_epoch = self.capture_snapshot_epoch();
-		let ticket = match self
+		let allocation = match self
 			.allocate_certified_tier_op(CertifiedTierWork::Retire { slab: job.slab }, evidence)
 			.await?
 		{
@@ -1151,8 +1151,12 @@ impl SlabManager {
 					candidate: None,
 				});
 			}
-			CertifiedTierAllocation::Allocated(allocation) => allocation.first,
+			CertifiedTierAllocation::Allocated(allocation) => allocation,
 		};
+		// The operation stays this step's own until its submission has returned, as the
+		// rewrite's does: the operation driver takes only what nobody owns.
+		let ownership = allocation.ownership;
+		let ticket = allocation.first;
 		let op = ticket.key();
 		let scope = CreditScope::of_ticket(&ticket);
 		self.certified_observer.submitting(step, op.op_seq);
@@ -1160,7 +1164,9 @@ impl SlabManager {
 		self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
 		let handoff =
 			crate::storage::sweeper::submit_tier_retirement_handed_off(self, committer, &ticket)
-				.await?;
+				.await;
+		drop(ownership);
+		let handoff = handoff?;
 		self.certified_observer
 			.enter(step, super::certified_observer::TierJobStage::Delivering);
 		#[cfg(test)]

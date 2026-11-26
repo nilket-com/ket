@@ -71481,3 +71481,159 @@ async fn collecting_a_slabs_rows_allocates_for_that_slab_alone() {
 		"premise: filtering the snapshot grows with the other slabs: {among_was_bytes} against {among_bytes}"
 	);
 }
+
+/// DC-289: one certified step run to its real Applied decision and durable effect and held at
+/// its own handoff (the pause inside `hand_off_op_if_complete`, armed for the worker and
+/// disarmed once the worker is inside), with acknowledgements held. While it is held, one
+/// real pass of the operation driver must return Ok and leave the worker's intent and the
+/// pending acknowledgements exactly as they were. Released, the worker returns its own step
+/// for that slab and operation, hands the operation off once, and reaches its retention note.
+async fn a_held_certified_worker_keeps_its_operation(retire: bool) {
+	use crate::storage::index::LoadedOp;
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let store = if retire {
+		let (first, second) = (id(0x7611), id(0x7612));
+		certified_tier_store(
+			"certified-retire-keeps-its-op",
+			&[(first, 10, 1), (second, 11, 2)],
+			&[(first, 10), (second, 11)],
+			&[],
+			first,
+		)
+		.await
+	} else {
+		let (obsolete, owned, unlisted) = (id(0x7621), id(0x7622), id(0x7623));
+		certified_tier_store(
+			"certified-rewrite-keeps-its-op",
+			&[
+				(obsolete, 10, 1),
+				(obsolete, 20, 2),
+				(owned, 15, 3),
+				(unlisted, 12, 4),
+			],
+			&[(obsolete, 10)],
+			&[(owned, 15)],
+			obsolete,
+		)
+		.await
+	};
+	let index = store.mgr.persistent_index().unwrap();
+	store.mgr.hold_acks_for_test(true);
+	assert_eq!(index.load_op_intents().await.unwrap(), Vec::new());
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*store
+		.mgr
+		.continuity_test_holds
+		.op_handoff_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let mut worker = {
+		let (mgr, plain) = (store.mgr.clone(), store.plain.clone());
+		let decider = store.decider(None, false);
+		tokio::spawn(async move {
+			mgr.run_certified_tier_step(plain.as_ref(), &decider, &TableSchemaCatalog::default())
+				.await
+		})
+	};
+	tokio::select! {
+		reached = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => {
+			reached
+				.expect("the worker reaches its own handoff")
+				.unwrap()
+				.forget();
+		}
+		ended = &mut worker => panic!("the worker ended before its handoff pause: {:?}", ended.unwrap()),
+	}
+	// Disarmed: the driver's own handoffs below are not caught by the worker's pause.
+	*store
+		.mgr
+		.continuity_test_holds
+		.op_handoff_hold
+		.lock()
+		.unwrap() = None;
+	let open = index.load_op_intents().await.unwrap();
+	let [LoadedOp::Submittable(ticket)] = open.as_slice() else {
+		panic!("premise: the worker's one applied operation is open: {open:?}");
+	};
+	let (key, digest) = (ticket.key(), ticket.digest());
+	let pending = index.load_ack_pending().await.unwrap();
+	assert!(
+		!pending.iter().any(|(seq, _)| *seq == key.op_seq),
+		"premise: not yet handed off: {pending:?}"
+	);
+	store
+		.drive()
+		.await
+		.expect("the driver's pass succeeds beside a live worker");
+	let after = index.load_op_intents().await.unwrap();
+	let [LoadedOp::Submittable(still)] = after.as_slice() else {
+		panic!("the driver took the live worker's operation {key:?}: open now {after:?}");
+	};
+	assert_eq!(
+		(still.key(), still.digest()),
+		(key, digest),
+		"the worker's intent is untouched"
+	);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		pending,
+		"nothing was handed off while the worker held it"
+	);
+	release.add_permits(1);
+	let step = tokio::time::timeout(Duration::from_secs(60), &mut worker)
+		.await
+		.expect("the released worker ends")
+		.unwrap()
+		.expect("the worker completes its own step");
+	match (&step, retire) {
+		(CertifiedTierStep::Retired { slab, op }, true)
+		| (CertifiedTierStep::Rewritten { slab, op, .. }, false) => {
+			assert_eq!(
+				(*slab, *op),
+				(store.slab, key),
+				"its own slab and operation"
+			);
+		}
+		_ => panic!("the worker's step: {step:?}"),
+	}
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"handed off"
+	);
+	let handed: Vec<_> = index
+		.load_ack_pending()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|(seq, _)| *seq == key.op_seq)
+		.collect();
+	assert_eq!(handed, vec![(key.op_seq, false)], "handed off once");
+	let retained = store.mgr.certified_retained_objects_for_test();
+	assert_eq!(
+		(retained.count, retained.uris),
+		(1, vec![store.pointer.l2_uri.clone()]),
+		"the worker reached its retention note"
+	);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await.is_some(),
+		!retire,
+		"retired locally, or its replacement installed"
+	);
+	store.mgr.hold_acks_for_test(false);
+	store.close().await;
+}
+
+/// DC-289: a certified retirement keeps its operation across its submission; the operation
+/// driver's pass beside it takes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_retirement_held_at_its_handoff_keeps_its_operation_from_the_driver() {
+	a_held_certified_worker_keeps_its_operation(true).await;
+}
+
+/// DC-289 control: a certified rewrite already does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_rewrite_held_at_its_handoff_keeps_its_operation_from_the_driver() {
+	a_held_certified_worker_keeps_its_operation(false).await;
+}
