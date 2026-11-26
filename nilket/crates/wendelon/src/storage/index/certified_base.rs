@@ -67,6 +67,25 @@ pub fn aged_evidence(aged: &[BaseEntry]) -> AgedEvidence {
 	}
 }
 
+/// Empties one of the base's row tables in `tx` and returns it open and empty (DC-301).
+///
+/// The table's tree is dropped as a whole and the table opened again in the same writer
+/// transaction, so the emptying commits or aborts with everything else `tx` does and the table
+/// still exists afterwards. An all-false `retain` reaches the same state, but redb 4.1 deletes
+/// row by row there and keeps every page it copies until the last row is gone: in a one-voter
+/// fixture, emptying 11,481 rows held about 100 MiB of pages and grew the file by 200 MiB.
+///
+/// `delete_table` goes by name, so the table is opened under its typed definition first: one
+/// stored under another type refuses here and is left as it is.
+fn emptied<'tx>(
+	tx: &'tx redb::WriteTransaction,
+	definition: TableDefinition<'static, &'static [u8], &'static [u8]>,
+) -> std::io::Result<redb::Table<'tx, &'static [u8], &'static [u8]>> {
+	drop(tx.open_table(definition).map_err(redb_to_io)?);
+	tx.delete_table(definition).map_err(redb_to_io)?;
+	tx.open_table(definition).map_err(redb_to_io)
+}
+
 /// Wendelon ADR 0122 D3: replaces the staged aged rows with `aged`, in `tx`,
 /// after checking that they reproduce `expected` (`None`: no aged component, so
 /// none). A mismatch or a repeated key refuses and writes nothing.
@@ -1318,22 +1337,17 @@ impl PersistentLocalIndex {
 					previous
 				};
 				{
-					let mut active = tx.open_table(BASE_ACTIVE_TABLE).map_err(redb_to_io)?;
-					active.retain(|_, _| false).map_err(redb_to_io)?;
+					let mut active = emptied(&tx, BASE_ACTIVE_TABLE)?;
 					for (key, value) in &staged_rows {
 						active
 							.insert(key.as_slice(), value.as_slice())
 							.map_err(redb_to_io)?;
 					}
 				}
-				{
-					let mut staged = tx.open_table(BASE_STAGED_TABLE).map_err(redb_to_io)?;
-					staged.retain(|_, _| false).map_err(redb_to_io)?;
-					// Wendelon ADR 0122 D3: the aged evidence goes with the staging; the
-					// index above was read from it first.
-					let mut aged = tx.open_table(BASE_AGED_STAGED_TABLE).map_err(redb_to_io)?;
-					aged.retain(|_, _| false).map_err(redb_to_io)?;
-				}
+				emptied(&tx, BASE_STAGED_TABLE)?;
+				// Wendelon ADR 0122 D3: the aged evidence goes with the staging; the
+				// index above was read from it first.
+				emptied(&tx, BASE_AGED_STAGED_TABLE)?;
 				// ADR 0699 S5b: the new base's entries by key, for the debt the
 				// activation records below.
 				let new_base: std::collections::HashMap<[u8; 56], BaseEntry> =
@@ -2896,6 +2910,290 @@ mod tests {
 				index.parent_intent(rsv, 0).await.unwrap().is_none(),
 				"intent {rsv} retired"
 			);
+		}
+	}
+
+	// DC-301: an activation empties its active, staged and aged tables by table (`emptied`).
+	// The fixture: generation 1 installed with forty entries; three intents, two the activation
+	// retires and one past its cut; generation 2 staged with twenty-two rows and eight aged rows.
+
+	/// What the activation may change or must leave: the active rows, the staged rows, the
+	/// aged rows, the debt and the base's metadata.
+	type BaseState = (
+		Vec<BaseEntry>,
+		Vec<BaseEntry>,
+		Vec<BaseEntry>,
+		Vec<(VersionKey, DebtRecord)>,
+		BaseMeta,
+	);
+
+	async fn base_state(index: &PersistentLocalIndex) -> BaseState {
+		(
+			index.base_entries(false).await.unwrap(),
+			index.base_entries(true).await.unwrap(),
+			index.aged_staged_for_test().await.unwrap(),
+			index.debt_page(None, 10_000).await.unwrap(),
+			index.base_meta().await.unwrap(),
+		)
+	}
+
+	async fn a_populated_base_with_generation_two_staged(
+		tag: &str,
+	) -> (
+		crate::test_support::TestDir,
+		PersistentLocalIndex,
+		StagedCandidate,
+	) {
+		let (dir, index) = open(tag).await;
+		let base: Vec<BaseEntry> = (1u8..=40).map(|key| entry(key, 1, key % 4)).collect();
+		activate(&index, 1, 0, 0, base.clone()).await;
+		// A manifest lists its versions in ascending key order.
+		let winner = owned(41, 2, 0x11);
+		begin(&index, 5, vec![winner, owned(43, 2, 0x22)]).await;
+		begin(&index, 7, vec![owned(45, 4, 0x77)]).await;
+		// Past the activation's cut (8): not retired by it.
+		begin(&index, 9, vec![owned(46, 5, 0x55)]).await;
+		// The new base keeps the even keys, replaces key 3 and adds the first intent's winner.
+		let mut next: Vec<BaseEntry> = base
+			.iter()
+			.copied()
+			.filter(|entry| entry.key_identity[0] % 2 == 0)
+			.collect();
+		next.push(entry(3, 6, 1));
+		next.push(as_entry(&winner));
+		let aged: Vec<BaseEntry> = base
+			.iter()
+			.copied()
+			.filter(|entry| entry.key_identity[0] % 5 == 0)
+			.collect();
+		let staged = stage_aged(&index, next, aged).await;
+		(dir, index, staged)
+	}
+
+	async fn activate_staged(
+		index: &PersistentLocalIndex,
+		staged: &StagedCandidate,
+	) -> std::io::Result<Result<(), ActivateRefusal>> {
+		index
+			.activate_base(
+				activation_of(staged, 8),
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
+			.await
+	}
+
+	/// The activation installs the staged rows over a populated base, leaves the staging tables
+	/// empty and present, records exactly the debt it owes, retires the intents at or under its
+	/// cut and keeps the one past it; all of it holds across a reopen, and the emptied tables
+	/// take the next generation.
+	#[tokio::test]
+	async fn an_activation_over_a_populated_base_empties_its_tables_and_keeps_its_debt_and_intents()
+	{
+		let (dir, index, staged) = a_populated_base_with_generation_two_staged("emptied").await;
+		let before = base_state(&index).await;
+		assert_eq!(
+			(before.0.len(), before.1.len(), before.2.len()),
+			(40, 22, 8)
+		);
+		activate_staged(&index, &staged).await.unwrap().unwrap();
+		let after = base_state(&index).await;
+		assert_eq!(after.0, before.1, "the staged rows are the active rows");
+		assert!(
+			after.1.is_empty() && after.2.is_empty(),
+			"the staged and aged tables are empty"
+		);
+		assert_eq!(
+			(after.4.active_gid, after.4.staged.is_none()),
+			(2, true),
+			"generation 2 is active and nothing is staged"
+		);
+		// Debt: the twenty displaced odd keys (key 3 replaced, the rest absent) and the two
+		// intent versions that did not win; the winner and the kept even keys owe nothing.
+		let displaced = after
+			.3
+			.iter()
+			.filter(|(_, record)| matches!(record.source, DebtSource::DisplacedBase { .. }))
+			.count();
+		let retired: Vec<(u64, bool)> = after
+			.3
+			.iter()
+			.filter_map(|(_, record)| match record.source {
+				DebtSource::RetiredIntent { rsv, .. } => Some((rsv, record.aged)),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(after.3.len(), 22, "{:?}", after.3);
+		assert_eq!(displaced, 20);
+		assert_eq!(retired, vec![(5, false), (7, false)]);
+		assert_eq!(
+			after.3.iter().filter(|(_, record)| record.aged).count(),
+			4,
+			"the displaced keys 5, 15, 25 and 35 are in the aged evidence"
+		);
+		assert!(
+			after.3.iter().all(|(_, record)| record.gid == 2),
+			"the debt is this generation's"
+		);
+		// Intents: the two at or under the cut are retired, the one past it stays.
+		assert!(index.parent_intent(5, 0).await.unwrap().is_none());
+		assert!(index.parent_intent(7, 0).await.unwrap().is_none());
+		assert!(index.parent_intent(9, 0).await.unwrap().is_some());
+		drop(index);
+		let index = PersistentLocalIndex::open(dir.join("index.redb"))
+			.await
+			.unwrap();
+		assert_eq!(
+			base_state(&index).await,
+			after,
+			"the state survives a reopen"
+		);
+		assert!(index.parent_intent(5, 0).await.unwrap().is_none());
+		assert!(index.parent_intent(9, 0).await.unwrap().is_some());
+		// The emptied tables exist and take the next generation.
+		activate(&index, 3, 2, 9, vec![entry(50, 9, 0)]).await;
+		assert_eq!(
+			index.base_entries(false).await.unwrap(),
+			vec![entry(50, 9, 0)]
+		);
+	}
+
+	/// A read snapshot opened before the activation reads the previous base, the staged rows
+	/// and the aged rows after its commit; a reader opened afterwards reads the new base and
+	/// empty staging tables.
+	#[tokio::test]
+	async fn a_snapshot_from_before_an_activation_keeps_the_tables_it_emptied() {
+		let (_dir, index, staged) = a_populated_base_with_generation_two_staged("snapshot").await;
+		let before = base_state(&index).await;
+		let old = index
+			.db
+			.run(|db| db.begin_read().map_err(redb_to_io))
+			.await
+			.unwrap();
+		activate_staged(&index, &staged).await.unwrap().unwrap();
+		let rows = |definition: TableDefinition<&[u8], &[u8]>| -> Vec<BaseEntry> {
+			let table = old.open_table(definition).unwrap();
+			table
+				.iter()
+				.unwrap()
+				.map(|row| decode_entry(row.unwrap().1.value()).unwrap())
+				.collect()
+		};
+		assert_eq!(rows(BASE_ACTIVE_TABLE), before.0, "the previous base");
+		assert_eq!(rows(BASE_STAGED_TABLE), before.1, "the staged rows");
+		assert_eq!(rows(BASE_AGED_STAGED_TABLE), before.2, "the aged rows");
+		drop(old);
+		let after = base_state(&index).await;
+		assert_eq!(after.0, before.1, "a later reader reads the new base");
+		assert!(after.1.is_empty() && after.2.is_empty());
+	}
+
+	/// An activation that fails after it has emptied its tables changes nothing, also across a
+	/// reopen, and succeeds once its cause is gone. The failure is a retired intent whose stored
+	/// value no longer decodes: the activation reads it only after the three tables are emptied.
+	#[tokio::test]
+	async fn an_activation_that_fails_after_emptying_its_tables_changes_nothing_and_can_be_retried()
+	{
+		use crate::storage::index::parent_intents::PARENT_INTENTS_TABLE;
+		let (dir, index, staged) = a_populated_base_with_generation_two_staged("abort").await;
+		let before = base_state(&index).await;
+		// Replaces the value of the intent at reservation 5 and returns the one it had.
+		async fn swap(index: &PersistentLocalIndex, value: Vec<u8>) -> Vec<u8> {
+			index
+				.db
+				.run(move |db| {
+					let tx = db.begin_write().map_err(redb_to_io)?;
+					let previous = {
+						let mut intents =
+							tx.open_table(PARENT_INTENTS_TABLE).map_err(redb_to_io)?;
+						let key = intents
+							.iter()
+							.map_err(redb_to_io)?
+							.map(|row| row.unwrap().0.value().to_vec())
+							.find(|key| key[..8] == 5u64.to_be_bytes())
+							.expect("the intent at reservation 5");
+						let previous = intents
+							.insert(key.as_slice(), value.as_slice())
+							.map_err(redb_to_io)?
+							.expect("its value")
+							.value()
+							.to_vec();
+						previous
+					};
+					tx.commit().map_err(redb_to_io)?;
+					Ok(previous)
+				})
+				.await
+				.unwrap()
+		}
+		let sound = swap(&index, b"not an intent".to_vec()).await;
+		let failed = activate_staged(&index, &staged).await;
+		assert!(
+			failed.is_err(),
+			"the undecodable intent fails it: {failed:?}"
+		);
+		assert_eq!(base_state(&index).await, before, "nothing changed");
+		assert!(index.parent_intent(7, 0).await.unwrap().is_some());
+		drop(index);
+		let index = PersistentLocalIndex::open(dir.join("index.redb"))
+			.await
+			.unwrap();
+		assert_eq!(
+			base_state(&index).await,
+			before,
+			"nothing changed across a reopen"
+		);
+		swap(&index, sound).await;
+		activate_staged(&index, &staged).await.unwrap().unwrap();
+		let after = base_state(&index).await;
+		assert_eq!(after.0, before.1);
+		assert_eq!(after.3.len(), 22);
+		assert!(index.parent_intent(5, 0).await.unwrap().is_none());
+	}
+
+	/// A base table stored under another type refuses the activation and is left as it is: the
+	/// emptying deletes by name only after the typed open has passed.
+	#[tokio::test]
+	async fn an_activation_refuses_a_table_of_another_type_and_leaves_it() {
+		const AGED_AS_NUMBERS: TableDefinition<u64, u64> =
+			TableDefinition::new("base_aged_staged_v1");
+		const ACTIVE_AS_NUMBERS: TableDefinition<u64, u64> = TableDefinition::new("base_active_v1");
+		const STAGED_AS_NUMBERS: TableDefinition<u64, u64> = TableDefinition::new("base_staged_v1");
+		for which in 0..3usize {
+			let (_dir, index, staged) =
+				a_populated_base_with_generation_two_staged(&format!("other-type-{which}")).await;
+			let meta = index.base_meta().await.unwrap();
+			let (typed, other) = [
+				(BASE_AGED_STAGED_TABLE, AGED_AS_NUMBERS),
+				(BASE_ACTIVE_TABLE, ACTIVE_AS_NUMBERS),
+				(BASE_STAGED_TABLE, STAGED_AS_NUMBERS),
+			][which];
+			index
+				.db
+				.run(move |db| {
+					let tx = db.begin_write().map_err(redb_to_io)?;
+					tx.delete_table(typed).map_err(redb_to_io)?;
+					tx.open_table(other)
+						.map_err(redb_to_io)?
+						.insert(1, 1)
+						.map_err(redb_to_io)?;
+					tx.commit().map_err(redb_to_io)
+				})
+				.await
+				.unwrap();
+			let refused = activate_staged(&index, &staged).await;
+			assert!(refused.is_err(), "table {which}: {refused:?}");
+			assert_eq!(index.base_meta().await.unwrap(), meta, "table {which}");
+			let kept = index
+				.db
+				.run(move |db| {
+					let tx = db.begin_read().map_err(redb_to_io)?;
+					let table = tx.open_table(other).map_err(redb_to_io)?;
+					Ok(table.get(1).map_err(redb_to_io)?.map(|value| value.value()))
+				})
+				.await
+				.unwrap();
+			assert_eq!(kept, Some(1), "table {which} was not deleted by name");
 		}
 	}
 }
