@@ -91,20 +91,49 @@ protocol optimization self-evident: when `stage_arcs` uploads content-addressed
 chunks before Raft, `certify_update` can collapse `reserve + certify` into a
 single Raft round whenever `ArcTenure` is unchanged.)*
 
-### B. Weak Ring (`toron` — Ephemeral RAM $\mathcal{B}_{\text{weak}}$)
+### B. Weak Ring (`toron` — Ephemeral RAM $\mathcal{B}_{\text{weak}}$, No Raft Group)
 
 | Canonical Boundary Signature | Consensus # | Mathematical Role on Ephemeral Compute State |
 |---|---|---|
 | `read_weak(cells, cut_k)` | **1** | Reads cached `TableDescriptor` at `(table_id, SchemaRev)`, optimizer facts, or session-pinned cut $K$. |
 | `merge_weak(cell, op_id, delta)` | **1** | Shuffle stage-completion bitsets (`\|=`), partial aggregates/sketches, monotone descriptor cache fills. |
-| `update_weak(footprint, op_id, f)` | **$\infty$** | RAM-only Raft ([Brainstorm 002](002_weak_control_ring.md)): bounded tenant core-slot quotas, HA coordinator handoff, open transaction session state. |
-| `await_weak(cell, predicate, deadline)` | **1** | Shuffle stage barriers (`completed == all_workers`), quota-slot waits, descriptor-sync waits. |
+| `update_weak(footprint, op_id, f)` | **$\infty$** | **Single-owner CPU `CAS` / local `Mutex` (never Raft):** per-node slot/memory admission, open transaction session buffers, local query-state transitions. |
+| `await_weak(cell, predicate, deadline)` | **1** | Shuffle stage barriers (`completed == all_workers`), local slot waits, descriptor-sync waits. |
 | `send_weak(token, msg)` | **1** | Morsel dispatch to workers, cross-ring cancel emission (`send_weak` $\to$ `send_strong`), trace carriers. |
 
-Multi-statement LTAP `BEGIN ... COMMIT` then requires **zero new nouns**: open
-statements accumulate on Toron via `read_strong(R, cut_k)` + `update_weak`
-(session read/write sets and local write buffer) + unauthoritative `stage_arcs`,
-and `COMMIT` executes **one** `update_strong(footprint, tx_id, cut_k, manifest)`.
+#### Why Toron Has No Raft Group (Consensus $\infty \neq$ Network Consensus)
+
+An early note ([Brainstorm 002](002_weak_control_ring.md)) imagined an in-memory
+Raft group across Toron coordinators. Separating **consensus number** from
+**crash survival** ([Brainstorm 021 §5](../../../wendelon/plans/brainstorms/021_boron_semiring.md))
+shows why Toron needs **zero Raft**:
+
+- Inside a single process, CPU atomics (`compare_exchange`) and local `Mutex`es
+  **already have Herlihy consensus number $\infty$**. Network Raft is strictly
+  the price of making a `CAS` register **durable across machine crashes**.
+- Every case in Brainstorm 002 splits cleanly into Strong truth on Wendelon or
+  single-owner Weak RAM in Toron:
+  1. **Active queries & open `BEGIN ... COMMIT` sessions:** Owned by a single
+     Toron coordinator (`update_weak` = local memory). If that coordinator
+     crashes before `COMMIT`, the session aborts cleanly on disconnect with zero
+     locks or state to unwind on Wendelon; if it crashes *during* `COMMIT`, the
+     reconnecting client calls `resolve_strong(tx_id)` on Wendelon.
+  2. **Tenant quotas:** Durable quota limits live on Wendelon
+     (`UpdateTenantQuota`); runtime admission on Toron uses local CPU `CAS`
+     semaphores per coordinator (`quota / active_coordinators` or node-local
+     memory/core budgets), never a Raft round-trip per query.
+  3. **Shuffle barriers:** Workers reporting stage completion perform bitwise-OR
+     `merge_weak` (`completed |= 1 << worker`) + `await_weak`
+     (`completed == all_workers`) inside the query's owning coordinator
+     (consensus #1, not $\infty$).
+
+Put simply: **if state must survive a node crash, it belongs in Wendelon
+(`_strong`); if it may vanish on a node crash, one owning Toron process's CPU
+`CAS` implements `update_weak` with no Raft group.** Multi-statement LTAP
+`BEGIN ... COMMIT` therefore needs neither Toron Raft nor cross-ring 2PC: open
+statements accumulate on Toron via `read_strong(R, cut_k)` + local `update_weak`
++ unauthoritative `stage_arcs`, and `COMMIT` executes **one**
+`update_strong(footprint, tx_id, cut_k, manifest)`.
 
 ---
 

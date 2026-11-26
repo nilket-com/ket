@@ -281,7 +281,55 @@ bytes in $H_1$ and $H_2$:
 
 ---
 
-## 5. Convergence Harvest Path (No Big-Bang Rewrite)
+## 5. Consensus Number vs. Crash Survival (Why Toron Has No Raft Group)
+
+A recurring trap when mapping algebra to systems is conflating **Herlihy
+consensus number ($\infty$)** with **network consensus (Raft)**. They live on
+orthogonal axes:
+
+- **Algebraic axis (Commutation):** Does $A \cdot B = B \cdot A$ hold (consensus
+  #1), or can order change state and caller observations (consensus $\infty$,
+  requiring linearizable compare-and-swap)?
+- **Fault-model axis (Crash survival):** Is state **ephemeral** (scoped to one
+  owning process's lifetime, where process death legally discards the state), or
+  **durable** (required to survive machine crashes, restarts, and disk loss)?
+
+Inside a single process's shared memory, hardware instructions
+(`AtomicU64::compare_exchange` or a local `Mutex`) **already provide consensus
+number $\infty$** in nanoseconds. Distributed Raft exists for one reason only:
+a single CPU's `CAS` register vanishes when that host crashes. Raft is how a
+cluster constructs **a crash-surviving `CAS` register** across $2f + 1$ fault
+domains.
+
+Crossing the two axes across the Weak Ring (`Toron`, ephemeral compute) and the
+Strong Ring (`Wendelon`, durable storage) shows why **only one of the four
+quadrants uses Raft**:
+
+| | **Commuting ($A \cdot B = B \cdot A$, Consensus #1)** | **Non-Commuting ($A \cdot B \neq B \cdot A$, Consensus $\infty$)** |
+|---|---|---|
+| **Ephemeral (`Weak` / `Toron`)** *(dies cleanly with its owning process)* | Lock-free atomics, bitsets, partial aggregates, descriptor/stats caches (`read_weak`, `merge_weak`, `await_weak`, `send_weak`) — **No Raft** | **Single-owner CPU `CAS` / `Mutex` (`update_weak`)** (session tx buffers, per-node slot semaphores) — **No Raft** |
+| **Durable (`Strong` / `Wendelon`)** *(survives host crash & power loss)* | Replicated / L2 immutable chunk writes and `max` watermarks (`stage_payloads`, `merge_strong`) — **No Raft per chunk** | **Raft (`update_strong`)** — **the sole quadrant in Nilket that runs Raft** |
+
+This separation yields the **upper-triangular cross-ring product**
+$\mathcal{B}_{\text{weak}} \ltimes_K \mathcal{B}_{\text{strong}}$:
+
+1. **Strong independence:** $\Omega_{\text{strong}}$ is closed — no Strong guard
+   ever reads $\Omega_{\text{weak}}$, and Wendelon never `await`s Toron. If an
+   entire Toron fleet reboots, Wendelon loses zero invariants and holds zero
+   orphaned locks.
+2. **No "RAM-only Raft" on Toron and no cross-ring 2PC:** If state must survive
+   a coordinator crash (table schemas, tenant quota definitions, committed
+   outcomes), it belongs on $\Omega_{\text{strong}}$. If state is allowed to die
+   with its coordinator (an active query DAG or an uncommitted `BEGIN ...
+   COMMIT` session buffer), one Toron coordinator owns it in RAM via
+   `update_weak` (local CPU `CAS`), streams unreferenced payloads via
+   `stage_payloads`, and crosses into Wendelon with **one** atomic
+   `update_strong` at `COMMIT` (resolving any mid-commit disconnect via
+   `resolve_strong(tx_id)`).
+
+---
+
+## 6. Convergence Harvest Path (No Big-Bang Rewrite)
 
 1. **Review razor (immediate):** New protocols or `WendelonRequest` /
    `DecisionCommand` variants must state their Boron generator, `(R, W)` cell
