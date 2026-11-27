@@ -1675,12 +1675,17 @@ impl SlabSweeper {
 		slab_id: SlabId,
 		plaintext_blob: &[u8],
 	) -> std::io::Result<crate::crypto::EncryptedTieredSlab> {
-		let snapshot = self.state_machine.state_snapshot().await;
+		// Only the schema catalog is read here: one coherent copy of it under the state's read
+		// lock, released before the worker runs. The rest of the replicated state is not copied.
+		let table_schemas = self
+			.state_machine
+			.read_state(|state| state.table_schemas.clone())
+			.await;
 		cpu_bound_off_the_runtime_worker(|| {
 			self.slab.encrypt_tiered_object_blob_with_table_stats(
 				slab_id,
 				plaintext_blob,
-				&snapshot.table_schemas,
+				&table_schemas,
 			)
 		})
 	}
@@ -1691,10 +1696,14 @@ impl SlabSweeper {
 		&self,
 		plaintext: &crate::storage::manager::TieredPlaintext,
 	) -> std::io::Result<crate::crypto::EncryptedTieredSlab> {
-		let snapshot = self.state_machine.state_snapshot().await;
+		// As above: the schema catalog alone, read once.
+		let table_schemas = self
+			.state_machine
+			.read_state(|state| state.table_schemas.clone())
+			.await;
 		cpu_bound_off_the_runtime_worker(|| {
 			self.slab
-				.encrypt_tiered_object_preserving_layout(plaintext, &snapshot.table_schemas)
+				.encrypt_tiered_object_preserving_layout(plaintext, &table_schemas)
 		})
 	}
 
