@@ -471,10 +471,15 @@ impl WendelonDataServer {
 			.decisions
 			.pause_at(super::child_writes::PauseStage::CertifiedTierStep)
 			.await;
-		let state = self.state_machine.state_snapshot().await;
+		// The step reads only the schema catalog: one coherent copy of it under the state's read
+		// lock, released before the storage work. The rest of the replicated state is not copied.
+		let table_schemas = self
+			.state_machine
+			.read_state(|state| state.table_schemas.clone())
+			.await;
 		let result = self
 			.slab
-			.run_certified_tier_step_observed(committer, self, &state.table_schemas, step)
+			.run_certified_tier_step_observed(committer, self, &table_schemas, step)
 			.await;
 		if let Some(permit) = permit {
 			permit.complete();
