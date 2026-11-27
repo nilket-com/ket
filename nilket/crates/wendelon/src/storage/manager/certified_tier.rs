@@ -974,17 +974,25 @@ impl SlabManager {
 		};
 		validate_tiered_blob(&source, &old_blob)?;
 		let acknowledged = self.acknowledged_offsets_in_slab(slab_id);
-		let decoded = decode_tiered_blob(
-			self.config.crypto.as_ref(),
-			&source,
-			&old_blob,
-			TierObjectEvidence::Indexed(&acknowledged),
-		)?;
+		// The decode's encrypted tenant validation already recovers the complete entries from this
+		// plaintext over this same offset sample; they are kept and used below in place of a
+		// second walk. A plaintext object has no such validation and is walked as before.
+		let (decoded, validated_entries) =
+			super::tiered_io::decode_tiered_blob_keeping_validated_entries(
+				self.config.crypto.as_ref(),
+				&source,
+				&old_blob,
+				TierObjectEvidence::Indexed(&acknowledged),
+			)?;
 		let source_layout = decoded.layout;
 		let plaintext_bytes = Zeroizing::new(decoded.bytes);
 		let plaintext =
 			crate::storage::tier_object_layout::SlabView::new(&plaintext_bytes, source_layout)?;
-		let mut records = recover_slab_entries_from_blob(plaintext, &acknowledged)?
+		let recovered = match validated_entries {
+			Some(entries) => entries,
+			None => recover_slab_entries_from_blob(plaintext, &acknowledged)?,
+		};
+		let mut records = recovered
 			.into_iter()
 			.map(|entry| CompactionRecord {
 				tenant_id: entry.tenant_id,

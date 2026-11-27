@@ -210,8 +210,9 @@ pub(super) fn decode_tiered_blob(
 /// `TierObjectEvidence::Indexed` evidence: they were recovered from this plaintext and layout over
 /// exactly `TieredPlaintext::record_offsets`, in the default recovery mode, and passed the
 /// tombstone-chain, single-tenant and encoding-directory checks. A plaintext object (no tenant
-/// recovery) and `Replacement` evidence return `None`. The only consumer is the tiered retention
-/// prepare (`retention_planning_entries`); every other caller uses `decode_tiered_blob`.
+/// recovery) and `Replacement` evidence return `None`. Its consumers are the tiered retention
+/// prepare (`retention_planning_entries`) and the certified tier claim, which decodes and plans
+/// over one offset sample; every other caller uses `decode_tiered_blob`.
 pub(super) fn decode_tiered_blob_keeping_validated_entries(
 	crypto: &CryptoManager,
 	pointer: &TieredSlabPointer,

@@ -67503,6 +67503,114 @@ async fn a_generation_moving_between_decision_and_allocation_allocates_nothing()
 	store.close().await;
 }
 
+/// The certified tier claim recovers its encrypted object's entries ONCE: the decode's tenant
+/// validation already walks the plaintext over the same offset sample, and the claim takes those
+/// entries instead of walking again. The job holds exactly what an explicit walk recovers.
+#[tokio::test(flavor = "current_thread")]
+async fn a_certified_tier_claim_recovers_its_encrypted_object_once() {
+	use crate::storage::core::RecoveryDecodeCountGuard;
+	use crate::storage::manager::certified_tier::CertifiedTierDecider;
+	let (obsolete, owned, unlisted) = (id(0x7721), id(0x7722), id(0x7723));
+	let store = certified_tier_store(
+		"certified-claim-one-recovery",
+		&[
+			(obsolete, 10, 1),
+			(obsolete, 20, 2),
+			(owned, 15, 3),
+			(unlisted, 12, 4),
+		],
+		&[(obsolete, 10)],
+		&[(owned, 15)],
+		obsolete,
+	)
+	.await;
+	// The reference, built independently of the claim: the published object fetched, decoded by
+	// the ordinary decoder (its validation is one walk) and walked once more, explicitly.
+	let blob = store.l2.get(&store.pointer.l2_uri).await.unwrap();
+	assert!(
+		store
+			.mgr
+			.encrypted_tiered_footer_summary(&blob)
+			.unwrap()
+			.is_some(),
+		"premise: the published object is encrypted"
+	);
+	let acknowledged = store.mgr.acknowledged_offsets_in_slab(store.slab);
+	let counted = RecoveryDecodeCountGuard::start();
+	let decoded = decode_tiered_blob(
+		store.mgr.config.crypto.as_ref(),
+		&store.pointer,
+		&blob,
+		TierObjectEvidence::Indexed(&acknowledged),
+	)
+	.unwrap();
+	let validation_walk = counted.finish();
+	let view = SlabView::new(&decoded.bytes, decoded.layout).unwrap();
+	let counted = RecoveryDecodeCountGuard::start();
+	let mut reference = recover_slab_entries_from_blob(view, &acknowledged).unwrap();
+	let one_walk = counted.finish();
+	assert!(one_walk > 0, "premise: a walk decodes the object's frames");
+	assert_eq!(
+		validation_walk, one_walk,
+		"premise: the decode's validation is one such walk"
+	);
+	reference.sort_by_key(|entry| entry.location.offset);
+	// The claim also reads each physical frame once for its table stamps (`frame_tables_of`), which
+	// classifies the frame through the same counted decoder: measured here, independently.
+	let counted = RecoveryDecodeCountGuard::start();
+	let mut frames = 0;
+	for frame in crate::storage::core::recovered_frames(&reference) {
+		let bytes = extract_record_from_blob(view, frame.location()).unwrap();
+		let rows: Vec<_> = frame
+			.entries()
+			.iter()
+			.map(|entry| entry.location.record_row_index)
+			.collect();
+		crate::storage::manager::certified_lsm::frame_tables_of(&bytes, &rows);
+		frames += 1;
+	}
+	let stamping = counted.finish();
+	assert!(frames > 0);
+
+	let counted = RecoveryDecodeCountGuard::start();
+	let job = store
+		.mgr
+		.claim_tiered_for_certified_cleanup(store.slab, None)
+		.await
+		.unwrap()
+		.expect("the published slab is claimed");
+	let claim_walks = counted.finish();
+	// Today: the decode's validation walk and the stamping, with no second recovery walk. Before
+	// this change the claim also walked the object again: one_walk more.
+	assert_eq!(
+		claim_walks,
+		validation_walk + stamping,
+		"the claim recovers the encrypted object once, not twice (one walk {one_walk}, stamping {stamping}, {frames} frames)"
+	);
+	// The same job contents as the explicit walk gives.
+	let held: Vec<_> = job
+		.entries()
+		.iter()
+		.map(|entry| (entry.tenant_id, entry.row_key_id, entry.location))
+		.collect();
+	let walked: Vec<_> = reference
+		.iter()
+		.map(|entry| (entry.tenant_id, entry.key_identity, entry.location))
+		.collect();
+	assert_eq!(held, walked);
+	// And the selection decided over it names the one obsolete version, as the step tests expect.
+	let selection = store.decider(None, false).decide(&job).await.unwrap();
+	assert_eq!(selection.len(), 1);
+	assert!(
+		job.entries()
+			.iter()
+			.filter(|entry| selection.selects(entry))
+			.all(|entry| entry.row_key_id == obsolete)
+	);
+	drop(job);
+	store.close().await;
+}
+
 /// ADR 0704 §6: the step refuses, typed and writing nothing, off the leader,
 /// outside ParentDecisions mode, when fenced, with no canonical tier state, and
 /// when the object store cannot serve the claimed object.
