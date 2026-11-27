@@ -965,12 +965,28 @@ fn write_clean_shutdown_record(dir: &Path) -> std::io::Result<()> {
 	File::open(dir)?.sync_all()
 }
 
+/// Wendelon ADR 0104 provisioning: the formation intent and the replacement token are written
+/// beside a never-owned store before its first start. Their content, admission and identity are
+/// the startup paths' to judge; here they are only not evidence that the store was used.
+const PROVISIONING_FILES: [&str; 2] = ["FORMATION_INTENT", "REPLACEMENT_TOKEN"];
+
+/// A provisioning file by its exact name AND as a regular file itself: a directory or a symlink
+/// of that name is not one, so it cannot hide other state.
+fn is_provisioning_file(entry: &fs::DirEntry) -> std::io::Result<bool> {
+	let name = entry.file_name();
+	Ok(PROVISIONING_FILES
+		.iter()
+		.any(|provisioned| name == *provisioned)
+		&& entry.file_type()?.is_file())
+}
+
 fn directory_is_fresh(dir: &Path) -> std::io::Result<bool> {
 	for entry in fs::read_dir(dir)? {
 		let entry = entry?;
 		let name = entry.file_name();
 		if name != "LOCK"
 			&& name != ".CLEAN_SHUTDOWN.tmp"
+			&& !is_provisioning_file(&entry)?
 			// ADR 0726: an enrolled root KEK directory is setup, not a store.
 			&& !crate::crypto::is_root_kek_artifact_dir(&entry.path())?
 		{
@@ -1373,6 +1389,84 @@ mod tests {
 		recovered.close(Duration::from_secs(5)).await.unwrap();
 		drop(recovered);
 		assert!(dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+	}
+
+	/// DC-282: provisioning beside a never-owned store is not use of the store, by its exact
+	/// name and only as a regular file; any evidence of use beside it, with no clean record,
+	/// still starts unclean, and a directory or a symlink of a provisioning name hides nothing.
+	#[tokio::test]
+	async fn provisioning_is_not_store_use_and_store_evidence_beside_it_still_starts_unclean() {
+		let previous_clean = |prepare: &dyn Fn(&Path)| {
+			let dir = TestDir::new();
+			prepare(dir.path());
+			let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+			owner.previous_shutdown_clean()
+		};
+		let intent = |dir: &Path| fs::write(dir.join("FORMATION_INTENT"), b"").unwrap();
+		let token = |dir: &Path| fs::write(dir.join("REPLACEMENT_TOKEN"), b"00\n").unwrap();
+		// Each provisioning file alone, as a regular file: a never-owned store.
+		assert!(previous_clean(&intent), "a formation intent alone");
+		assert!(previous_clean(&token), "a replacement token alone");
+		// Evidence of use beside either, and no clean record: unclean, as before.
+		for evidence in [
+			"PARENT_DECISIONS",
+			".PARENT_DECISIONS.tmp",
+			"control.wal",
+			"control.wal.00000000000000000000.seg",
+			"vote.wnd",
+			"snapshot.wnd",
+			"storage_index.redb",
+			"slab_0000000000000000.wnd",
+			"audit.ndjson",
+			"FORMATION_INTENT.old",
+			"formation_intent",
+		] {
+			for provision in [&intent as &dyn Fn(&Path), &token] {
+				assert!(
+					!previous_clean(&|dir: &Path| {
+						provision(dir);
+						fs::write(dir.join(evidence), b"x").unwrap();
+					}),
+					"{evidence} beside provisioning is store use"
+				);
+			}
+		}
+		// A directory or a symlink of a provisioning name is not a provisioning file.
+		for name in ["FORMATION_INTENT", "REPLACEMENT_TOKEN"] {
+			assert!(
+				!previous_clean(&|dir: &Path| fs::create_dir(dir.join(name)).unwrap()),
+				"an empty directory named {name}"
+			);
+			assert!(
+				!previous_clean(&|dir: &Path| {
+					fs::create_dir(dir.join(name)).unwrap();
+					fs::write(dir.join(name).join("storage_index.redb"), b"x").unwrap();
+				}),
+				"a directory named {name} holding state"
+			);
+			assert!(
+				!previous_clean(&|dir: &Path| {
+					std::os::unix::fs::symlink("/dev/null", dir.join(name)).unwrap()
+				}),
+				"a symlink named {name}"
+			);
+		}
+		// A clean record still decides for a used store, provisioning or not.
+		let dir = TestDir::new();
+		fs::write(dir.path().join("control.wal"), b"history").unwrap();
+		intent(dir.path());
+		fs::write(dir.path().join(CLEAN_SHUTDOWN_RECORD), b"").unwrap();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		assert!(
+			owner.previous_shutdown_clean(),
+			"a clean record beside a used store"
+		);
+		drop(owner);
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		assert!(
+			!owner.previous_shutdown_clean(),
+			"consumed: the next start is unclean"
+		);
 	}
 
 	#[test]

@@ -5636,6 +5636,74 @@ mod tests {
 		node.shutdown().await.unwrap();
 	}
 
+	/// DC-282: a directory holding only what a real provisioner wrote is a never-owned store to
+	/// its owner, and a clean close of it records the stop clean.
+	#[tokio::test]
+	async fn a_store_provisioned_with_a_formation_intent_was_never_owned() {
+		provisioned_store_was_never_owned("node-dc282-formation-intent-fresh", |dir| {
+			crate::node::provision_formation_intent(dir).unwrap()
+		})
+		.await;
+	}
+
+	#[tokio::test]
+	async fn a_store_provisioned_with_a_replacement_token_was_never_owned() {
+		provisioned_store_was_never_owned("node-dc282-replacement-token-fresh", |dir| {
+			crate::node::provision_replacement_token(dir, 0x5eed).unwrap()
+		})
+		.await;
+	}
+
+	async fn provisioned_store_was_never_owned(tag: &str, provision: impl Fn(&std::path::Path)) {
+		use crate::storage::ownership::DataDirectoryOwner;
+		let dir = tempdir(tag);
+		provision(&dir);
+		let owner = DataDirectoryOwner::acquire_or_create(&*dir).unwrap();
+		assert!(
+			owner.previous_shutdown_clean(),
+			"provisioning beside a never-owned store is not an unclean shutdown"
+		);
+		owner
+			.close(std::time::Duration::from_secs(5))
+			.await
+			.unwrap();
+		drop(owner);
+		assert!(
+			dir.join("CLEAN_SHUTDOWN").exists(),
+			"its clean close is recorded"
+		);
+	}
+
+	/// DC-282: the first start of a new provisioned ParentDecisions store is a clean start, not a
+	/// recovery: it owes no proof of a base it never had, so even an immediate stop is recorded
+	/// clean, and the next start is clean too.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_new_provisioned_parent_decisions_store_starts_clean_and_stops_clean() {
+		use crate::consensus::decision_mode::DecisionMode;
+		let dir = tempdir("node-dc282-new-store-starts-clean");
+		let mut cfg = NodeBootstrapConfig::dev(7009, dir.to_path_buf(), "127.0.0.1:0".into());
+		cfg.decision_mode = DecisionMode::ParentDecisions;
+		crate::node::provision_formation_intent(&cfg.data_dir).unwrap();
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		assert!(
+			!node.recovered_after_unclean_shutdown(),
+			"a new store's first start is not a recovery"
+		);
+		node.shutdown().await.unwrap();
+		assert!(
+			dir.join("CLEAN_SHUTDOWN").exists(),
+			"an immediate stop is clean"
+		);
+		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		assert!(
+			!node.recovered_after_unclean_shutdown(),
+			"and so is the next start"
+		);
+		node.shutdown().await.unwrap();
+	}
+
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 	async fn a_parent_decisions_creation_stopped_before_its_marker_resumes() {
 		use crate::consensus::decision_mode::DecisionMode;
