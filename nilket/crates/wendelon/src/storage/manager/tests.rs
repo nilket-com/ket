@@ -6771,6 +6771,11 @@ async fn encrypt_tiered_object_blob_with_table_stats_builds_decryptable_csb() {
 	let mut catalog = TableSchemaCatalog::default();
 	catalog.upsert(tenant(), descriptor.clone()).unwrap();
 
+	// Frames without the storage columns: each is its own row, kept as materialized.
+	let (concat_inputs, rows, frames) =
+		assert_tier_stats_equal_single_row_reference(&mgr, slab_id, &raw, &descriptor);
+	assert_eq!((concat_inputs, rows, frames), (2, 2, 2));
+
 	let encrypted = mgr
 		.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
 		.unwrap();
@@ -7062,6 +7067,292 @@ async fn tier_stats_build_decodes_each_256_row_frame_at_most_once() {
 		decodes <= frames,
 		"stats build decoded {decodes} times for {frames} physical frames of 256 rows"
 	);
+}
+
+// The tier statistics build keeps one batch per contiguous run of a frame's matched rows for its
+// concat. These hold it to the block the one-row-per-entry form produces, and to the count of
+// batches it retains.
+
+/// `tier_stats_decode_descriptor` under another row identity policy.
+fn tier_stats_descriptor_with_identity(
+	table_object_id: TableObjectId,
+	rows_per_frame: u32,
+	row_identity_policy: RowIdentityPolicy,
+) -> TableSchemaDescriptor {
+	let schema = Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("region", DataType::LargeUtf8, true),
+	]);
+	let mut descriptor = TableSchemaDescriptor::new_with_layout(
+		table_object_id,
+		1,
+		"analytics",
+		"tier_stats_runs",
+		&schema,
+		row_identity_policy,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(
+			MultiRowLayoutDescriptor::new(rows_per_frame, rows_per_frame, 1024 * 1024).unwrap(),
+		),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+	descriptor.refresh_descriptor_fingerprints().unwrap();
+	descriptor.validate().unwrap();
+	descriptor
+}
+
+/// The block the build must return for a slab whose every recovered row matches `descriptor`,
+/// derived independently: every entry's own one-row batch, concatenated in recovery order.
+/// Returns it with the slab's recovered rows and physical frames.
+fn tier_stats_single_row_reference(
+	mgr: &SlabManager,
+	slab_id: SlabId,
+	raw: &[u8],
+	descriptor: &TableSchemaDescriptor,
+) -> (crate::crypto::TieredColumnStatsBlock, usize, usize) {
+	let blob = SlabView::dense(slab_id, raw).unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	let entries = recover_slab_entries_from_blob(blob, &acknowledged).unwrap();
+	let mut rows = Vec::new();
+	let mut frames = 0;
+	for recovered in crate::storage::core::recovered_frames(&entries) {
+		frames += 1;
+		let decoded = crate::storage::multirow::decode_batch(
+			&extract_record_from_blob(blob, recovered.location()).unwrap(),
+		)
+		.unwrap();
+		for entry in recovered.entries() {
+			let row = crate::storage::multirow::materialize_record_location_batch(
+				&decoded,
+				entry.location.record_row_index,
+			)
+			.unwrap();
+			assert_eq!(
+				row.num_rows(),
+				1,
+				"the reference covers all-matched slabs only"
+			);
+			rows.push(row);
+		}
+	}
+	let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+	let plaintext = crate::storage::stats::build_column_stats_block_with_ciphertext_budget(
+		descriptor,
+		&batch,
+		crate::storage::stats::COLUMN_STATS_DEFAULT_PREFIX_BYTES,
+		crate::storage::stats::max_column_stats_ciphertext_bytes_for_slab_payload(
+			usize::try_from(mgr.config.max_slab_bytes).unwrap(),
+		),
+	)
+	.unwrap();
+	let parsed = parse_column_stats_block(&plaintext).unwrap();
+	assert_eq!(parsed.header.row_count, rows.len() as u64);
+	let block = crate::crypto::TieredColumnStatsBlock::plaintext(
+		plaintext,
+		descriptor.schema_generation,
+		parsed.header.column_block_count,
+		crate::storage::stats::locator_flags_for_parsed_column_stats_block(&parsed),
+	);
+	(block, rows.len(), frames)
+}
+
+/// Builds the slab's block through the real builder, asserts its plaintext and locator metadata
+/// equal the single-row reference, and returns (batches handed to the concat, rows, frames).
+fn assert_tier_stats_equal_single_row_reference(
+	mgr: &SlabManager,
+	slab_id: SlabId,
+	raw: &[u8],
+	descriptor: &TableSchemaDescriptor,
+) -> (usize, usize, usize) {
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor.clone()).unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	TIER_STATS_CONCAT_INPUTS.with(|inputs| inputs.set(None));
+	let built = mgr
+		.build_tiered_column_stats_block(
+			SlabView::dense(slab_id, raw).unwrap(),
+			tenant(),
+			&catalog,
+			&acknowledged,
+		)
+		.unwrap()
+		.expect("an all-matched typed slab builds column stats");
+	let concat_inputs = TIER_STATS_CONCAT_INPUTS
+		.with(std::cell::Cell::get)
+		.expect("the build reached its concat");
+	let (reference, rows, frames) = tier_stats_single_row_reference(mgr, slab_id, raw, descriptor);
+	let crate::crypto::TieredColumnStatsBlock::Plaintext {
+		plaintext,
+		schema_generation,
+		column_count,
+		flags,
+	} = built
+	else {
+		panic!("the builder returns a plaintext stats block");
+	};
+	let crate::crypto::TieredColumnStatsBlock::Plaintext {
+		plaintext: reference_plaintext,
+		schema_generation: reference_generation,
+		column_count: reference_columns,
+		flags: reference_flags,
+	} = reference
+	else {
+		panic!("the reference is a plaintext stats block");
+	};
+	assert_eq!(plaintext, reference_plaintext, "statistics block bytes");
+	assert_eq!(schema_generation, reference_generation);
+	assert_eq!(column_count, reference_columns);
+	assert_eq!(flags, reference_flags);
+	(concat_inputs, rows, frames)
+}
+
+/// `frames` requests of `rows_per_request` rows of the two-column table under
+/// `row_identity_policy`, through real admission and packing, sealed into one slab.
+async fn tier_stats_runs_slab(
+	row_identity_policy: RowIdentityPolicy,
+	requests: usize,
+	rows_per_request: usize,
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	TableSchemaDescriptor,
+	SlabId,
+	Vec<u8>,
+) {
+	let (dir, mgr) = fresh_manager().await;
+	let descriptor = tier_stats_descriptor_with_identity(
+		TableObjectId::new([0xD4; 16]),
+		u32::try_from(rows_per_request).unwrap(),
+		row_identity_policy,
+	);
+	for request in 0..requests {
+		let batch = tier_stats_decode_batch(request, rows_per_request);
+		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			hlc(10_000 + 1_000 * request as u64),
+		)
+		.unwrap();
+		for one in &packed {
+			let entries = storage_multirow_index_entries_from_frame(&one.frame_bytes)
+				.unwrap()
+				.expect("typed multirow frame exposes per-row entries");
+			mgr.append_durable_multirow_with_locality(tenant(), &one.frame_bytes, &entries)
+				.await
+				.unwrap();
+		}
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	(dir, mgr, descriptor, slab_id, raw)
+}
+
+#[tokio::test]
+async fn tier_stats_build_keeps_one_batch_per_multirow_frame_and_the_same_block() {
+	for rows_per_frame in [64usize, 256] {
+		let (_dir, mgr, descriptor, slab_id, raw) =
+			tier_stats_runs_slab(RowIdentityPolicy::AppendOnly, 3, rows_per_frame).await;
+		let (concat_inputs, rows, frames) =
+			assert_tier_stats_equal_single_row_reference(&mgr, slab_id, &raw, &descriptor);
+		assert_eq!((rows, frames), (3 * rows_per_frame, 3));
+		// The retained-per-row form handed the concat one batch per row.
+		assert_eq!(
+			concat_inputs, frames,
+			"{rows} rows in {frames} frames must reach the concat as one batch per frame"
+		);
+	}
+}
+
+#[tokio::test]
+async fn tier_stats_build_keeps_single_row_frames_as_they_were_materialized() {
+	let (_dir, mgr, descriptor, slab_id, raw) =
+		tier_stats_runs_slab(RowIdentityPolicy::AppendOnly, 5, 1).await;
+	let (concat_inputs, rows, frames) =
+		assert_tier_stats_equal_single_row_reference(&mgr, slab_id, &raw, &descriptor);
+	assert_eq!((rows, frames), (5, 5));
+	// No more batches than rows: a one-row frame costs what it did.
+	assert_eq!(concat_inputs, rows);
+}
+
+#[tokio::test]
+async fn tier_stats_build_of_primary_key_multirow_frames_equals_the_single_row_reference() {
+	let (_dir, mgr, descriptor, slab_id, raw) = tier_stats_runs_slab(
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+		2,
+		64,
+	)
+	.await;
+	let (concat_inputs, rows, frames) =
+		assert_tier_stats_equal_single_row_reference(&mgr, slab_id, &raw, &descriptor);
+	assert_eq!(rows, 128);
+	assert_eq!(concat_inputs, frames);
+}
+
+#[tokio::test]
+async fn tier_stats_build_of_content_hash_multirow_frames_equals_the_single_row_reference() {
+	let (_dir, mgr, descriptor, slab_id, raw) =
+		tier_stats_runs_slab(RowIdentityPolicy::AppendOnlyContentHash, 2, 64).await;
+	let (concat_inputs, rows, frames) =
+		assert_tier_stats_equal_single_row_reference(&mgr, slab_id, &raw, &descriptor);
+	assert_eq!(rows, 128);
+	assert_eq!(concat_inputs, frames);
+}
+
+/// The run logic alone, over orders the recovery walk does not produce: a gap, a repeat, an
+/// earlier row and a second frame. The rows reach the concat exactly as their one-row batches.
+#[tokio::test]
+async fn matched_rows_split_on_gaps_repeats_and_reordering() {
+	let descriptor = tier_stats_decode_descriptor(TableObjectId::new([0xD5; 16]), 8);
+	let frames = (0..2)
+		.map(|frame| {
+			let batch = tier_stats_decode_batch(frame, 8);
+			let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+			let packed = pack_record_batch_by_bucket(
+				&meta,
+				&descriptor,
+				&batch,
+				WriterNodeId::ZERO,
+				hlc(10_000 + 1_000 * frame as u64),
+			)
+			.unwrap();
+			assert_eq!(packed.len(), 1);
+			crate::storage::multirow::decode_batch(&packed[0].frame_bytes).unwrap()
+		})
+		.collect::<Vec<_>>();
+	assert!(has_storage_synthetic_columns(&frames[0]));
+	// (frame, rows in arrival order) and the batches they must become.
+	let arrivals: [(usize, &[usize]); 2] = [(0, &[0, 1, 2, 5, 5, 4, 6, 7]), (1, &[3, 4, 0])];
+	let expected_batches = 5 + 2;
+	let mut matched = MatchedRows::default();
+	let mut single_rows = Vec::new();
+	for (frame, rows) in arrivals {
+		for row in rows {
+			let materialized = crate::storage::multirow::materialize_record_location_batch(
+				&frames[frame],
+				RecordRowIndex::new(u32::try_from(*row).unwrap()),
+			)
+			.unwrap();
+			assert_eq!(materialized.num_rows(), 1);
+			single_rows.push(materialized.clone());
+			matched.push(&frames[frame], *row, materialized).unwrap();
+		}
+		matched.finish_frame(&frames[frame]).unwrap();
+	}
+	assert_eq!(matched.batches.len(), expected_batches);
+	let schema = single_rows[0].schema();
+	assert!(matched.batches.iter().all(|batch| batch.schema() == schema));
+	assert_eq!(
+		arrow::compute::concat_batches(&schema, &matched.batches).unwrap(),
+		arrow::compute::concat_batches(&schema, &single_rows).unwrap()
+	);
+	// A run of one row is the row as it was materialized, not a second copy of it.
+	let lone = &matched.batches[1];
+	assert!(Arc::ptr_eq(lone.column(0), single_rows[3].column(0)));
 }
 
 #[tokio::test]

@@ -1050,7 +1050,7 @@ impl SlabManager {
 		let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
 		let mut candidates: Option<Vec<TableSchemaDescriptor>> = None;
 		let mut saw_unmatched_row = false;
-		let mut row_batches = Vec::with_capacity(entries.len());
+		let mut matched_rows = MatchedRows::default();
 		for recovered in crate::storage::core::recovered_frames(&entries) {
 			// Its row slices share this one decode's buffers. A frame that does not decode stays
 			// that way for all its rows.
@@ -1131,9 +1131,17 @@ impl SlabManager {
 					continue;
 				}
 				candidates = Some(matching);
-				row_batches.push(batch);
+				if let Some(decoded) = decoded.as_ref() {
+					matched_rows.push(decoded, location.record_row_index.get() as usize, batch)?;
+				}
+			}
+			if let Some(decoded) = decoded.as_ref() {
+				matched_rows.finish_frame(decoded)?;
 			}
 		}
+		let row_batches = matched_rows.batches;
+		#[cfg(test)]
+		TIER_STATS_CONCAT_INPUTS.with(|inputs| inputs.set(Some(row_batches.len())));
 
 		let Some(mut candidates) = candidates else {
 			return Ok(None);
@@ -1195,5 +1203,80 @@ impl SlabManager {
 	pub(super) fn clear_tiered_stats_cache_for_slab(&self, slab_id: SlabId) {
 		self.tiered_stats_cache
 			.retain(|key, _stats| key.slab_id != slab_id);
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	// How many batches the last tier statistics build on this thread handed to its concat.
+	pub(super) static TIER_STATS_CONCAT_INPUTS: std::cell::Cell<Option<usize>> =
+		const { std::cell::Cell::new(None) };
+}
+
+/// The matched rows a tier statistics build keeps for its concat, in the order they matched.
+///
+/// A frame with the storage columns materializes each row as a one-row slice of itself, so a run
+/// of consecutive matched rows is one slice of the frame: it is kept as its first row and a
+/// length, and becomes one batch when the frame is finished. A row that does not continue the
+/// run (a gap, a repeat, an earlier row) closes it and starts the next, so the rows reach the
+/// concat exactly as their one-row batches would have. A frame without the storage columns is
+/// its own row and is kept as it was materialized.
+#[derive(Default)]
+pub(super) struct MatchedRows {
+	pub(super) batches: Vec<RecordBatch>,
+	run: Option<MatchedRun>,
+}
+
+struct MatchedRun {
+	/// The run's first row as materialized: the whole run while it stays one row long.
+	first: RecordBatch,
+	start: usize,
+	len: usize,
+}
+
+impl MatchedRows {
+	/// `materialized` is `materialize_record_location_batch(frame, row)`, one row, already
+	/// matched to the build's descriptor.
+	pub(super) fn push(
+		&mut self,
+		frame: &RecordBatch,
+		row: usize,
+		materialized: RecordBatch,
+	) -> std::io::Result<()> {
+		if !has_storage_synthetic_columns(frame) {
+			self.finish_frame(frame)?;
+			self.batches.push(materialized);
+			return Ok(());
+		}
+		if let Some(run) = self.run.as_mut()
+			&& run.start + run.len == row
+		{
+			run.len += 1;
+			return Ok(());
+		}
+		self.finish_frame(frame)?;
+		self.run = Some(MatchedRun {
+			first: materialized,
+			start: row,
+			len: 1,
+		});
+		Ok(())
+	}
+
+	/// Closes the open run of `frame`. Every frame that pushed a row is finished before the next
+	/// frame's rows arrive, so a run never spans frames.
+	pub(super) fn finish_frame(&mut self, frame: &RecordBatch) -> std::io::Result<()> {
+		let Some(run) = self.run.take() else {
+			return Ok(());
+		};
+		self.batches.push(if run.len == 1 {
+			run.first
+		} else {
+			// The same projection each of these rows already passed one at a time.
+			crate::storage::multirow::strip_storage_synthetic_columns(
+				&frame.slice(run.start, run.len),
+			)?
+		});
+		Ok(())
 	}
 }
