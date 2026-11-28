@@ -9789,6 +9789,9 @@ fn adr078_manager_source_concatenates_submodules() {
 			"query_tails.rs",
 			// ADR 0696 (0692 §7): charged cross-slab redirects of maintenance rewrites.
 			"redirect_store.rs",
+			// Wendelon ADR 0131: the rehydration installer that owns its slab paths until it
+			// settles, its capacity, and the released-file records.
+			"rehydration_install.rs",
 			// ADR 0692: per-key relocation and atomic empty-key removal.
 			"relocation.rs",
 			// ADR 0697 §4: reserved ids, their capability and their terminal paths.
@@ -10927,6 +10930,9 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			("open.rs".to_string(), 4),
 			// A test hook asking whether a file exists: it installs nothing.
 			("pause_hooks.rs".to_string(), 1),
+			// Wendelon ADR 0131: the rehydration installer's final name, published with
+			// link_no_replace from a temporary name it created, and removed only by its identity.
+			("rehydration_install.rs".to_string(), 1),
 			// An existing file only: a rejected output moved out of this namespace,
 			// and an abandoned one read and disposed of after its claim. Nothing is
 			// installed at a slab path. A resumed disposal names the original once more.
@@ -10935,12 +10941,11 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			("retention_reclaim.rs".to_string(), 1),
 			// the declaration cut (fresh id) and segment source reads
 			("secondary_index_segments.rs".to_string(), 3),
-			// Open classification, owner-identity GC unlink, and released unlink.
+			// Open classification, owner-identity GC unlink, and the release settler's
+			// identity-checked unlink (Wendelon ADR 0131 D4).
 			("slab_file_quarantine.rs".to_string(), 3),
 			// Bootstrap checks the existing path and allocates a fresh replacement.
 			("tier_authority.rs".to_string(), 2),
-			// rehydration, published with link_no_replace
-			("tiered_io.rs".to_string(), 1),
 		],
 		"slab-path call sites changed; review each against the id-keyed release rule"
 	);
@@ -10956,21 +10961,32 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			// Staged output rename and no-replace link into the quarantine namespace.
 			("lsm_driver.rs".to_string(), 2),
 			("maintenance_publication.rs".to_string(), 1),
+			// Wendelon ADR 0131: the rehydration installer's no-replace link of its own
+			// temporary name.
+			("rehydration_install.rs".to_string(), 1),
 			// A rejected output's no-replace link out of the slab namespace, and a
 			// reservation cleanup's into its quarantine name. Neither installs a slab.
 			// ... and a resumed disposal's link, for the row that recorded it and never made it.
 			("reservations.rs".to_string(), 3),
 			("secondary_index_segments.rs".to_string(), 1),
-			("tiered_io.rs".to_string(), 1),
 		],
 		"rename/link call sites changed; review each against the id-keyed release rule"
 	);
-	let tiered_io =
-		fs::read_to_string(manifest_dir.join("src/storage/manager/tiered_io.rs")).unwrap();
+	let installer =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/rehydration_install.rs"))
+			.unwrap();
 	assert!(
-		tiered_io.contains("link_no_replace(&tmp_path, &path)"),
+		installer.contains("link_no_replace(&tmp_path, &path)"),
 		"rehydration never replaces a file at a slab path"
 	);
+	// Wendelon ADR 0131 D3: the installer's temporary name is created by it or not its own,
+	// and none of its names is removed by name alone.
+	let candidate = manager_method_body(&installer, "install_candidate");
+	assert!(candidate.contains("create_new: true"));
+	assert!(!candidate.contains(".unlink("));
+	assert!(!installer.contains("unlink_local_file("));
+	assert_eq!(installer.matches(".unlink(").count(), 1);
+	assert!(manager_method_body(&installer, "remove_by_identity").contains(".unlink(path)"));
 }
 
 /// One manager per data directory: the only constructor outside test and
@@ -12670,9 +12686,15 @@ fn production_part(source: &str) -> &str {
 /// The lifecycle permit sites of one production source, as (file, enclosing
 /// function); commented lines and test modules are not sites.
 fn lifecycle_permit_sites(file: &str, source: &str) -> Vec<(String, String)> {
+	production_call_sites(file, source, &["lifecycle_permit()", "under_permit("])
+}
+
+/// The sites of any of `needles` in one production source, as (file, enclosing
+/// function); commented lines and test modules are not sites.
+fn production_call_sites(file: &str, source: &str, needles: &[&str]) -> Vec<(String, String)> {
 	let production = production_part(source);
 	let mut sites = Vec::new();
-	for needle in ["lifecycle_permit()", "under_permit("] {
+	for &needle in needles {
 		for (offset, _) in production.match_indices(needle) {
 			let line = production[..offset].rfind('\n').map_or(0, |at| at + 1);
 			if production[line..offset].trim_start().starts_with("//") {
@@ -12820,6 +12842,108 @@ fn an_unclassified_lifecycle_permit_site_fails_the_census() {
 		moved
 	);
 	assert!(!moved.is_empty());
+}
+
+/// Wendelon ADR 0131 D2: an admitted operation mints child write permits while
+/// its owner closes, so it stays narrow. Only the rehydration installer's
+/// handoff and the release settler's claim take one, only their two task
+/// bodies run inside one, and the task-local scope lives in `ownership.rs`
+/// alone. A classification guard; the behavioural controls are the evidence.
+#[test]
+fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operations() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut taken = Vec::new();
+	let mut scoped = Vec::new();
+	let mut typed = Vec::new();
+	let mut task_local = Vec::new();
+	walk_dir(&src, &mut |path| {
+		let name = path.file_name().unwrap().to_string_lossy().into_owned();
+		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+			return;
+		}
+		let file = path
+			.strip_prefix(&src)
+			.unwrap()
+			.to_string_lossy()
+			.into_owned();
+		let source = fs::read_to_string(path).unwrap();
+		taken.extend(production_call_sites(
+			&file,
+			&source,
+			&["admitted_operation()", "::admitted_operation"],
+		));
+		scoped.extend(production_call_sites(&file, &source, &["operation.run("]));
+		if production_part(&source).contains("AdmittedOperation") {
+			typed.push(file.clone());
+		}
+		if source.contains("ADMITTED_OPERATION") {
+			task_local.push(file);
+		}
+	});
+	let owned = |sites: &[(&str, &str)]| {
+		sites
+			.iter()
+			.map(|(file, function)| (file.to_string(), function.to_string()))
+			.collect::<Vec<_>>()
+	};
+	taken.sort();
+	assert_eq!(
+		taken,
+		owned(&[
+			(
+				"storage/manager/rehydration_install.rs",
+				"hand_off_rehydration"
+			),
+			(
+				"storage/manager/slab_file_quarantine.rs",
+				"claim_released_slab_file"
+			),
+		]),
+		"an admitted operation taken outside the installer handoff and the settler claim"
+	);
+	scoped.sort();
+	assert_eq!(
+		scoped,
+		owned(&[
+			(
+				"storage/manager/rehydration_install.rs",
+				"install_rehydrated_copy"
+			),
+			(
+				"storage/manager/slab_file_quarantine.rs",
+				"settle_released_slab_file"
+			),
+		]),
+		"an admitted operation's scope runs outside the installer and the settler tasks"
+	);
+	typed.sort();
+	assert_eq!(
+		typed,
+		vec![
+			"storage/manager/rehydration_install.rs".to_string(),
+			"storage/manager/slab_file_quarantine.rs".to_string(),
+			"storage/ownership.rs".to_string(),
+		]
+	);
+	assert_eq!(task_local, vec!["storage/ownership.rs".to_string()]);
+	// The child permit is minted at the one write admission, only for the same
+	// owner, and only while it closes; every other admission stays fenced.
+	let ownership = fs::read_to_string(src.join("storage/ownership.rs")).unwrap();
+	let permit = manager_method_body(&ownership, "write_permit");
+	assert!(permit.contains("OwnerPhase::Active => true"));
+	assert!(permit.contains("OwnerPhase::Closing => self.in_admitted_scope()"));
+	assert!(permit.contains("OwnerPhase::Closed => false"));
+	assert!(
+		manager_method_body(&ownership, "in_admitted_scope").contains("Arc::as_ptr(&self.inner)")
+	);
+	for fenced in ["lifecycle_permit", "admitted_operation", "register_worker"] {
+		let body = manager_method_body(&ownership, fenced);
+		assert!(
+			body.contains("if state.phase != OwnerPhase::Active {")
+				&& !body.contains("in_admitted_scope"),
+			"{fenced} stays fenced once close began"
+		);
+	}
 }
 
 /// ADR 0707: decision maintenance proposes only through its stop-aware

@@ -1173,7 +1173,7 @@ mod write_timing_tests {
 			.write(true)
 			.open(dir.join("data"))
 			.unwrap();
-		(dir, FileHandle::new(file))
+		(dir, FileHandle::new(file).unwrap())
 	}
 
 	fn page(byte: u8) -> AlignedBuf {

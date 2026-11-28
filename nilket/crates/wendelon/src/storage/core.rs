@@ -371,7 +371,8 @@ pub struct LocalSlabStore {
 	/// descriptor context to rebuild the manager's locality index.
 	pub(crate) recovered_localities: DashMap<TenantKey, Locality>,
 
-	/// Owning handle to the slab file.
+	/// Owning handle to the slab file, with the identity its open read (ADR 0131
+	/// D4), so a release under the manager's state lock needs no syscall.
 	file: FileHandle,
 
 	/// Data-path I/O seam over the underlying io_uring thread.
@@ -541,6 +542,55 @@ impl LocalSlabStore {
 				},
 			)
 			.await?;
+		Self::recover_opened(path, slab_id, file_ops, group_commit, acknowledged, file).await
+	}
+
+	/// ADR 0131 D3: open the existing file at `path`, never creating one, and
+	/// recover it only if the opened handle is the file `expected` names. The
+	/// handle's own identity is compared before recovery can modify the file,
+	/// and recovery runs through that same handle; a mismatch is refused typed.
+	pub(crate) async fn open_verified(
+		path: impl AsRef<Path>,
+		slab_id: SlabId,
+		file_ops: Arc<dyn AsyncFileOps>,
+		group_commit: GroupCommitConfig,
+		expected: (u64, u64),
+	) -> std::io::Result<Self> {
+		let path = path.as_ref();
+		let file = file_ops
+			.open(
+				path,
+				OpenFlags {
+					read: true,
+					write: true,
+					create: false,
+					direct: true,
+					..Default::default()
+				},
+			)
+			.await?;
+		if file.identity() != expected {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"slab {slab_id}: the file opened at {} is not the expected file",
+					path.display()
+				),
+			));
+		}
+		Self::recover_opened(path, slab_id, file_ops, group_commit, None, file).await
+	}
+
+	/// The part of every open after its handle exists: the name made durable,
+	/// recovery through `file`, and the store around that same handle.
+	async fn recover_opened(
+		path: &Path,
+		slab_id: SlabId,
+		file_ops: Arc<dyn AsyncFileOps>,
+		group_commit: GroupCommitConfig,
+		acknowledged: Option<&BTreeSet<u64>>,
+		file: FileHandle,
+	) -> std::io::Result<Self> {
 		// Every open makes the slab's name durable before the store is returned:
 		// bytes synced into a file whose directory entry a crash then loses are
 		// lost with it, though the record was acknowledged. That the file
@@ -886,9 +936,12 @@ impl LocalSlabStore {
 
 	/// Identity of the file descriptor actually owned by this slab.
 	pub(crate) fn opened_file_identity(&self) -> std::io::Result<(u64, u64)> {
-		use std::os::unix::fs::MetadataExt;
-		let metadata = self.file.try_clone()?.metadata()?;
-		Ok((metadata.dev(), metadata.ino()))
+		Ok(self.file.identity())
+	}
+
+	/// The identity read at open, with no syscall: every store has one.
+	pub(crate) fn cached_file_identity(&self) -> (u64, u64) {
+		self.file.identity()
 	}
 
 	/// Read a bounded, complete sealed slab through its already-owned file

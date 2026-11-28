@@ -241,8 +241,12 @@ pub use tier_generation::{
 };
 use version_identity::IncomingVersion;
 pub(crate) use witnessed_reads::CopyWitness;
+mod rehydration_install;
 mod slab_file_quarantine;
 mod tiered_io;
+pub use rehydration_install::{
+	RehydrationInhibition, RehydrationInhibitionReason, RehydrationName,
+};
 use relocation::{
 	KeyRelocation, RelocationInsertion, RelocationPair, RelocationScratch,
 	decrement_reference_count,
@@ -896,9 +900,9 @@ pub struct SlabManager {
 	/// Local slab files open found disagreeing with the committed tier state;
 	/// fixed at open, never served or unlinked.
 	quarantined_slab_files: slab_file_quarantine::SlabFileQuarantine,
-	/// Slab ids whose local file an operation of this process removed from
-	/// `state` and has not yet unlinked: the only slab files it may unlink.
-	released_slab_files: DashSet<SlabId>,
+	/// Released slab files not yet unlinked, each with its identity: the only ones it may unlink.
+	released_slab_files: rehydration_install::ReleasedSlabFiles,
+	rehydration_installs: rehydration_install::RehydrationInstalls,
 	live_reservations: Arc<DashSet<SlabId>>,
 	/// Test-only pause points (manager/pause_hooks.rs).
 	#[cfg(test)]
@@ -4328,10 +4332,6 @@ fn merge_row_tombstone_metadata(
 
 fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd", slab_id))
-}
-
-fn rehydrate_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
-	dir.join(format!("slab_{:016x}.wnd.rehydrate.tmp", slab_id))
 }
 
 fn stats_advisory_fields(

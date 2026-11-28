@@ -1579,8 +1579,8 @@ impl SlabManager {
 		if release_locally {
 			{
 				let state = self.state.lock().await;
-				if state.sealed.remove(&slab_id).is_some() {
-					self.release_slab_file(slab_id);
+				if let Some((_, slab)) = state.sealed.remove(&slab_id) {
+					self.release_slab_file(slab_id, slab.cached_file_identity());
 				}
 			}
 			// The old slab is disposed: its redirects go with it.

@@ -181,6 +181,69 @@ impl Drop for LifecyclePermit {
 	}
 }
 
+/// ADR 0131 D2: admission for one manager-owned operation that issues many file
+/// writes in sequence (a rehydration installer, a released-file settler). Like
+/// [`LifecyclePermit`] it counts in the drain, so close waits for it; it is
+/// refused once close began; and dropped without completing, it revokes this
+/// run's clean-shutdown record. Its body runs through [`AdmittedOperation::run`]:
+/// inside that scope, [`DataDirectoryOwner::write_permit`] for the same owner
+/// mints a child permit in the submitting task even while the owner closes, so
+/// the operation finishes what it started. The child is an ordinary counted
+/// [`WritePermit`]: it moves with its I/O and outlives the parent if it must.
+/// Nothing outside the scope gains anything.
+pub(crate) struct AdmittedOperation {
+	inner: Arc<OwnerInner>,
+	completed: bool,
+}
+
+tokio::task_local! {
+	/// The owner whose admitted operation the current task's body runs under.
+	static ADMITTED_OPERATION: AdmittedScope;
+}
+
+/// The scope's view of its parent: which owner it belongs to. Built only by
+/// [`AdmittedOperation::run`], which holds the parent for the scope's whole life,
+/// so a scope exists only while its parent is outstanding.
+struct AdmittedScope {
+	owner: std::sync::Weak<OwnerInner>,
+}
+
+impl AdmittedOperation {
+	/// Runs `body` inside this operation's scope, then completes the operation.
+	/// Cancelled before `body` ends, the operation is dropped uncompleted.
+	pub(crate) async fn run<F: std::future::Future>(self, body: F) -> F::Output {
+		let scope = AdmittedScope {
+			owner: Arc::downgrade(&self.inner),
+		};
+		let output = ADMITTED_OPERATION.scope(scope, body).await;
+		self.complete();
+		output
+	}
+
+	fn complete(mut self) {
+		self.completed = true;
+	}
+}
+
+impl Drop for AdmittedOperation {
+	fn drop(&mut self) {
+		if !self.completed {
+			self.inner
+				.clean_record_revoked
+				.store(true, std::sync::atomic::Ordering::Release);
+		}
+		let mut state = self
+			.inner
+			.state
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		state.outstanding -= 1;
+		if state.outstanding == 0 {
+			self.inner.drained.notify_waiters();
+		}
+	}
+}
+
 /// Returned when another process already owns the canonical data directory.
 #[derive(Debug)]
 pub struct DataDirectoryBusy {
@@ -597,9 +660,37 @@ impl DataDirectoryOwner {
 			.load(std::sync::atomic::Ordering::Acquire)
 	}
 
-	pub(crate) fn write_permit(&self) -> std::io::Result<WritePermit> {
+	/// ADR 0131 D2: an admitted operation; refused once close began.
+	pub(crate) fn admitted_operation(&self) -> std::io::Result<AdmittedOperation> {
 		let mut state = self.inner.state.lock().unwrap();
 		if state.phase != OwnerPhase::Active {
+			return Err(closed_error());
+		}
+		state.outstanding += 1;
+		Ok(AdmittedOperation {
+			inner: self.inner.clone(),
+			completed: false,
+		})
+	}
+
+	/// Whether the current task runs inside an admitted operation of this owner.
+	fn in_admitted_scope(&self) -> bool {
+		ADMITTED_OPERATION
+			.try_with(|scope| std::ptr::eq(scope.owner.as_ptr(), Arc::as_ptr(&self.inner)))
+			.unwrap_or(false)
+	}
+
+	/// The single admission every write reaches, in the submitting task. While
+	/// the owner closes, only a child of an admitted operation of this owner is
+	/// admitted (ADR 0131 D2); the drain counts it like any other permit.
+	pub(crate) fn write_permit(&self) -> std::io::Result<WritePermit> {
+		let mut state = self.inner.state.lock().unwrap();
+		let admitted = match state.phase {
+			OwnerPhase::Active => true,
+			OwnerPhase::Closing => self.in_admitted_scope(),
+			OwnerPhase::Closed => false,
+		};
+		if !admitted {
 			return Err(closed_error());
 		}
 		state.outstanding += 1;
@@ -1551,6 +1642,112 @@ mod tests {
 
 		let after_crash = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
 		assert!(!after_crash.previous_shutdown_clean());
+	}
+
+	/// ADR 0131 D2: close waits for an admitted operation; while it drains, the
+	/// operation's own scope still gets child write permits, which close counts
+	/// on their own, while every other admission is refused. Once the last
+	/// child goes, close completes and records the directory clean.
+	#[tokio::test]
+	async fn an_admitted_operation_finishes_its_writes_while_its_owner_closes() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let operation = owner.admitted_operation().unwrap();
+		let (entered, reached) = oneshot::channel();
+		let (release, released) = oneshot::channel::<()>();
+		let body_owner = owner.clone();
+		let task = tokio::spawn(operation.run(async move {
+			let _ = entered.send(());
+			let _ = released.await;
+			body_owner.write_permit()
+		}));
+		reached.await.unwrap();
+		let closing = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(5)).await })
+		};
+		owner.wait_until_closing().await;
+		assert!(
+			owner.write_permit().is_err(),
+			"a write outside the scope is refused"
+		);
+		assert!(owner.admitted_operation().is_err(), "no new operation");
+		assert!(owner.lifecycle_permit().is_err(), "no new lifecycle permit");
+		let outside = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.write_permit().is_err() })
+		};
+		assert!(
+			outside.await.unwrap(),
+			"another task of the owner is refused"
+		);
+		assert!(!closing.is_finished(), "close waits for the operation");
+		release.send(()).unwrap();
+		let child = task
+			.await
+			.unwrap()
+			.expect("the operation's scope mints a child permit while its owner closes");
+		for _ in 0..4 {
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			!closing.is_finished(),
+			"the child is counted on its own after its parent completed"
+		);
+		drop(child);
+		closing.await.unwrap().unwrap();
+		assert!(!owner.clean_record_revoked());
+		drop(owner);
+		assert!(dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+	}
+
+	/// ADR 0131 D2: a scope admits only its own owner's children; a task it
+	/// spawns gains nothing; and an operation dropped before completing revokes
+	/// the clean-shutdown record, as an interrupted lifecycle permit does.
+	#[tokio::test]
+	async fn an_admitted_operation_scope_is_narrow_and_its_interruption_revokes() {
+		let closing_dir = TestDir::new();
+		let closing = DataDirectoryOwner::acquire_existing(closing_dir.path()).unwrap();
+		let other_dir = TestDir::new();
+		let other = DataDirectoryOwner::acquire_existing(other_dir.path()).unwrap();
+		let held = closing.admitted_operation().unwrap();
+		closing.begin_close();
+		let foreign = other.admitted_operation().unwrap();
+		let refused = {
+			let closing = closing.clone();
+			foreign
+				.run(async move { closing.write_permit().is_err() })
+				.await
+		};
+		assert!(refused, "another owner's scope admits nothing here");
+		let spawned = {
+			let closing = closing.clone();
+			held.run(async move {
+				let own = closing.write_permit().map(drop).is_ok();
+				let spawned = tokio::spawn(async move { closing.write_permit().is_err() })
+					.await
+					.unwrap();
+				own && spawned
+			})
+			.await
+		};
+		assert!(
+			spawned,
+			"the scope's own child is admitted; a task it spawns is not"
+		);
+		closing.close(Duration::from_secs(5)).await.unwrap();
+		assert!(closing_dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+
+		// A store with data, not a never-owned directory.
+		fs::write(other_dir.path().join("data.bin"), b"written").unwrap();
+		drop(other.admitted_operation().unwrap());
+		assert!(
+			other.clean_record_revoked(),
+			"an interrupted operation revokes"
+		);
+		other.close(Duration::from_secs(5)).await.unwrap();
+		drop(other);
+		assert!(!other_dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
 	}
 }
 

@@ -69,7 +69,7 @@ pub(super) struct RehydrationAttempt(u64);
 
 impl RehydrationAttempt {
 	/// The next value of a process-local `u64` counter (`fetch_add`, which wraps).
-	fn issue() -> Self {
+	pub(super) fn issue() -> Self {
 		static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 		Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 	}
@@ -80,7 +80,9 @@ impl RehydrationAttempt {
 /// cancelled during the fetch leaves an entry that admits nothing, and the next
 /// eligible read replaces it. From the handoff to local installation on, the
 /// admission is held until its attempt ends it or a publication, retirement
-/// or quarantine of the slab removes it.
+/// or quarantine of the slab removes it. That removal revokes only the right to
+/// register a copy: the installer keeps the slab's names until it settles
+/// (ADR 0131, `rehydration_install.rs`).
 pub(super) enum RehydrationAdmission {
 	Fetching {
 		attempt: RehydrationAttempt,
@@ -90,14 +92,14 @@ pub(super) enum RehydrationAdmission {
 }
 
 impl RehydrationAdmission {
-	fn attempt(&self) -> RehydrationAttempt {
+	pub(super) fn attempt(&self) -> RehydrationAttempt {
 		match self {
 			Self::Fetching { attempt, .. } | Self::Installing(attempt) => *attempt,
 		}
 	}
 
 	/// Whether the admission still excludes another attempt.
-	fn is_held(&self) -> bool {
+	pub(super) fn is_held(&self) -> bool {
 		match self {
 			Self::Fetching { lease, .. } => lease.strong_count() > 0,
 			Self::Installing(_) => true,
@@ -106,10 +108,13 @@ impl RehydrationAdmission {
 }
 
 /// The admitted attempt as its read holds it during the fetch. Dropping it, as
-/// a cancelled read does, releases a fetching admission.
+/// a cancelled read does, releases a fetching admission and its capacity token.
 pub(super) struct AdmittedRehydration {
-	attempt: RehydrationAttempt,
-	_lease: Arc<()>,
+	pub(super) attempt: RehydrationAttempt,
+	pub(super) _lease: Arc<()>,
+	/// ADR 0131 D5: one of the manager's promotion slots, held from admission
+	/// until the installer settles or the attempt is abandoned.
+	pub(super) slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// A rehydrated local copy of one tier object (ADR 0705 §3): the object's
@@ -1899,10 +1904,13 @@ impl SlabManager {
 		{
 			// The pointer and its generation history are published together.
 			let mut state = self.state.lock().await;
-			let released_sealed = state.sealed.remove(&pointer.slab_id).is_some();
-			let released_copy = state.rehydrated.remove(&pointer.slab_id).is_some();
-			if released_sealed || released_copy {
-				self.release_slab_file(pointer.slab_id);
+			let released_sealed = state.sealed.remove(&pointer.slab_id).map(|(_, slab)| slab);
+			let released_copy = state
+				.rehydrated
+				.remove(&pointer.slab_id)
+				.map(|(_, copy)| copy.store);
+			if let Some(released) = released_sealed.or(released_copy) {
+				self.release_slab_file(pointer.slab_id, released.cached_file_identity());
 			}
 			state.install_tiered(&self.tier_budget, pointer.slab_id, pointer.clone());
 			if let Some(layout) = next_layout {
@@ -2282,10 +2290,13 @@ impl SlabManager {
 			.await?;
 		{
 			let mut state = self.state.lock().await;
-			let released_sealed = state.sealed.remove(&slab_id).is_some();
-			let released_copy = state.rehydrated.remove(&slab_id).is_some();
-			if released_sealed || released_copy {
-				self.release_slab_file(slab_id);
+			let released_sealed = state.sealed.remove(&slab_id).map(|(_, slab)| slab);
+			let released_copy = state
+				.rehydrated
+				.remove(&slab_id)
+				.map(|(_, copy)| copy.store);
+			if let Some(released) = released_sealed.or(released_copy) {
+				self.release_slab_file(slab_id, released.cached_file_identity());
 			}
 			let _old = state.tiered.remove(&slab_id);
 			let _old = state.remove_tier_layout(&self.tier_budget, slab_id);
@@ -2439,10 +2450,13 @@ impl SlabManager {
 		};
 		{
 			let mut state = self.state.lock().await;
-			let released_sealed = state.sealed.remove(&slab_id).is_some();
-			let released_copy = state.rehydrated.remove(&slab_id).is_some();
-			if released_sealed || released_copy {
-				self.release_slab_file(slab_id);
+			let released_sealed = state.sealed.remove(&slab_id).map(|(_, slab)| slab);
+			let released_copy = state
+				.rehydrated
+				.remove(&slab_id)
+				.map(|(_, copy)| copy.store);
+			if let Some(released) = released_sealed.or(released_copy) {
+				self.release_slab_file(slab_id, released.cached_file_identity());
 			}
 			state.tiered.remove(&slab_id);
 			state.remove_tier_layout(&self.tier_budget, slab_id);
@@ -2527,18 +2541,6 @@ impl SlabManager {
 			.hot_read_counts
 			.get(&slab_id)
 			.copied()
-	}
-
-	/// Test-only: admits one promotion attempt for `slab_id` as the threshold
-	/// read would, for a test that installs a copy without reading up to it.
-	#[cfg(test)]
-	pub(super) async fn admit_rehydration_for_test(&self, slab_id: SlabId) -> RehydrationAttempt {
-		let mut state = self.state.lock().await;
-		let attempt = RehydrationAttempt::issue();
-		state
-			.rehydrating
-			.insert(slab_id, RehydrationAdmission::Installing(attempt));
-		attempt
 	}
 
 	/// Lookup the L2 pointer for a tiered slab.
@@ -2649,18 +2651,20 @@ impl SlabManager {
 	pub async fn drop_rehydrated_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
 		let removed = {
 			let state = self.state.lock().await;
+			// ADR 0131 D1: an installer's names are its own until it settles.
 			if state
 				.rehydrating
 				.get(&slab_id)
 				.is_some_and(RehydrationAdmission::is_held)
+				|| self.rehydration_installs.has_record(slab_id)
 			{
 				return Ok(false);
 			}
-			let removed = state.rehydrated.remove(&slab_id).is_some();
-			if removed {
-				self.release_slab_file(slab_id);
+			let removed = state.rehydrated.remove(&slab_id);
+			if let Some((_, copy)) = &removed {
+				self.release_slab_file(slab_id, copy.store.cached_file_identity());
 			}
-			removed
+			removed.is_some()
 		};
 		#[cfg(test)]
 		self.rehydrated_copy_eviction_pause_point().await;
@@ -3331,40 +3335,33 @@ impl SlabManager {
 			plaintext_for_rehydration = Some(plaintext);
 			record
 		};
-		if let Some(admitted) = self.note_l2_read(pointer.slab_id).await {
-			let attempt = admitted.attempt;
+		if let Some(admitted) = self.note_l2_read(pointer).await {
 			let plaintext = match plaintext_for_rehydration.take() {
 				Some(plaintext) => Ok(plaintext),
 				None => self.fetch_full_tiered_plaintext(l2.as_ref(), pointer).await,
 			};
-			let rehydrate_result = match plaintext {
+			match plaintext {
 				// A rehydrated copy is dense on disk; its local reads take
-				// the object's layout (ADR 0705 §3).
+				// the object's layout (ADR 0705 §3). ADR 0131: the manager's
+				// installer owns the attempt from the handoff on; this read
+				// only waits for its outcome, and leaving changes nothing.
 				Ok(plaintext) => {
-					if self
-						.begin_rehydration_install(pointer.slab_id, attempt)
+					if let Some(outcome) = self
+						.hand_off_rehydration(pointer, admitted, plaintext)
 						.await
 					{
-						drop(admitted);
-						self.rehydrate_tiered_slab(pointer.clone(), attempt, plaintext)
-							.await
-					} else {
-						// Superseded during the fetch: nothing to install.
-						Ok(())
+						rehydration_install::wait_settled(outcome).await;
 					}
 				}
 				Err(err) => {
-					self.abandon_rehydration_attempt(pointer.slab_id, attempt)
+					self.abandon_rehydration_attempt(pointer.slab_id, admitted.attempt)
 						.await;
-					Err(err)
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						error = %err,
+						"rehydration failed; continuing to serve slab from L2"
+					);
 				}
-			};
-			if let Err(err) = rehydrate_result {
-				tracing::warn!(
-					slab_id = pointer.slab_id.get(),
-					error = %err,
-					"rehydration failed; continuing to serve slab from L2"
-				);
 			}
 		}
 		if let Ok(policy) = record_batch_compression_policy_from_ipc(&frame) {
@@ -3510,14 +3507,29 @@ impl SlabManager {
 		})
 	}
 
-	/// Counts one L2 read of `slab_id`; at the promotion threshold it admits one
-	/// promotion attempt and returns it, with the lease its fetch holds.
-	pub(super) async fn note_l2_read(&self, slab_id: SlabId) -> Option<AdmittedRehydration> {
+	/// Counts one L2 read of `pointer`'s slab; at the promotion threshold it
+	/// admits one promotion attempt and returns it, with the lease its fetch
+	/// holds and its capacity token. ADR 0131 D1: only a read of the slab's
+	/// current publication counts, so a read that resolved an older pointer
+	/// admits nothing; and no attempt is admitted while an installer's record,
+	/// a released file of the slab or a promotion inhibition holds its names.
+	pub(super) async fn note_l2_read(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> Option<AdmittedRehydration> {
 		let promote_after = self.config.rehydration.promote_after_l2_reads;
 		if promote_after == 0 {
 			return None;
 		}
+		let slab_id = pointer.slab_id;
 		let mut state = self.state.lock().await;
+		if !state
+			.tiered
+			.get(&slab_id)
+			.is_some_and(|published| published.value() == pointer)
+		{
+			return None;
+		}
 		if state.rehydrated.contains_key(&slab_id) {
 			return None;
 		}
@@ -3541,6 +3553,20 @@ impl SlabManager {
 			self.quarantined_slab_files.note_rehydration_skipped();
 			return None;
 		}
+		// A name this process could not remove or did not create: promotion of
+		// the slab stays inhibited, and its reads keep serving from L2.
+		if self.rehydration_installs.inhibition(slab_id).is_some() {
+			state.hot_read_counts.remove(&slab_id);
+			return None;
+		}
+		// The names are another owner's until it settles; the reads keep counting.
+		if self.rehydration_installs.has_record(slab_id)
+			|| self.released_slab_files.contains(slab_id)
+		{
+			return None;
+		}
+		// D5: capacity before admission, never waited for.
+		let slot = self.rehydration_installs.try_acquire_slot()?;
 		let attempt = RehydrationAttempt::issue();
 		let lease = Arc::new(());
 		let admission = RehydrationAdmission::Fetching {
@@ -3551,6 +3577,7 @@ impl SlabManager {
 		Some(AdmittedRehydration {
 			attempt,
 			_lease: lease,
+			slot,
 		})
 	}
 
@@ -3558,7 +3585,7 @@ impl SlabManager {
 	/// whether it did. A publication, retirement or quarantine during the
 	/// attempt's I/O removed its entry, and a newer attempt may hold the slab
 	/// since: a stale attempt changes nothing.
-	fn end_rehydration_attempt(
+	pub(super) fn end_rehydration_attempt(
 		state: &mut ManagerState,
 		slab_id: SlabId,
 		attempt: RehydrationAttempt,
@@ -3573,28 +3600,9 @@ impl SlabManager {
 		owned
 	}
 
-	/// The handoff from the fetch to local installation. Only the attempt that
-	/// still owns the admission installs; from here its admission no longer
-	/// ends with its read, so no later attempt can start while this one's file
-	/// I/O may still run against the slab's paths.
-	async fn begin_rehydration_install(
-		&self,
-		slab_id: SlabId,
-		attempt: RehydrationAttempt,
-	) -> bool {
-		let mut state = self.state.lock().await;
-		match state.rehydrating.get_mut(&slab_id) {
-			Some(admission) if admission.attempt() == attempt => {
-				*admission = RehydrationAdmission::Installing(attempt);
-				true
-			}
-			_ => false,
-		}
-	}
-
 	/// A failed attempt that still owned its admission returns the slab to one
 	/// read below the promotion threshold, so the next eligible read retries.
-	fn set_rehydration_retry_floor(&self, state: &mut ManagerState, slab_id: SlabId) {
+	pub(super) fn set_rehydration_retry_floor(&self, state: &mut ManagerState, slab_id: SlabId) {
 		let retry_floor = self
 			.config
 			.rehydration
@@ -3615,103 +3623,6 @@ impl SlabManager {
 		if Self::end_rehydration_attempt(&mut state, slab_id, attempt) {
 			self.set_rehydration_retry_floor(&mut state, slab_id);
 		}
-	}
-
-	pub(super) async fn rehydrate_tiered_slab(
-		&self,
-		pointer: TieredSlabPointer,
-		attempt: RehydrationAttempt,
-		plaintext: TieredPlaintext,
-	) -> std::io::Result<()> {
-		let result = self
-			.install_rehydrated_local_copy(&pointer, &plaintext)
-			.await;
-		let mut state = self.state.lock().await;
-		let owned = Self::end_rehydration_attempt(&mut state, pointer.slab_id, attempt);
-		// A copy is installed only for the generation it was made from.
-		let still_published = state
-			.tiered
-			.get(&pointer.slab_id)
-			.is_some_and(|published| published.value() == &pointer);
-		match result {
-			Ok(_) if !still_published => {
-				// The copy this call installed belongs to a superseded
-				// generation: it is never tracked, and its file is removed
-				// rather than left at the slab's path.
-				self.release_slab_file(pointer.slab_id);
-				drop(state);
-				self.unlink_released_slab_file(pointer.slab_id).await
-			}
-			Ok(installed) => {
-				state.hot_read_counts.remove(&pointer.slab_id);
-				state.install_rehydrated(&self.tier_budget, pointer.slab_id, installed);
-				Ok(())
-			}
-			Err(err) => {
-				// A stale attempt never recreates read counts for a slab that
-				// was republished, retired or quarantined during its I/O.
-				if owned {
-					self.set_rehydration_retry_floor(&mut state, pointer.slab_id);
-				}
-				Err(err)
-			}
-		}
-	}
-
-	pub(super) async fn install_rehydrated_local_copy(
-		&self,
-		pointer: &TieredSlabPointer,
-		plaintext: &TieredPlaintext,
-	) -> std::io::Result<RehydratedCopy> {
-		let slab_id = pointer.slab_id;
-		// The copy holds exactly the object's bytes under its layout.
-		let blob = plaintext.view()?.bytes();
-		if self.quarantined_slab_files.contains(slab_id) {
-			return Err(Error::new(
-				ErrorKind::AlreadyExists,
-				format!("slab {slab_id}'s path holds a quarantined file; it is never replaced"),
-			));
-		}
-		let path = slab_path(&self.config.dir, slab_id);
-		let tmp_path = rehydrate_tmp_path(&self.config.dir, slab_id);
-		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
-		self.file_ops.write_all(&tmp_path, blob).await?;
-		let tmp = self
-			.file_ops
-			.open(
-				&tmp_path,
-				OpenFlags {
-					read: true,
-					write: true,
-					create: false,
-					create_new: false,
-					truncate: false,
-					direct: false,
-				},
-			)
-			.await?;
-		self.file_ops.fsync(&tmp).await?;
-		// The copy is published only where no file exists: whatever is already
-		// at the slab's path is not this copy's to replace.
-		let linked = self.file_ops.link_no_replace(&tmp_path, &path).await;
-		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
-		linked?;
-		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
-		let slab = Arc::new(
-			LocalSlabStore::open(
-				&path,
-				slab_id,
-				self.file_ops.clone(),
-				self.config.group_commit.clone(),
-			)
-			.await?,
-		);
-		Ok(RehydratedCopy {
-			store: slab,
-			layout: plaintext.layout,
-			generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
-			keep_local_until: Instant::now() + self.config.rehydration.min_local_residency,
-		})
 	}
 }
 

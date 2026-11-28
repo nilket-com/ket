@@ -68945,10 +68945,11 @@ async fn a_rehydrated_based_object_reads_through_its_layout_and_serves_only_its_
 		assert!(location.offset >= plaintext.layout.base());
 		expected.insert(key, (location, value.to_vec()));
 	}
-	let attempt = mgr.admit_rehydration_for_test(pointer.slab_id).await;
-	mgr.rehydrate_tiered_slab(published.clone(), attempt, plaintext)
-		.await
-		.unwrap();
+	assert_eq!(
+		mgr.rehydrate_for_test(&published, plaintext).await,
+		Some(rehydration_install::InstallOutcome::Registered),
+		"premise: the installer registers the copy"
+	);
 	assert!(
 		mgr.is_rehydrated(pointer.slab_id).await,
 		"premise: a local copy"
@@ -74208,4 +74209,1764 @@ async fn a_cancelled_stale_attempt_leaves_a_newer_attempt_its_admission() {
 	);
 	assert_promotion_copy_serves_reads(&f, calls).await;
 	drop(release_a);
+}
+
+// ------------------------------------------------------------------
+// ADR 0131: a rehydration installer owns its slab paths until its copy is
+// registered or removed. Ordinary single-installer state controls: a file-ops
+// backend gates the installer's own handle write (or one unlink), never two
+// writers at once.
+// ------------------------------------------------------------------
+
+/// A test hold: (`entered`, `release`).
+type GateHold = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+
+fn gate_hold() -> GateHold {
+	(
+		Arc::new(tokio::sync::Semaphore::new(0)),
+		Arc::new(tokio::sync::Semaphore::new(0)),
+	)
+}
+
+/// Signals `entered`, then waits for one `release`.
+async fn pass_gate_hold((entered, release): GateHold) {
+	entered.add_permits(1);
+	release.acquire().await.unwrap().forget();
+}
+
+/// Waits (bounded) until a hold is entered.
+async fn gate_hold_entered(entered: &tokio::sync::Semaphore, what: &str) {
+	match tokio::time::timeout(Duration::from_secs(10), entered.acquire()).await {
+		Ok(Ok(permit)) => permit.forget(),
+		_ => panic!("BLOCKER: {what}: the hold was never reached"),
+	}
+}
+
+/// The test's controls over `InstallerGateFileOps`.
+#[derive(Default)]
+struct InstallerGate {
+	/// The path each descriptor this backend opened names.
+	opened: std::sync::Mutex<HashMap<i32, PathBuf>>,
+	/// Holds the next write to a rehydration temporary file.
+	write_hold: std::sync::Mutex<Option<GateHold>>,
+	/// The next temporary-file write passes only part of its bytes.
+	short_write: AtomicBool,
+	/// The next temporary-file write makes no progress.
+	zero_write: AtomicBool,
+	/// Every temporary-file write: (offset, bytes offered, bytes written).
+	writes: std::sync::Mutex<Vec<(u64, usize, usize)>>,
+	/// Unlinks of a name with this suffix fail, this many more times.
+	unlink_failures: std::sync::Mutex<Option<(String, usize)>>,
+	/// Holds the next unlink of a name with this suffix.
+	unlink_hold: std::sync::Mutex<Option<(String, GateHold)>>,
+	/// Opens of a name with this suffix fail before the inner open, this many
+	/// more times: nothing is created.
+	open_failures: std::sync::Mutex<Option<(String, usize)>>,
+	/// Opens of a name with this suffix fail AFTER the inner open succeeded,
+	/// this many more times: the file exists, as when its identity step fails.
+	open_failures_after_creating: std::sync::Mutex<Option<(String, usize)>>,
+	/// This many more directory syncs fail.
+	fsync_dir_failures: std::sync::atomic::AtomicUsize,
+}
+
+impl InstallerGate {
+	fn hold_next_tmp_write(&self) -> GateHold {
+		let hold = gate_hold();
+		let previous = self.write_hold.lock().unwrap().replace(hold.clone());
+		assert!(previous.is_none(), "premise: one write hold at a time");
+		hold
+	}
+
+	fn hold_next_unlink(&self, suffix: &str) -> GateHold {
+		let hold = gate_hold();
+		*self.unlink_hold.lock().unwrap() = Some((suffix.to_owned(), hold.clone()));
+		hold
+	}
+
+	fn fail_unlinks(&self, suffix: &str, times: usize) {
+		*self.unlink_failures.lock().unwrap() = Some((suffix.to_owned(), times));
+	}
+
+	fn fail_opens(&self, suffix: &str, times: usize) {
+		*self.open_failures.lock().unwrap() = Some((suffix.to_owned(), times));
+	}
+
+	fn fail_opens_after_creating(&self, suffix: &str, times: usize) {
+		*self.open_failures_after_creating.lock().unwrap() = Some((suffix.to_owned(), times));
+	}
+
+	fn fail_fsync_dirs(&self, times: usize) {
+		self.fsync_dir_failures.store(times, Ordering::SeqCst);
+	}
+
+	fn fsync_dir_failures_left(&self) -> usize {
+		self.fsync_dir_failures.load(Ordering::SeqCst)
+	}
+
+	fn unlink_failures_left(&self) -> usize {
+		self.unlink_failures
+			.lock()
+			.unwrap()
+			.as_ref()
+			.map_or(0, |(_, left)| *left)
+	}
+
+	fn tmp_writes(&self) -> Vec<(u64, usize, usize)> {
+		self.writes.lock().unwrap().clone()
+	}
+}
+
+/// Delegates every operation to `inner`, the production backend, except that
+/// the gate may hold, shorten or stall a write to a rehydration temporary
+/// file, and hold or fail an unlink.
+struct InstallerGateFileOps {
+	inner: Arc<dyn AsyncFileOps>,
+	gate: Arc<InstallerGate>,
+}
+
+impl InstallerGateFileOps {
+	fn is_rehydration_tmp(&self, handle: &crate::storage::file_ops::FileHandle) -> bool {
+		self.gate
+			.opened
+			.lock()
+			.unwrap()
+			.get(&handle.raw_fd())
+			.is_some_and(|path| path.to_string_lossy().ends_with(".rehydrate.tmp"))
+	}
+}
+
+#[async_trait::async_trait]
+impl AsyncFileOps for InstallerGateFileOps {
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		let inner = self.inner.clone().bind_directory_owner(owner)?;
+		Ok(Arc::new(Self {
+			inner,
+			gate: self.gate.clone(),
+		}))
+	}
+
+	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		self.inner.write_permit()
+	}
+
+	async fn open(
+		&self,
+		path: &Path,
+		flags: OpenFlags,
+	) -> std::io::Result<crate::storage::file_ops::FileHandle> {
+		{
+			let name = path.to_string_lossy();
+			let mut failures = self.gate.open_failures.lock().unwrap();
+			if let Some((suffix, left)) = failures.as_mut()
+				&& *left > 0 && name.ends_with(suffix.as_str())
+			{
+				*left -= 1;
+				return Err(Error::other("injected open-time identity failure (test)"));
+			}
+		}
+		let handle = self.inner.open(path, flags).await?;
+		{
+			let name = path.to_string_lossy();
+			let mut failures = self.gate.open_failures_after_creating.lock().unwrap();
+			if let Some((suffix, left)) = failures.as_mut()
+				&& *left > 0 && name.ends_with(suffix.as_str())
+			{
+				*left -= 1;
+				drop(handle);
+				return Err(Error::other(
+					"injected identity failure after the open (test)",
+				));
+			}
+		}
+		self.gate
+			.opened
+			.lock()
+			.unwrap()
+			.insert(handle.raw_fd(), path.to_path_buf());
+		Ok(handle)
+	}
+
+	async fn read_plain_at(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+		offset: u64,
+		len: usize,
+	) -> std::io::Result<Vec<u8>> {
+		self.inner.read_plain_at(handle, offset, len).await
+	}
+
+	async fn write_plain_at(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+		offset: u64,
+		mut bytes: Vec<u8>,
+	) -> std::io::Result<usize> {
+		if !self.is_rehydration_tmp(handle) {
+			return self.inner.write_plain_at(handle, offset, bytes).await;
+		}
+		let hold = self.gate.write_hold.lock().unwrap().take();
+		if let Some(hold) = hold {
+			pass_gate_hold(hold).await;
+		}
+		let offered = bytes.len();
+		let written = if self.gate.zero_write.swap(false, Ordering::SeqCst) {
+			0
+		} else {
+			if offered > 1 && self.gate.short_write.swap(false, Ordering::SeqCst) {
+				bytes.truncate((offered / 2 + 7).min(offered - 1));
+			}
+			self.inner.write_plain_at(handle, offset, bytes).await?
+		};
+		self.gate
+			.writes
+			.lock()
+			.unwrap()
+			.push((offset, offered, written));
+		Ok(written)
+	}
+
+	async fn read_at(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+		offset: u64,
+		buf: crate::storage::io_uring::AlignedBuf,
+	) -> std::io::Result<(usize, crate::storage::io_uring::AlignedBuf)> {
+		self.inner.read_at(handle, offset, buf).await
+	}
+
+	async fn write_at(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+		offset: u64,
+		buf: crate::storage::io_uring::AlignedBuf,
+	) -> std::io::Result<(usize, crate::storage::io_uring::AlignedBuf)> {
+		self.inner.write_at(handle, offset, buf).await
+	}
+
+	async fn fsync(&self, handle: &crate::storage::file_ops::FileHandle) -> std::io::Result<()> {
+		self.inner.fsync(handle).await
+	}
+
+	async fn fdatasync(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+	) -> std::io::Result<()> {
+		self.inner.fdatasync(handle).await
+	}
+
+	async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+		self.inner.read_all(path).await
+	}
+
+	async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+		self.inner.write_all(path, bytes).await
+	}
+
+	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
+		self.inner.file_len(path).await
+	}
+
+	async fn opened_file_len(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+	) -> std::io::Result<u64> {
+		self.inner.opened_file_len(handle).await
+	}
+
+	async fn set_len(
+		&self,
+		handle: &crate::storage::file_ops::FileHandle,
+		len: u64,
+	) -> std::io::Result<()> {
+		self.inner.set_len(handle, len).await
+	}
+
+	async fn path_identity(&self, path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+		self.inner.path_identity(path).await
+	}
+
+	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+		self.inner.create_dir_all(path).await
+	}
+
+	async fn read_dir(
+		&self,
+		path: &Path,
+	) -> std::io::Result<Vec<crate::storage::file_ops::DirectoryEntry>> {
+		self.inner.read_dir(path).await
+	}
+
+	async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
+		let fail = self
+			.gate
+			.fsync_dir_failures
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+				left.checked_sub(1)
+			})
+			.is_ok();
+		if fail {
+			return Err(Error::other("injected directory sync failure (test)"));
+		}
+		self.inner.fsync_dir(path).await
+	}
+
+	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+		self.inner.rename(from, to).await
+	}
+
+	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+		self.inner.link_no_replace(from, to).await
+	}
+
+	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
+		let name = path.to_string_lossy().into_owned();
+		let hold = {
+			let mut held = self.gate.unlink_hold.lock().unwrap();
+			if held
+				.as_ref()
+				.is_some_and(|(suffix, _)| name.ends_with(suffix.as_str()))
+			{
+				held.take().map(|(_, hold)| hold)
+			} else {
+				None
+			}
+		};
+		if let Some(hold) = hold {
+			pass_gate_hold(hold).await;
+		}
+		{
+			let mut failures = self.gate.unlink_failures.lock().unwrap();
+			if let Some((suffix, left)) = failures.as_mut()
+				&& *left > 0 && name.ends_with(suffix.as_str())
+			{
+				*left -= 1;
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					"injected unlink failure (test)",
+				));
+			}
+		}
+		self.inner.unlink(path).await
+	}
+}
+
+/// A promotion slab on a manager whose file operations pass through an
+/// `InstallerGate`, optionally bound to a directory owner. Its object holds a
+/// pruned key beside the promotion row, so a retention rewrite can replace it.
+struct GatedPromotion {
+	f: PromotionSlab,
+	l2: Arc<dyn ObjectStore>,
+	gate: Arc<InstallerGate>,
+	calls: Arc<PromotionFetchControl>,
+	owner: Option<DataDirectoryOwner>,
+}
+
+impl GatedPromotion {
+	fn slab(&self) -> SlabId {
+		self.f.pointer.slab_id
+	}
+
+	fn tmp_path(&self) -> PathBuf {
+		rehydration_install::rehydrate_tmp_path(&self.f.mgr.config.dir, self.slab())
+	}
+
+	fn final_path(&self) -> PathBuf {
+		slab_path(&self.f.mgr.config.dir, self.slab())
+	}
+
+	/// The final name's file name, which no temporary name ends with.
+	fn final_suffix(&self) -> String {
+		self.final_path()
+			.file_name()
+			.unwrap()
+			.to_string_lossy()
+			.into_owned()
+	}
+
+	fn assert_names_absent(&self, what: &str) {
+		assert!(
+			!self.tmp_path().exists(),
+			"{what}: no temporary name is left"
+		);
+		assert!(!self.final_path().exists(), "{what}: no final name is left");
+	}
+}
+
+async fn gated_promotion_slab(tag: &str, owned: bool) -> GatedPromotion {
+	let l1_dir = fresh_dir(&format!("{tag}-l1"));
+	let l2_root = fresh_dir(&format!("{tag}-l2"));
+	let calls = Arc::new(PromotionFetchControl::default());
+	let l2: Arc<dyn ObjectStore> = Arc::new(PromotionFetchFaultStore {
+		inner: Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap()),
+		control: calls.clone(),
+	});
+	let io = spawn_io_thread(64).unwrap();
+	let gate = Arc::new(InstallerGate::default());
+	let file_ops: Arc<dyn AsyncFileOps> = Arc::new(InstallerGateFileOps {
+		inner: Arc::new(
+			IoUringFileOps::with_isolated_blocking(
+				io.clone(),
+				"wendelon-fs-meta-gated",
+				BlockingIoClass::SlabMetadata,
+			)
+			.unwrap(),
+		),
+		gate: gate.clone(),
+	});
+	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	};
+	let owner = owned.then(|| DataDirectoryOwner::acquire_or_create(&*l1_dir).unwrap());
+	let mgr = match &owner {
+		Some(owner) => {
+			SlabManager::initialize_new_store_with_file_ops_and_owner(
+				config,
+				file_ops,
+				owner.clone(),
+			)
+			.await
+		}
+		None => SlabManager::initialize_new_store_with_file_ops(config, file_ops).await,
+	}
+	.unwrap();
+	let (pruned, key) = (id(0x3131_0002), id(0x3040_0001));
+	mgr.append(tenant(), pruned, hlc(10), b"p-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), key, hlc(10), PROMOTION_ROW)
+		.await
+		.unwrap();
+	mgr.append(tenant(), pruned, hlc(20), b"p-20")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}.wnd")).await;
+	assert!(
+		pointer.is_encrypted,
+		"premise: the committed pointer is encrypted"
+	);
+	let threshold = mgr.config.rehydration.promote_after_l2_reads as usize;
+	assert!(threshold >= 1, "premise: promotion is enabled");
+	let location = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("premise: the row is indexed");
+	assert_eq!(location.slab_id, pointer.slab_id);
+	GatedPromotion {
+		f: PromotionSlab {
+			_dirs: [l1_dir, l2_root],
+			mgr,
+			pointer,
+			location,
+			threshold,
+		},
+		l2,
+		gate,
+		calls,
+		owner,
+	}
+}
+
+/// Reads up to one below the threshold, then spawns the threshold read with
+/// the installer held before its first write. Returns once the installer is
+/// there, with the read's task and the hold's release.
+async fn spawn_held_installer(
+	g: &GatedPromotion,
+	what: &str,
+) -> (
+	tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+	Arc<tokio::sync::Semaphore>,
+) {
+	for n in 1..g.f.threshold {
+		let (bytes, _) = read_promotion_row(&g.f, &g.calls, &format!("{what}: read {n}")).await;
+		assert_eq!(bytes, 0, "premise: {what}: read {n} reads ranges only");
+	}
+	let (entered, release) = g.gate.hold_next_tmp_write();
+	let task = {
+		let mgr = g.f.mgr.clone();
+		let location = g.f.location;
+		tokio::spawn(async move { mgr.read(location).await })
+	};
+	gate_hold_entered(&entered, what).await;
+	assert!(
+		g.f.mgr.rehydration_installing_for_test(g.slab()),
+		"premise: {what}: the installer holds the slab's names"
+	);
+	assert!(
+		!task.is_finished(),
+		"premise: {what}: the threshold read waits for its installer"
+	);
+	(task, release)
+}
+
+/// The installer holding `slab`'s names, as its outcome watch will report it.
+async fn installer_outcome(
+	outcome: tokio::sync::watch::Receiver<rehydration_install::InstallState>,
+	what: &str,
+) -> rehydration_install::InstallOutcome {
+	match tokio::time::timeout(
+		Duration::from_secs(10),
+		rehydration_install::wait_settled(outcome),
+	)
+	.await
+	{
+		Ok(Some(outcome)) => outcome,
+		Ok(None) => panic!("{what}: the installer ended without an outcome"),
+		Err(_) => panic!("{what}: the installer did not settle within 10 s"),
+	}
+}
+
+/// Reads past the threshold that admit nothing: each is served from L2
+/// without a whole-object fetch.
+async fn reads_admit_nothing(g: &GatedPromotion, location: RecordLocation, what: &str) {
+	for n in 0..=g.f.threshold {
+		let before = g.calls.get_bytes_calls();
+		let row = g.f.mgr.read(location).await.unwrap();
+		assert_eq!(row, PROMOTION_ROW, "{what}: read {n} returns the row");
+		assert_eq!(
+			g.calls.get_bytes_calls(),
+			before,
+			"{what}: read {n} past the threshold admits no promotion"
+		);
+	}
+	assert!(
+		!g.f.mgr.rehydrating_for_test(g.slab()).await,
+		"{what}: no admission"
+	);
+}
+
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+	while !done() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{what}: not reached within 10 s"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+}
+
+/// C1 (DC-307), a same-pointer replay. With the installer held, the replay
+/// returns and ends the admission, and reads past the threshold admit nothing
+/// and serve L2. On release, the candidate is removed by identity and never
+/// registered; the next eligible read admits and serves locally.
+#[tokio::test]
+async fn a_same_pointer_replay_never_lets_a_second_installer_onto_held_names() {
+	let g = gated_promotion_slab("installer-replay", false).await;
+	let (task, release) = spawn_held_installer(&g, "replay").await;
+	let replay = tokio::time::timeout(
+		Duration::from_secs(10),
+		g.f.mgr.apply_tier_slab(g.f.pointer.clone()),
+	)
+	.await;
+	match replay {
+		Ok(Ok(())) => {}
+		Ok(Err(error)) => panic!("BLOCKER: the same-pointer replay failed: {error}"),
+		Err(_) => panic!("BLOCKER: the same-pointer replay waited on the held installer"),
+	}
+	assert!(
+		!g.f.mgr.rehydrating_for_test(g.slab()).await,
+		"the replay revoked the right to register"
+	);
+	assert!(
+		g.f.mgr.rehydration_installing_for_test(g.slab()),
+		"the installer keeps the slab's names past the replay"
+	);
+	reads_admit_nothing(&g, g.f.location, "while the installer is held").await;
+	let outcome =
+		g.f.mgr
+			.rehydration_outcome_for_test(g.slab())
+			.expect("premise: the installer's record");
+	release.add_permits(1);
+	assert_eq!(
+		installer_outcome(outcome, "replay").await,
+		rehydration_install::InstallOutcome::Removed,
+		"a revoked candidate is removed, never registered"
+	);
+	assert_eq!(
+		released_promotion_read(task, "threshold").await,
+		PROMOTION_ROW
+	);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await, "nothing registered");
+	assert!(!g.f.mgr.rehydration_installing_for_test(g.slab()));
+	g.assert_names_absent("after the revoked installer");
+	let (bytes, _) = read_promotion_row(&g.f, &g.calls, "the next eligible read").await;
+	assert_eq!(bytes, 1, "the next eligible read admits one promotion");
+	assert_promotion_copy_serves_reads(&g.f, &g.calls).await;
+}
+
+/// C2 (DC-307), a replacement. A retention rewrite publishes a new generation
+/// while the installer is held: the record's exclusion outlives it, the old
+/// candidate is removed by identity, and the new generation then promotes.
+#[tokio::test]
+async fn a_replacement_during_a_held_installer_never_registers_the_old_candidate() {
+	let g = gated_promotion_slab("installer-replacement", false).await;
+	let (task, release) = spawn_held_installer(&g, "replacement").await;
+	let (bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(&g.f.mgr, &g.f.pointer).await;
+	let uri =
+		g.l2.put("tier/installer-replacement-2.wnd", &bytes)
+			.await
+			.unwrap();
+	let published = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&g.f.mgr, g.slab(), uri, &bytes)
+	};
+	assert_ne!(published, g.f.pointer, "premise: a new generation");
+	tokio::time::timeout(
+		Duration::from_secs(10),
+		g.f.mgr.apply_tier_slab_committed(published.clone(), None),
+	)
+	.await
+	.expect("BLOCKER: the replacement waited on the held installer")
+	.unwrap();
+	assert!(g.f.mgr.rehydration_installing_for_test(g.slab()));
+	let location =
+		g.f.mgr
+			.lookup(tenant(), id(0x3040_0001))
+			.unwrap()
+			.expect("premise: the row survives the rewrite");
+	reads_admit_nothing(&g, location, "the new generation, installer held").await;
+	let outcome = g.f.mgr.rehydration_outcome_for_test(g.slab()).unwrap();
+	release.add_permits(1);
+	assert_eq!(
+		installer_outcome(outcome, "replacement").await,
+		rehydration_install::InstallOutcome::Removed
+	);
+	assert_eq!(
+		released_promotion_read(task, "threshold").await,
+		PROMOTION_ROW
+	);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	g.assert_names_absent("after the superseded installer");
+	let before = g.calls.get_bytes_calls();
+	assert_eq!(g.f.mgr.read(location).await.unwrap(), PROMOTION_ROW);
+	assert_eq!(
+		g.calls.get_bytes_calls() - before,
+		1,
+		"the new generation's eligible read promotes"
+	);
+	assert!(g.f.mgr.is_rehydrated(g.slab()).await);
+	for n in 1..=3 {
+		let (bytes, ranges) = (g.calls.get_bytes_calls(), g.calls.get_range_calls());
+		assert_eq!(g.f.mgr.read(location).await.unwrap(), PROMOTION_ROW);
+		assert_eq!(
+			(g.calls.get_bytes_calls(), g.calls.get_range_calls()),
+			(bytes, ranges),
+			"local read {n} of the new generation fetches nothing"
+		);
+	}
+}
+
+/// C3 (DC-306): the threshold reader is aborted after the handoff; the
+/// installer owns the attempt and registers the copy, and the next read is
+/// local.
+#[tokio::test]
+async fn an_aborted_threshold_reader_leaves_its_installer_to_register_the_copy() {
+	let g = gated_promotion_slab("installer-aborted-reader", false).await;
+	let (task, release) = spawn_held_installer(&g, "aborted reader").await;
+	let outcome = g.f.mgr.rehydration_outcome_for_test(g.slab()).unwrap();
+	cancel_held_promotion_read(task, "aborted reader").await;
+	assert!(
+		g.f.mgr.rehydration_installing_for_test(g.slab()),
+		"the installer outlives its reader"
+	);
+	release.add_permits(1);
+	assert_eq!(
+		installer_outcome(outcome, "aborted reader").await,
+		rehydration_install::InstallOutcome::Registered
+	);
+	assert_promotion_copy_serves_reads(&g.f, &g.calls).await;
+}
+
+/// C3 (DC-306), the failing variant: the installer fails after its reader was
+/// aborted. It removes its names and applies the retry floor itself, so the
+/// first eligible read after settlement admits.
+#[tokio::test]
+async fn an_aborted_reader_whose_installer_fails_lets_the_next_read_retry() {
+	let g = gated_promotion_slab("installer-aborted-failing", false).await;
+	let (task, release) = spawn_held_installer(&g, "aborted, failing").await;
+	g.gate.zero_write.store(true, Ordering::SeqCst);
+	let outcome = g.f.mgr.rehydration_outcome_for_test(g.slab()).unwrap();
+	cancel_held_promotion_read(task, "aborted, failing").await;
+	release.add_permits(1);
+	assert_eq!(
+		installer_outcome(outcome, "aborted, failing").await,
+		rehydration_install::InstallOutcome::Removed
+	);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	g.assert_names_absent("after the failed installer");
+	let (bytes, _) = read_promotion_row(&g.f, &g.calls, "the first read after settlement").await;
+	assert_eq!(
+		bytes, 1,
+		"the retry floor admits the first read after settlement"
+	);
+	assert_promotion_copy_serves_reads(&g.f, &g.calls).await;
+}
+
+/// C4 (D1): a read that resolved a pointer the slab no longer publishes is
+/// neither counted nor admitted; reads of the current pointer still are.
+#[tokio::test]
+async fn a_read_of_an_older_pointer_admits_nothing() {
+	let (f, _calls) = promotion_fault_slab("installer-old-pointer").await;
+	let stale = TieredSlabPointer {
+		l2_uri: format!("{}-superseded", f.pointer.l2_uri),
+		..f.pointer.clone()
+	};
+	assert_ne!(stale, f.pointer, "premise: another pointer");
+	for _ in 0..=f.threshold {
+		assert!(f.mgr.note_l2_read(&stale).await.is_none());
+	}
+	assert_eq!(
+		f.mgr.hot_read_count_for_test(f.pointer.slab_id).await,
+		None,
+		"a read of an older pointer is not counted"
+	);
+	for _ in 1..f.threshold {
+		assert!(f.mgr.note_l2_read(&f.pointer).await.is_none());
+	}
+	let admitted = f.mgr.note_l2_read(&f.pointer).await;
+	assert!(
+		admitted.is_some(),
+		"the current pointer's threshold read admits"
+	);
+	drop(admitted);
+}
+
+/// C5 (D2): close with a held installer. Close waits; during the drain an
+/// unrelated write of the same owner and a new admitted operation are refused;
+/// a bounded close returns `ShutdownIncomplete`; on release the installer
+/// finishes through child permits and a repeated close completes clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_waits_for_a_held_installer_and_refuses_everything_else() {
+	let g = gated_promotion_slab("installer-close", true).await;
+	let owner = g.owner.clone().expect("premise: an owned store");
+	let (task, release) = spawn_held_installer(&g, "close").await;
+	use crate::storage::ownership::ShutdownIncomplete;
+	let error = owner
+		.close(Duration::from_millis(300))
+		.await
+		.expect_err("a bounded close times out on the held installer");
+	assert!(
+		error
+			.get_ref()
+			.and_then(|source| source.downcast_ref::<ShutdownIncomplete>())
+			.is_some(),
+		"{error}"
+	);
+	// Negative controls during the drain.
+	assert!(
+		g.f.mgr.file_ops.write_permit().is_err(),
+		"an unrelated caller of the same owner gets no write permit"
+	);
+	let unrelated = g.f.mgr.config.dir.join("unrelated-write");
+	assert!(
+		g.f.mgr
+			.file_ops
+			.write_all(&unrelated, b"refused")
+			.await
+			.is_err(),
+		"an unrelated write of the same owner is refused"
+	);
+	assert!(!unrelated.exists());
+	assert!(
+		owner.admitted_operation().is_err(),
+		"no new admitted operation once close began"
+	);
+	let closing = {
+		let owner = owner.clone();
+		tokio::spawn(async move { owner.close(Duration::from_secs(20)).await })
+	};
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	assert!(!closing.is_finished(), "close waits for the installer");
+	release.add_permits(1);
+	assert_eq!(released_promotion_read(task, "close").await, PROMOTION_ROW);
+	tokio::time::timeout(Duration::from_secs(30), closing)
+		.await
+		.expect("close completes once the installer settles")
+		.unwrap()
+		.unwrap();
+	assert!(
+		g.f.mgr.is_rehydrated(g.slab()).await,
+		"the installer finished through its child permits"
+	);
+	assert!(!owner.clean_record_revoked());
+	assert!(g.f.mgr.config.dir.join("CLEAN_SHUTDOWN").exists());
+}
+
+/// C6 (D1, D4): while an installer's record exists, GC, the released-file
+/// unlink and the copy drop all refuse the slab.
+#[tokio::test]
+async fn gc_release_and_copy_drop_refuse_a_slab_whose_installer_holds_its_names() {
+	let g = gated_promotion_slab("installer-exclusion", false).await;
+	let (task, release) = spawn_held_installer(&g, "exclusion").await;
+	assert!(
+		!g.f.mgr.drop_rehydrated_slab(g.slab()).await.unwrap(),
+		"the copy drop refuses"
+	);
+	let gc =
+		g.f.mgr
+			.gc_unlink_owned_slab_file(g.slab())
+			.await
+			.unwrap_err();
+	assert_eq!(gc.kind(), ErrorKind::WouldBlock, "GC refuses: {gc}");
+	g.f.mgr.released_slab_files.owe(g.slab(), (0, 0));
+	let unlink =
+		g.f.mgr
+			.unlink_released_slab_file(g.slab())
+			.await
+			.unwrap_err();
+	assert_eq!(
+		unlink.kind(),
+		ErrorKind::WouldBlock,
+		"the release refuses: {unlink}"
+	);
+	g.f.mgr.released_slab_files.forget_owed(g.slab());
+	release.add_permits(1);
+	assert_eq!(
+		released_promotion_read(task, "exclusion").await,
+		PROMOTION_ROW
+	);
+	assert!(g.f.mgr.is_rehydrated(g.slab()).await);
+}
+
+/// C6 (D4): a released file whose path now names another file is left alone.
+#[tokio::test]
+async fn a_released_slab_file_replaced_at_its_path_is_left_alone() {
+	let g = gated_promotion_slab("installer-release-identity", false).await;
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert!(g.f.mgr.is_rehydrated(g.slab()).await, "premise: a copy");
+	let path = g.final_path();
+	std::fs::remove_file(&path).unwrap();
+	std::fs::write(&path, b"another file").unwrap();
+	assert!(g.f.mgr.drop_rehydrated_slab(g.slab()).await.unwrap());
+	assert_eq!(
+		std::fs::read(&path).unwrap(),
+		b"another file",
+		"a file of another identity is never unlinked"
+	);
+	assert_eq!(
+		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		None,
+		"the settler ended the release"
+	);
+}
+
+/// C6 (D4): a waiter dropped during a release leaves the entry `Unlinking`
+/// under its settler, which still excludes promotion, until the unlink ends.
+#[tokio::test]
+async fn a_dropped_release_waiter_leaves_the_unlink_to_its_settler() {
+	let g = gated_promotion_slab("installer-release-waiter", false).await;
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert!(g.f.mgr.is_rehydrated(g.slab()).await, "premise: a copy");
+	let (entered, release) = g.gate.hold_next_unlink(&g.final_suffix());
+	let waiter = {
+		let mgr = g.f.mgr.clone();
+		let slab = g.slab();
+		tokio::spawn(async move { mgr.drop_rehydrated_slab(slab).await })
+	};
+	gate_hold_entered(&entered, "release unlink").await;
+	waiter.abort();
+	assert!(waiter.await.unwrap_err().is_cancelled());
+	assert_eq!(
+		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		Some("unlinking"),
+		"the release stays the settler's"
+	);
+	reads_admit_nothing(&g, g.f.location, "during the settler's unlink").await;
+	release.add_permits(1);
+	let mgr = g.f.mgr.clone();
+	let slab = g.slab();
+	wait_until("the settler's unlink", || {
+		mgr.released_slab_files.phase_for_test(slab).is_none()
+	})
+	.await;
+	assert!(!g.final_path().exists(), "the settler unlinked the copy");
+	let (bytes, _) = read_promotion_row(&g.f, &g.calls, "after the release").await;
+	assert_eq!(bytes, 1, "the slab promotes again once the release ended");
+	assert_promotion_copy_serves_reads(&g.f, &g.calls).await;
+}
+
+/// C7 (D3): a short write completes by looping from the returned count, and
+/// the copy holds exactly the object's bytes across the short boundary.
+#[tokio::test]
+async fn a_short_installer_write_completes_by_looping_and_keeps_every_byte() {
+	let g = gated_promotion_slab("installer-short-write", false).await;
+	g.gate.short_write.store(true, Ordering::SeqCst);
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert!(
+		g.f.mgr.is_rehydrated(g.slab()).await,
+		"the copy is registered"
+	);
+	let writes = g.gate.tmp_writes();
+	let (first_offset, offered, short) = writes[0];
+	assert_eq!(first_offset, 0);
+	assert!(
+		short < offered,
+		"premise: the first write was short: {writes:?}"
+	);
+	assert_eq!(
+		writes[1].0, short as u64,
+		"the next write starts at the returned count: {writes:?}"
+	);
+	let total = writes.iter().map(|(_, _, written)| written).sum::<usize>();
+	assert_eq!(total, offered, "every byte written once: {writes:?}");
+	let plaintext =
+		g.f.mgr
+			.tiered_plaintext_from_l2(&g.f.pointer)
+			.await
+			.unwrap();
+	let copy = std::fs::read(g.final_path()).unwrap();
+	assert_eq!(copy.len(), plaintext.bytes.len());
+	let boundary = (short + 64).min(copy.len());
+	assert_eq!(
+		&copy[..boundary],
+		&plaintext.bytes[..boundary],
+		"the bytes across the short boundary"
+	);
+	assert!(copy == plaintext.bytes, "the copy holds the object's bytes");
+	assert!(!g.tmp_path().exists());
+	assert_promotion_copy_serves_reads(&g.f, &g.calls).await;
+}
+
+/// C7 (D3): a write that makes no progress fails with `WriteZero`; the
+/// installer removes its temporary name and the next read retries.
+#[tokio::test]
+async fn a_zero_progress_installer_write_fails_and_disposes_of_its_names() {
+	let g = gated_promotion_slab("installer-zero-write", false).await;
+	g.gate.zero_write.store(true, Ordering::SeqCst);
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert_eq!(g.gate.tmp_writes()[0].2, 0, "premise: no progress");
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	assert!(!g.f.mgr.rehydration_installing_for_test(g.slab()));
+	g.assert_names_absent("after the zero-progress write");
+	let (bytes, _) = read_promotion_row(&g.f, &g.calls, "the retry").await;
+	assert_eq!(bytes, 1);
+	assert_promotion_copy_serves_reads(&g.f, &g.calls).await;
+}
+
+/// C8 (D3, D5): an unlink of the owned final name that keeps failing is
+/// retried, then settles `CleanupFailed`, published with the inhibition it
+/// reports; promotion and GC of the slab then refuse.
+#[tokio::test]
+async fn a_persistent_unlink_failure_settles_cleanup_failed_and_inhibits_promotion() {
+	let g = gated_promotion_slab("installer-cleanup-failed", false).await;
+	let (task, release) = spawn_held_installer(&g, "cleanup failure").await;
+	g.f.mgr
+		.apply_tier_slab(g.f.pointer.clone())
+		.await
+		.expect("premise: the replay revokes the attempt");
+	g.gate.fail_unlinks(&g.final_suffix(), 3);
+	let outcome = g.f.mgr.rehydration_outcome_for_test(g.slab()).unwrap();
+	release.add_permits(1);
+	assert_eq!(
+		installer_outcome(outcome, "cleanup failure").await,
+		rehydration_install::InstallOutcome::CleanupFailed
+	);
+	assert_eq!(
+		g.gate.unlink_failures_left(),
+		0,
+		"three tries, each refused"
+	);
+	assert_eq!(
+		released_promotion_read(task, "threshold").await,
+		PROMOTION_ROW
+	);
+	let identity = {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = std::fs::symlink_metadata(g.final_path()).unwrap();
+		(metadata.dev(), metadata.ino())
+	};
+	assert_eq!(
+		g.f.mgr.rehydration_inhibited(),
+		vec![RehydrationInhibition {
+			slab_id: g.slab(),
+			reason: RehydrationInhibitionReason::RehydrationCleanupFailed,
+			name: RehydrationName::Final,
+			identity: Some(identity),
+		}]
+	);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	assert!(!g.tmp_path().exists(), "the temporary name was removed");
+	reads_admit_nothing(&g, g.f.location, "an inhibited slab").await;
+	let gc =
+		g.f.mgr
+			.gc_unlink_owned_slab_file(g.slab())
+			.await
+			.unwrap_err();
+	assert_eq!(
+		gc.kind(),
+		ErrorKind::WouldBlock,
+		"GC refuses the stuck final name"
+	);
+	assert!(
+		g.final_path().exists(),
+		"the stuck name is left for the operator"
+	);
+}
+
+/// C9 (D3): a temporary name this process did not create is never touched;
+/// the slab's promotion is inhibited (`RehydrationTempPresent`), and the
+/// final-file evidence and GC are unchanged.
+#[tokio::test]
+async fn a_leftover_temporary_name_inhibits_promotion_and_is_never_unlinked() {
+	let g = gated_promotion_slab("installer-leftover-tmp", false).await;
+	std::fs::write(g.tmp_path(), b"leftover").unwrap();
+	let identity = {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = std::fs::symlink_metadata(g.tmp_path()).unwrap();
+		(metadata.dev(), metadata.ino())
+	};
+	let evidence = g.f.mgr.quarantined_slab_files();
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert_eq!(
+		std::fs::read(g.tmp_path()).unwrap(),
+		b"leftover",
+		"never unlinked"
+	);
+	assert_eq!(
+		g.f.mgr.rehydration_inhibited(),
+		vec![RehydrationInhibition {
+			slab_id: g.slab(),
+			reason: RehydrationInhibitionReason::RehydrationTempPresent,
+			name: RehydrationName::Temporary,
+			identity: Some(identity),
+		}]
+	);
+	assert_eq!(
+		g.f.mgr.quarantined_slab_files(),
+		evidence,
+		"final-file evidence unchanged"
+	);
+	assert!(!g.final_path().exists());
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	assert!(
+		!g.f.mgr.rehydration_installs.refuses_gc(g.slab()),
+		"a stuck temporary name never affects GC"
+	);
+	reads_admit_nothing(&g, g.f.location, "a slab with a leftover").await;
+}
+
+/// The slab's current pointer, applied again: a publication that ends every
+/// admission of the slab and never waits on a held fetch.
+async fn replay_same_pointer(f: &PromotionSlab) {
+	tokio::time::timeout(
+		Duration::from_secs(10),
+		f.mgr.apply_tier_slab(f.pointer.clone()),
+	)
+	.await
+	.expect("BLOCKER: the replay waited on a held fetch")
+	.unwrap();
+}
+
+/// C10 (D5): attempt A's capacity token stays held across a publication that
+/// erases its `Fetching` entry. With A and B both fetching, a third eligible
+/// read is refused; once A's read ends, the next eligible read promotes.
+#[tokio::test]
+async fn a_promotion_slot_follows_its_fetch_across_a_publication() {
+	let (f, control) = held_promotion_slab("installer-capacity").await;
+	let calls = &control.calls;
+	let slab = f.pointer.slab_id;
+	for n in 1..f.threshold {
+		read_promotion_row(&f, calls, &format!("A read {n}")).await;
+	}
+	let (a, release_a) = spawn_held_promotion_read(&f, &control, "A").await;
+	replay_same_pointer(&f).await;
+	assert!(
+		!f.mgr.rehydrating_for_test(slab).await,
+		"premise: A's admission erased"
+	);
+	for n in 1..f.threshold {
+		read_promotion_row(&f, calls, &format!("B read {n}")).await;
+	}
+	let (b, release_b) = spawn_held_promotion_read(&f, &control, "B").await;
+	replay_same_pointer(&f).await;
+	for n in 0..=f.threshold {
+		let (bytes, _) = read_promotion_row(&f, calls, &format!("third attempt {n}")).await;
+		assert_eq!(
+			bytes, 0,
+			"read {n}: with both slots held by live fetches, nothing is admitted"
+		);
+	}
+	assert!(!f.mgr.rehydrating_for_test(slab).await);
+	release_a
+		.send(HeldFetchRelease::Pass)
+		.expect("premise: A's held fetch awaits its release");
+	assert_eq!(released_promotion_read(a, "A").await, PROMOTION_ROW);
+	assert!(
+		!f.mgr.is_rehydrated(slab).await,
+		"A's erased attempt installs nothing"
+	);
+	let (bytes, _) = read_promotion_row(&f, calls, "the read after A").await;
+	assert_eq!(
+		bytes, 1,
+		"A's slot is free: the next eligible read promotes"
+	);
+	assert!(f.mgr.is_rehydrated(slab).await);
+	release_b
+		.send(HeldFetchRelease::Pass)
+		.expect("premise: B's held fetch awaits its release");
+	assert_eq!(released_promotion_read(b, "B").await, PROMOTION_ROW);
+	assert_promotion_copy_serves_reads(&f, calls).await;
+}
+
+/// ADR 0131 D4 (review): the identity a release needs is read by the open
+/// itself, so a failed open (here, before anything was created) is an ordinary,
+/// retryable error that leaves nothing owed; and a store that opened always has
+/// its identity, so its release is recorded and really unlinks its file. The
+/// boundary after creation is covered by the rotation and installer controls.
+#[tokio::test]
+async fn an_open_without_its_identity_fails_and_every_opened_slab_release_unlinks() {
+	let g = gated_promotion_slab("release-open-identity", false).await;
+	let slab = SlabId::new(0x7131_0001);
+	let path = slab_path(&g.f.mgr.config.dir, slab);
+	let name = path.file_name().unwrap().to_string_lossy().into_owned();
+	g.gate.fail_opens(&name, 1);
+	let refused = LocalSlabStore::open(
+		&path,
+		slab,
+		g.f.mgr.file_ops.clone(),
+		g.f.mgr.config.group_commit.clone(),
+	)
+	.await;
+	assert!(refused.is_err(), "an open without its identity fails");
+	assert!(!path.exists(), "nothing was opened");
+	assert_eq!(
+		g.f.mgr.released_slab_files.phase_for_test(slab),
+		None,
+		"nothing is owed"
+	);
+	let store = LocalSlabStore::open(
+		&path,
+		slab,
+		g.f.mgr.file_ops.clone(),
+		g.f.mgr.config.group_commit.clone(),
+	)
+	.await
+	.expect("the retried open succeeds");
+	let on_disk = {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = std::fs::symlink_metadata(&path).unwrap();
+		(metadata.dev(), metadata.ino())
+	};
+	assert_eq!(store.cached_file_identity(), on_disk);
+	g.f.mgr
+		.release_slab_file(slab, store.cached_file_identity());
+	assert_eq!(
+		g.f.mgr.released_slab_files.phase_for_test(slab),
+		Some("owed"),
+		"every opened store's release is recorded"
+	);
+	drop(store);
+	g.f.mgr.unlink_released_slab_file(slab).await.unwrap();
+	assert!(!path.exists(), "the release really unlinked the file");
+	assert_eq!(g.f.mgr.released_slab_files.phase_for_test(slab), None);
+}
+
+/// ADR 0131 D4 (review), control (a): a directory sync that fails once after
+/// the release settler's unlink is retried; the release ends once it succeeds.
+#[tokio::test]
+async fn a_transient_directory_sync_failure_after_a_release_unlink_is_retried() {
+	let g = gated_promotion_slab("release-sync-transient", false).await;
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert!(g.f.mgr.is_rehydrated(g.slab()).await, "premise: a copy");
+	g.gate.fail_fsync_dirs(1);
+	assert!(g.f.mgr.drop_rehydrated_slab(g.slab()).await.unwrap());
+	assert_eq!(
+		g.gate.fsync_dir_failures_left(),
+		0,
+		"the failed sync was retried"
+	);
+	assert!(!g.final_path().exists());
+	assert_eq!(
+		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		None,
+		"the release ended once its sync succeeded"
+	);
+}
+
+/// ADR 0131 D4 (review), control (b): a directory sync that keeps failing
+/// after the unlink propagates its error and keeps the release `SyncOwed`,
+/// which still excludes promotion. The path is never examined or unlinked
+/// again: a later occupant survives the later release, which retries only the
+/// sync and succeeds once the fault clears.
+#[tokio::test]
+async fn a_persistent_directory_sync_failure_keeps_only_the_sync_owed() {
+	let g = gated_promotion_slab("release-sync-persistent", false).await;
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert!(g.f.mgr.is_rehydrated(g.slab()).await, "premise: a copy");
+	g.gate.fail_fsync_dirs(3);
+	assert!(
+		g.f.mgr.drop_rehydrated_slab(g.slab()).await.is_err(),
+		"the persistent sync failure is propagated"
+	);
+	assert_eq!(g.gate.fsync_dir_failures_left(), 0, "three tries");
+	assert!(!g.final_path().exists(), "the unlink stands");
+	assert_eq!(
+		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		Some("sync_owed"),
+		"the sync obligation is kept"
+	);
+	reads_admit_nothing(&g, g.f.location, "while the sync is owed").await;
+	std::fs::write(g.final_path(), b"a later occupant").unwrap();
+	g.f.mgr
+		.unlink_released_slab_file(g.slab())
+		.await
+		.expect("the retried sync succeeds once the fault clears");
+	assert_eq!(
+		std::fs::read(g.final_path()).unwrap(),
+		b"a later occupant",
+		"the path is never touched again"
+	);
+	assert_eq!(g.f.mgr.released_slab_files.phase_for_test(g.slab()), None);
+}
+
+// ------------------------------------------------------------------
+// ADR 0131 (review R3): an open that creates its file and then fails at its
+// identity step, and the GC resume's settlement of a sync-only release.
+// ------------------------------------------------------------------
+
+fn rotation_value() -> Vec<u8> {
+	vec![0x31_u8; 4096]
+}
+
+/// A store at `dir` with 16 KiB slabs, its file operations through a gate.
+async fn gated_rotating_manager(
+	dir: &crate::test_support::TestDir,
+) -> (Arc<InstallerGate>, Arc<SlabManager>) {
+	let mgr = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	drop(mgr);
+	let io = spawn_io_thread(64).unwrap();
+	let gate = Arc::new(InstallerGate::default());
+	let file_ops: Arc<dyn AsyncFileOps> = Arc::new(InstallerGateFileOps {
+		inner: Arc::new(
+			IoUringFileOps::with_isolated_blocking(
+				io.clone(),
+				"wendelon-fs-meta-rotation",
+				BlockingIoClass::SlabMetadata,
+			)
+			.unwrap(),
+		),
+		gate: gate.clone(),
+	});
+	let mgr = SlabManager::open_with_file_ops(
+		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 16 * 1024,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		},
+		file_ops,
+	)
+	.await
+	.unwrap();
+	(gate, mgr)
+}
+
+/// A rotation whose open created the next slab file and then failed.
+struct FailedRotation {
+	acknowledged: Vec<(Identity, RecordLocation)>,
+	key: Identity,
+	n: u64,
+	next: SlabId,
+}
+
+/// Appends until a rotation's creating open fails after its file exists. The
+/// error reaches the caller, the allocator stays at the failed id, and the
+/// created file is there, empty.
+async fn rotation_failed_after_creating(
+	dir: &crate::test_support::TestDir,
+	gate: &InstallerGate,
+	mgr: &Arc<SlabManager>,
+) -> FailedRotation {
+	let value = rotation_value();
+	let first_key = id(0xa131_0000);
+	let first = mgr
+		.append_durable(tenant(), first_key, hlc(1), &value)
+		.await
+		.unwrap();
+	let mut acknowledged = vec![(first_key, first)];
+	let next = mgr.state.lock().await.next_slab_id;
+	assert!(
+		!slab_path(dir, next).exists(),
+		"premise: the next slab file does not exist yet"
+	);
+	gate.fail_opens_after_creating(".wnd", 1);
+	for n in 1..64_u64 {
+		let key = id(0xa131_0000 + n);
+		match mgr.append_durable(tenant(), key, hlc(n + 1), &value).await {
+			Ok(location) => {
+				assert_eq!(location.slab_id, first.slab_id, "premise: no rotation yet");
+				acknowledged.push((key, location));
+			}
+			Err(error) => {
+				assert!(
+					error
+						.to_string()
+						.contains("injected identity failure after the open"),
+					"the open's error reaches the caller: {error}"
+				);
+				assert_eq!(
+					mgr.state.lock().await.next_slab_id,
+					next,
+					"the allocator never moved past the failed open"
+				);
+				assert_eq!(
+					std::fs::metadata(slab_path(dir, next))
+						.map(|metadata| metadata.len())
+						.ok(),
+					Some(0),
+					"the failed open created its file, empty"
+				);
+				return FailedRotation {
+					acknowledged,
+					key,
+					n,
+					next,
+				};
+			}
+		}
+	}
+	panic!("premise: the appends reach a rotation");
+}
+
+/// R3 (a1): a rotation's creating open fails after creating its file. The
+/// retried append opens that same file under the same id, and every record,
+/// before and after, reads back, also after a reopen.
+#[tokio::test]
+async fn a_rotation_whose_open_fails_after_creating_its_file_is_retried_into_it() {
+	let dir = fresh_dir("rotation-identity-retry");
+	let (gate, mgr) = gated_rotating_manager(&dir).await;
+	let failed = rotation_failed_after_creating(&dir, &gate, &mgr).await;
+	let value = rotation_value();
+	let retried = mgr
+		.append_durable(tenant(), failed.key, hlc(failed.n + 1), &value)
+		.await
+		.expect("the retried append rotates");
+	assert_eq!(
+		retried.slab_id, failed.next,
+		"the retry opens the file the failed open created"
+	);
+	let mut records = failed.acknowledged.clone();
+	records.push((failed.key, retried));
+	for (key, location) in &records {
+		assert_eq!(mgr.read(*location).await.unwrap(), value, "{key:?}");
+	}
+	drop(mgr);
+	let reopened = try_open_manager_at_dir(dir.to_path_buf()).await.unwrap();
+	for (key, location) in &records {
+		assert_eq!(
+			reopened.read(*location).await.unwrap(),
+			value,
+			"{key:?} after the reopen"
+		);
+	}
+}
+
+/// R3 (a1): the same failure, then a reopen with no retry: the empty created
+/// file does not stop the open, every acknowledged record reads back, the
+/// committed id high-water still covers the failed id, and appends go on.
+#[tokio::test]
+async fn a_rotation_whose_open_fails_after_creating_its_file_is_recovered_on_reopen() {
+	let dir = fresh_dir("rotation-identity-reopen");
+	let (gate, mgr) = gated_rotating_manager(&dir).await;
+	let failed = rotation_failed_after_creating(&dir, &gate, &mgr).await;
+	drop(mgr);
+	let value = rotation_value();
+	let reopened = try_open_manager_at_dir(dir.to_path_buf())
+		.await
+		.expect("the store reopens with the empty created file");
+	for (key, location) in &failed.acknowledged {
+		assert_eq!(reopened.read(*location).await.unwrap(), value, "{key:?}");
+	}
+	assert!(
+		reopened.state.lock().await.durable_slab_id_bound > failed.next,
+		"the committed id high-water still covers the failed open's id"
+	);
+	let after = reopened
+		.append_durable(tenant(), failed.key, hlc(failed.n + 1), &value)
+		.await
+		.expect("appends go on after the reopen");
+	assert_eq!(reopened.read(after).await.unwrap(), value);
+}
+
+/// R3 (a2): the installer's exclusive open of its temporary name creates it
+/// and then fails at its identity step. The name is kept (never unlinked),
+/// reported with the identity a later diagnostic stat gives, and nothing is
+/// registered; promotion of the slab stays inhibited.
+#[tokio::test]
+async fn an_installer_temporary_name_whose_open_failed_after_creating_it_is_kept_and_reported() {
+	let g = gated_promotion_slab("installer-tmp-open-identity", false).await;
+	g.gate.fail_opens_after_creating(".rehydrate.tmp", 1);
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("read {n}")).await;
+	}
+	assert!(g.tmp_path().exists(), "the created name is never unlinked");
+	let identity = {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = std::fs::symlink_metadata(g.tmp_path()).unwrap();
+		(metadata.dev(), metadata.ino())
+	};
+	assert_eq!(
+		g.f.mgr.rehydration_inhibited(),
+		vec![RehydrationInhibition {
+			slab_id: g.slab(),
+			reason: RehydrationInhibitionReason::RehydrationTempPresent,
+			name: RehydrationName::Temporary,
+			identity: Some(identity),
+		}]
+	);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await, "nothing registered");
+	assert!(!g.f.mgr.rehydration_installing_for_test(g.slab()));
+	assert!(!g.final_path().exists());
+	reads_admit_nothing(&g, g.f.location, "an inhibited slab").await;
+	assert!(g.tmp_path().exists(), "still never unlinked");
+}
+
+/// A GC removal whose unlink of the original succeeded while its directory
+/// sync kept failing: the slab's release is `SyncOwed` and its row stays at
+/// `QuarantineRecorded`, both of the same file.
+struct SyncOwedGc {
+	dir: crate::test_support::TestDir,
+	owner: DataDirectoryOwner,
+	faults: Arc<FaultyFileOps>,
+	mgr: Arc<SlabManager>,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	slab_id: SlabId,
+	identity: (u64, u64),
+}
+
+impl SyncOwedGc {
+	fn fail_sync(&self) -> InjectedFault {
+		InjectedFault::on(
+			FaultOp::FsyncDir,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected slab directory sync failure".into(),
+			},
+		)
+		.for_path(self.dir.to_path_buf())
+	}
+
+	/// Holds this directory's next sync until released; then it fails if asked.
+	fn hold_sync(&self, then_fail: bool) -> GateHold {
+		let (entered, release) = gate_hold();
+		self.faults.inject(
+			InjectedFault::on(
+				FaultOp::FsyncDir,
+				FaultAction::Hold {
+					entered: entered.clone(),
+					release: release.clone(),
+					then_fail,
+				},
+			)
+			.for_path(self.dir.to_path_buf()),
+		);
+		(entered, release)
+	}
+
+	fn driver(&self) -> crate::storage::op_driver::OpDriver {
+		op_driver(&self.cluster, &self.mgr, self.plain.clone())
+	}
+
+	fn phase(&self) -> Option<&'static str> {
+		self.mgr.released_slab_files.phase_for_test(self.slab_id)
+	}
+
+	/// Whether the op under test (this slab's removal, of exactly this file)
+	/// still stands at `QuarantineRecorded`.
+	async fn recorded(&self) -> bool {
+		use crate::consensus::slab_ops::SlabCommand;
+		use crate::storage::index::OpProgress;
+		let rows = self
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap();
+		let mine = rows
+			.iter()
+			.filter(|row| {
+				matches!(row.command(), SlabCommand::GcRemove(remove)
+					if remove.slab.local_id() == self.slab_id)
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			mine.len() <= 1,
+			"one removal of the slab under test: {rows:?}"
+		);
+		mine.first().is_some_and(|row| {
+			matches!(row.progress(), Some(OpProgress::QuarantineRecorded(file))
+				if (file.dev, file.ino) == self.identity)
+		})
+	}
+
+	/// GC never stands advanced while a release of the same file is left.
+	async fn assert_never_advanced_with_its_release_left(&self, what: &str) {
+		if !self.recorded().await {
+			assert_eq!(
+				self.mgr.released_slab_files.identity_for_test(self.slab_id),
+				None,
+				"{what}: GC advanced and left a matching release"
+			);
+		}
+	}
+
+	/// Drives until the op under test advances; every drive must succeed.
+	async fn drive_until_advanced(&self, what: &str) {
+		let driver = self.driver();
+		for attempt in 0..6 {
+			driver
+				.drive_once()
+				.await
+				.unwrap_or_else(|error| panic!("{what}: drive {attempt} failed: {error}"));
+			if !self.recorded().await {
+				break;
+			}
+		}
+		assert!(!self.recorded().await, "{what}: the resume advanced");
+		assert_eq!(self.phase(), None, "{what}: the release is settled");
+	}
+
+	async fn close(self) {
+		let _ = self.owner.close(Duration::from_secs(5)).await;
+	}
+}
+
+async fn sync_owed_gc(tag: &str) -> SyncOwedGc {
+	let dir = fresh_dir(tag);
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let faults = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
+	let mgr = SlabManager::initialize_new_store_with_file_ops_and_owner(
+		gc_owned_test_config(&dir),
+		faults.clone(),
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	// The mark, on its own.
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(true, Ordering::Release);
+	mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+		.await
+		.unwrap();
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(false, Ordering::Release);
+	// The removal: its directory sync fails on every try after the unlink.
+	let (entered, release) = gate_hold();
+	*mgr.continuity_test_holds
+		.gc_before_unlink_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let sweep = {
+		let (mgr, plain) = (mgr.clone(), plain.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+				.await
+		})
+	};
+	gate_hold_entered(&entered, "GC before its unlink").await;
+	*mgr.continuity_test_holds
+		.gc_before_unlink_hold
+		.lock()
+		.unwrap() = None;
+	let mut gc = SyncOwedGc {
+		dir,
+		owner,
+		faults,
+		mgr,
+		cluster,
+		plain,
+		slab_id,
+		identity: (0, 0),
+	};
+	for _ in 0..3 {
+		gc.faults.inject(gc.fail_sync());
+	}
+	release.add_permits(1);
+	let swept = tokio::time::timeout(Duration::from_secs(60), sweep)
+		.await
+		.expect("the sweep ends")
+		.unwrap();
+	assert!(swept.is_err(), "the GC route propagates the failed sync");
+	assert!(
+		!slab_path(&gc.dir, slab_id).exists(),
+		"premise: the unlink stands"
+	);
+	assert_eq!(gc.phase(), Some("sync_owed"));
+	gc.identity = gc
+		.mgr
+		.released_slab_files
+		.identity_for_test(slab_id)
+		.expect("premise: the release's identity");
+	assert!(
+		gc.recorded().await,
+		"premise: this slab's removal of this very file stands at QuarantineRecorded"
+	);
+	gc
+}
+
+/// R3 (b), retargeted in R4: the normal GC resume (the op driver, no
+/// ordinary release) of the removal under test. While its sync fails, neither
+/// the release nor the progress moves; once it succeeds, both do, and every
+/// drive of that healthy leg succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resume_settles_the_sync_its_unlink_owed_together_with_its_progress() {
+	let gc = sync_owed_gc("gc-resume-sync-owed").await;
+	gc.faults.inject(gc.fail_sync());
+	let error = gc
+		.driver()
+		.drive_once()
+		.await
+		.expect_err("the resume's failed sync is propagated");
+	assert!(
+		error
+			.to_string()
+			.contains("injected slab directory sync failure"),
+		"the resume reached its sync: {error}"
+	);
+	assert_eq!(gc.phase(), Some("sync_owed"), "the release is kept");
+	assert!(gc.recorded().await, "the progress is kept");
+	gc.drive_until_advanced("the healthy resume").await;
+	gc.assert_never_advanced_with_its_release_left("the healthy resume")
+		.await;
+	gc.close().await;
+}
+
+/// R4: one sync-only owner and one waiter. An ordinary release claims the
+/// `SyncOwed` release and is held inside its directory sync; the GC resume
+/// runs meanwhile, joins that owner and never advances before the owner's
+/// terminal result. `owner_fails` decides that result.
+async fn gc_resume_joins_a_held_sync_only_owner(tag: &str, owner_fails: bool) {
+	let gc = sync_owed_gc(tag).await;
+	let (owner_in, owner_release) = gc.hold_sync(owner_fails);
+	let (resume_in, resume_release) = gc.hold_sync(false);
+	let release = {
+		let (mgr, slab_id) = (gc.mgr.clone(), gc.slab_id);
+		tokio::spawn(async move { mgr.unlink_released_slab_file(slab_id).await })
+	};
+	gate_hold_entered(&owner_in, "the owner's directory sync").await;
+	assert_eq!(
+		gc.phase(),
+		Some("unlinking"),
+		"the release has its one owner"
+	);
+	let resume = {
+		let driver = gc.driver();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	gate_hold_entered(&resume_in, "the resume's own directory sync").await;
+	resume_release.add_permits(1);
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	assert!(
+		!resume.is_finished(),
+		"the resume waits for the owner's terminal result"
+	);
+	assert!(
+		gc.recorded().await,
+		"GC does not advance before the owner ends"
+	);
+	assert_eq!(gc.phase(), Some("unlinking"));
+	if owner_fails {
+		// The owner's other two tries fail as well.
+		gc.faults.inject(gc.fail_sync());
+		gc.faults.inject(gc.fail_sync());
+	}
+	owner_release.add_permits(1);
+	let released = tokio::time::timeout(Duration::from_secs(30), release)
+		.await
+		.expect("the owner ends")
+		.unwrap();
+	let resumed = tokio::time::timeout(Duration::from_secs(30), resume)
+		.await
+		.expect("the resume ends")
+		.unwrap();
+	gc.assert_never_advanced_with_its_release_left("after the owner")
+		.await;
+	if owner_fails {
+		assert!(released.is_err(), "the owner's sync failed");
+		assert!(resumed.is_err(), "the resume propagates the owner's result");
+		assert_eq!(gc.phase(), Some("sync_owed"), "the release is kept");
+		assert!(gc.recorded().await, "GC did not advance");
+		// A later clean resume settles both together.
+		gc.drive_until_advanced("the later clean resume").await;
+	} else {
+		released.expect("the owner settled the release");
+		resumed.expect("the resume advances on the owner's Done");
+		assert_eq!(gc.phase(), None, "the release is settled");
+		assert!(!gc.recorded().await, "GC advanced");
+	}
+	gc.assert_never_advanced_with_its_release_left("at the end")
+		.await;
+	gc.close().await;
+}
+
+/// R4 control 1(a): the held owner succeeds; its release goes and GC advances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resume_joins_a_held_sync_only_owner_that_succeeds() {
+	gc_resume_joins_a_held_sync_only_owner("gc-resume-owner-succeeds", false).await;
+}
+
+/// R4 control 1(b): the held owner fails; its release stays `SyncOwed`, GC does
+/// not advance and propagates the error, and a later clean resume settles both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resume_joins_a_held_sync_only_owner_that_fails() {
+	gc_resume_joins_a_held_sync_only_owner("gc-resume-owner-fails", true).await;
 }

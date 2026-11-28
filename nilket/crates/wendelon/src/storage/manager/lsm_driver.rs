@@ -4612,8 +4612,10 @@ impl SlabManager {
 				continue;
 			}
 			self.bump_slab_publication_revision(slab_id)?;
+			// ADR 0131: beside the pins, a rehydration installer's hold on the names.
 			if self.slab_pins.pin_count(slab_id) != 0
 				|| self.counter_slab_has_pending_frames(slab_id)
+				|| self.rehydration_installs.refuses_gc(slab_id)
 			{
 				return Err(Error::new(
 					ErrorKind::WouldBlock,

@@ -1195,11 +1195,14 @@ impl SlabManager {
 			deferred_table_drop_l2: Default::default(),
 			cleanup_scan_schedule: Default::default(),
 			quarantined_slab_files,
-			released_slab_files: DashSet::new(),
+			released_slab_files: Default::default(),
+			rehydration_installs: Default::default(),
 			live_reservations: Arc::new(DashSet::new()),
 			#[cfg(test)]
 			test_pauses: Default::default(),
 		});
+		// ADR 0131: the installer and release settler tasks run against this manager.
+		manager.rehydration_installs.bind(&manager);
 		{
 			// Every tiered slab is verified against its object before its first
 			// serve in this process.

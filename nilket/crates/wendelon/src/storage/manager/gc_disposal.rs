@@ -503,7 +503,11 @@ impl SlabManager {
 		let slab_id = remove.slab.local_id();
 		let index = self.require_op_index()?;
 		self.bump_slab_publication_revision(slab_id)?;
-		if self.slab_pins.pin_count(slab_id) != 0 || self.counter_slab_has_pending_frames(slab_id) {
+		// ADR 0131: beside the pins, a rehydration installer's hold on the names.
+		if self.slab_pins.pin_count(slab_id) != 0
+			|| self.counter_slab_has_pending_frames(slab_id)
+			|| self.rehydration_installs.refuses_gc(slab_id)
+		{
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
 				"LSM GC eligibility changed before unlink",
@@ -624,6 +628,13 @@ impl SlabManager {
 				self.file_ops.link_no_replace(&original, &entry).await?;
 			}
 			fsync_parent_dir(self.file_ops.as_ref(), &entry).await?;
+			// ADR 0131 D4: an earlier release of this very file (an unlink whose
+			// directory sync failed leaves it `SyncOwed`) is settled through its one
+			// owner, claimed here or joined if another release already holds it,
+			// and progress advances only on that owner's `Done`: a restored release
+			// or its error keeps the progress where it is.
+			self.settle_release_of(slab_id, (file.dev, file.ino))
+				.await?;
 			self.gc_drop_run_locked(&remove, key, digest, intent, Some(file), original_present)
 				.await?;
 			drop(lease);

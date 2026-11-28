@@ -22,13 +22,31 @@ pub const O_DIRECT: i32 = libc::O_DIRECT;
 #[derive(Clone)]
 pub struct FileHandle {
 	file: Arc<File>,
+	/// The descriptor's (device, inode), read where it was opened (ADR 0131): every
+	/// handle carries the identity of the file it owns.
+	identity: (u64, u64),
 }
 
 impl FileHandle {
-	pub fn new(file: File) -> Self {
-		Self {
+	/// Owns `file`, reading its identity first. A handle whose identity cannot be read is
+	/// an ordinary open error: no handle and no store exist, so no release is owed. A
+	/// creating open may already have created its file; its caller's retry or reopen
+	/// recovers it like any other existing file.
+	///
+	/// ADR 0131 changed this constructor's signature (it returned `Self`): a
+	/// source-breaking, pre-release change for any out-of-tree caller, which now
+	/// handles the `Result`. In-tree callers are the backends' open jobs and tests.
+	pub fn new(file: File) -> std::io::Result<Self> {
+		let identity = file_identity(&file.metadata()?)?;
+		Ok(Self {
 			file: Arc::new(file),
-		}
+			identity,
+		})
+	}
+
+	/// The (device, inode) of the file this handle owns.
+	pub fn identity(&self) -> (u64, u64) {
+		self.identity
 	}
 
 	pub fn raw_fd(&self) -> RawFd {
@@ -164,6 +182,15 @@ pub trait AsyncFileOps: Send + Sync {
 
 	async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()>;
 
+	/// ADR 0131: the (device, inode) of whatever `path` names, never following a final
+	/// symlink; `None` when nothing is there. A read: it needs no write admission.
+	async fn path_identity(&self, path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+		let path = path.to_path_buf();
+		tokio::task::spawn_blocking(move || path_identity_now(&path))
+			.await
+			.map_err(Error::other)?
+	}
+
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
 
 	async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirectoryEntry>>;
@@ -177,6 +204,19 @@ pub trait AsyncFileOps: Send + Sync {
 	async fn link_no_replace(&self, from: &Path, to: &Path) -> std::io::Result<()>;
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()>;
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> std::io::Result<(u64, u64)> {
+	use std::os::unix::fs::MetadataExt;
+	Ok((metadata.dev(), metadata.ino()))
+}
+
+fn path_identity_now(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+	match std::fs::symlink_metadata(path) {
+		Ok(metadata) => file_identity(&metadata).map(Some),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(error),
+	}
 }
 
 #[derive(Clone)]
@@ -352,7 +392,7 @@ impl AsyncFileOps for IoUringFileOps {
 				if flags.direct {
 					options.custom_flags(O_DIRECT);
 				}
-				options.open(path).map(FileHandle::new)
+				options.open(path).and_then(FileHandle::new)
 			},
 		)
 		.await
@@ -479,6 +519,11 @@ impl AsyncFileOps for IoUringFileOps {
 		self.run_blocking_write(move || file.set_len(len)).await
 	}
 
+	async fn path_identity(&self, path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+		let path = path.to_path_buf();
+		self.run_blocking(move || path_identity_now(&path)).await
+	}
+
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
 		self.run_blocking_write(move || std::fs::create_dir_all(path))
@@ -603,7 +648,7 @@ impl AsyncFileOps for BlockingFileOps {
 				if flags.direct {
 					options.custom_flags(O_DIRECT);
 				}
-				options.open(path).map(FileHandle::new)
+				options.open(path).and_then(FileHandle::new)
 			},
 		)
 		.await
@@ -1046,6 +1091,13 @@ pub enum FaultAction {
 		xor_mask: u8,
 	},
 	Skip,
+	/// A directory sync signals `entered`, waits for one `release`, then fails if
+	/// `then_fail`, and otherwise syncs as usual (ADR 0131 overlap controls).
+	Hold {
+		entered: Arc<tokio::sync::Semaphore>,
+		release: Arc<tokio::sync::Semaphore>,
+		then_fail: bool,
+	},
 }
 
 #[cfg(test)]
@@ -1444,6 +1496,19 @@ impl AsyncFileOps for FaultyFileOps {
 		if let Some(action) = self.take_fault(FaultOp::FsyncDir, path) {
 			match action {
 				FaultAction::Skip => return Ok(()),
+				FaultAction::Hold {
+					entered,
+					release,
+					then_fail,
+				} => {
+					entered.add_permits(1);
+					if let Ok(permit) = release.acquire().await {
+						permit.forget();
+					}
+					if then_fail {
+						return Err(Error::other("held directory sync failed (test)"));
+					}
+				}
 				other => {
 					self.apply_fault_result(other)?;
 					return Ok(());

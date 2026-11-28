@@ -22,7 +22,8 @@ async fn ordinary_ring_operation_cost_is_reported() {
 			.write(true)
 			.open(dir.join("data"))
 			.unwrap(),
-	);
+	)
+	.unwrap();
 	let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
 	buf.as_mut_slice().fill(0x67);
 	for rep in 0..REPS {
