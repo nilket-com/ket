@@ -645,3 +645,160 @@ fn a_decision_key_is_its_nodes_own_and_no_other_roles() {
 		);
 	}
 }
+
+/// DC-309 sentinels: one distinctive byte per secret field, never a real key.
+const LEASE_SENTINEL: [u8; 32] = [0xA5; 32];
+const TRANSFER_SENTINEL: [u8; 32] = [0x5A; 32];
+const AUDIT_SENTINEL: [u8; 32] = [0xC3; 32];
+const DECISION_SENTINEL: [u8; 32] = [0x3C; 32];
+const ACCESS_SENTINEL: &str = "dc309-access-sentinel";
+const SECRET_KEY_SENTINEL: &str = "dc309-secret-key-sentinel";
+const SESSION_SENTINEL: &str = "dc309-session-sentinel";
+
+/// `text` without whitespace, so the compact and pretty forms compare alike.
+fn squeezed(text: &str) -> String {
+	text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Whether `printed` carries `secret` in any form a rendering could take: its decimal array
+/// (compact or pretty), its `{:x?}` array, or its hex string, in either case.
+fn renders(printed: &str, secret: [u8; 32]) -> bool {
+	let flat = squeezed(printed);
+	let list = |each: &dyn Fn(u8) -> String| secret.map(each).join(",");
+	let decimal = list(&|b| b.to_string());
+	let debug_hex = list(&|b| format!("{b:x}"));
+	let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+	[decimal, debug_hex, hex]
+		.into_iter()
+		.any(|form| flat.contains(&form) || flat.contains(&form.to_uppercase()))
+}
+
+/// The behaviour before DC-309, shown with a mirror of the old derive: a derived `Debug` over a
+/// raw secret field renders its bytes in both forms, and `renders` detects them.
+#[test]
+fn a_derived_debug_over_a_raw_secret_field_renders_its_bytes() {
+	#[derive(Debug)]
+	#[allow(dead_code)]
+	struct DerivedBefore {
+		lease_signing_secret: [u8; 32],
+	}
+	let before = DerivedBefore {
+		lease_signing_secret: LEASE_SENTINEL,
+	};
+	assert!(
+		renders(&format!("{before:?}"), LEASE_SENTINEL),
+		"the derived compact form renders the secret"
+	);
+	assert!(
+		renders(&format!("{before:#?}"), LEASE_SENTINEL),
+		"the derived pretty form renders the secret"
+	);
+	assert!(
+		!renders(&format!("{before:?}"), TRANSFER_SENTINEL),
+		"the detector does not confuse two sentinels"
+	);
+}
+
+/// DC-309: neither `{:?}` nor `{:#?}` of a configuration carries a signing secret or a nested
+/// object-store credential; each prints `<redacted>`, and the other fields still print, in
+/// declaration order.
+#[test]
+fn the_configuration_debug_redacts_every_signing_secret_in_both_forms() {
+	use crate::consensus::decisions::decision_verifying_key_bytes;
+	use crate::storage::{
+		ObjectStoreConfig, RemoteObjectStoreConfig, RemoteObjectStoreProvider,
+		S3CompatibleProviderConfig,
+	};
+	let mut cfg = config()
+		.with_parent_decisions_for_disposable_store()
+		.with_decision_keys(
+			DECISION_SENTINEL,
+			BTreeMap::from([(7, decision_verifying_key_bytes(DECISION_SENTINEL))]),
+		);
+	cfg.lease_signing_secret = LEASE_SENTINEL;
+	cfg.transfer_signing_secret = TRANSFER_SENTINEL;
+	cfg.audit_root_signing_secret = AUDIT_SENTINEL;
+	cfg.l2 = Some(ObjectStoreConfig::Remote(RemoteObjectStoreConfig {
+		bucket: "dc309-bucket".into(),
+		root: "dc309-root".into(),
+		provider: RemoteObjectStoreProvider::S3Compatible(S3CompatibleProviderConfig {
+			endpoint: "http://dc309.invalid".into(),
+			region: "dc309-region".into(),
+			access_key_id: Some(ACCESS_SENTINEL.into()),
+			secret_access_key: Some(SECRET_KEY_SENTINEL.into()),
+			session_token: Some(SESSION_SENTINEL.into()),
+			allow_anonymous: false,
+			virtual_host_style: false,
+		}),
+	}));
+	// Public construction and field reads are unchanged.
+	assert_eq!(cfg.lease_signing_secret, LEASE_SENTINEL);
+	for (form, printed) in [
+		("compact", format!("{cfg:?}")),
+		("pretty", format!("{cfg:#?}")),
+	] {
+		for (name, secret) in [
+			("lease", LEASE_SENTINEL),
+			("transfer", TRANSFER_SENTINEL),
+			("audit root", AUDIT_SENTINEL),
+			("decision", DECISION_SENTINEL),
+		] {
+			assert!(
+				!renders(&printed, secret),
+				"{form}: the {name} signing secret rendered"
+			);
+		}
+		for credential in [ACCESS_SENTINEL, SECRET_KEY_SENTINEL, SESSION_SENTINEL] {
+			assert!(
+				!printed.contains(credential),
+				"{form}: a nested object-store credential rendered"
+			);
+		}
+		let flat = squeezed(&printed);
+		for required in [
+			"lease_signing_secret:<redacted>,",
+			"transfer_signing_secret:<redacted>,",
+			"audit_root_signing_secret:<redacted>,",
+			"decision_signing_secret:Some(<redacted>",
+			"secret_access_key:<redacted>,",
+			",node_id:7,",
+			",allow_dev_keys:false,",
+			"advertise_address:\"127.0.0.1:0\"",
+			"bucket:\"dc309-bucket\"",
+			"slab_max_bytes:67108864,",
+		] {
+			assert!(flat.contains(required), "{form}: missing {required}");
+		}
+		let order = [
+			"node_id",
+			"data_dir",
+			"slab_max_bytes",
+			"group_commit",
+			"storage_shutdown_timeout",
+			"advertise_address",
+			"lease_signing_secret",
+			"allow_dev_keys",
+			"trusted_lease_signers",
+			"transfer_signing_secret",
+			"trusted_transfer_signers",
+			"audit_root_signing_secret",
+			"trusted_audit_root_keys",
+			"cluster",
+			"l2",
+			"tiering",
+			"decision_mode",
+			"decision_signing_secret",
+			"trusted_decision_signers",
+			"mvcc_retention_policy",
+			"parent_decisions_retention_window",
+			"counter_retention",
+			"observability",
+			"audit",
+		]
+		.map(|name| flat.find(&format!(",{name}:")));
+		assert!(
+			order.iter().all(Option::is_some) && order.is_sorted(),
+			"{form}: a field is missing or out of declaration order"
+		);
+	}
+}

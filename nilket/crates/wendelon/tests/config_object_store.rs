@@ -342,7 +342,7 @@ fn no_debug_rendering_holds_a_credential() {
 	] {
 		assert!(
 			!rendered.contains(ACCESS) && !rendered.contains(SECRET),
-			"{rendered}"
+			"a debug rendering holds a credential"
 		);
 		assert!(rendered.contains("<redacted>") && rendered.contains("10.0.0.6"));
 	}
@@ -381,7 +381,10 @@ fn no_debug_rendering_holds_a_credential() {
 		})
 	});
 	let rendered = format!("{nested:?} {nested:#?}");
-	assert!(!rendered.contains("hidden-"), "{rendered}");
+	assert!(
+		!rendered.contains("hidden-"),
+		"a nested provider rendering holds a credential"
+	);
 	assert!(rendered.contains("bucket-id") && rendered.contains("<redacted>"));
 }
 

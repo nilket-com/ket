@@ -399,7 +399,10 @@ impl std::fmt::Debug for DecisionSigningSecret {
 /// Caller-supplied parameters for [`WendelonNode::bootstrap`].
 /// Loaded from TOML in production (`plans/ops/configuration.md`) or
 /// constructed programmatically in tests.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is written by hand (DC-309): every signing secret prints as `<redacted>`, and
+/// every other field prints as a derived `Debug` would, in declaration order.
+#[derive(Clone, PartialEq, Eq)]
 pub struct NodeBootstrapConfig {
 	/// Test-only (DC-276 controls): this node starts with certified cleanup and
 	/// the debt sweep held (`pause_cleanup`), before its first maintenance pass.
@@ -561,6 +564,166 @@ pub struct NodeBootstrapConfig {
 	/// Optional additive audit shipping sinks; the local NDJSON chain
 	/// remains mandatory and is always enabled.
 	pub audit: AuditSinksConfig,
+}
+
+/// DC-309: the configuration prints without a byte of any signing secret. The destructuring
+/// names every field, so a new field does not compile until it is printed or redacted here.
+impl std::fmt::Debug for NodeBootstrapConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let Self {
+			#[cfg(test)]
+			hold_cleanup_at_start_for_test,
+			#[cfg(test)]
+			hold_certification_at_start_for_test,
+			#[cfg(test)]
+			startup_probe,
+			#[cfg(test)]
+			startup_fault,
+			#[cfg(test)]
+			test_time,
+			node_id,
+			data_dir,
+			slab_max_bytes,
+			group_commit,
+			tier_history_budget_bytes,
+			rf,
+			wal_io_depth,
+			slab_io_depth,
+			storage_shutdown_timeout,
+			#[cfg(feature = "test-support")]
+			slab_file_ops,
+			#[cfg(feature = "test-support")]
+			join_promotion_gate,
+			query_stall_bound,
+			write_stall_trace,
+			cdc_locality_heartbeat_interval,
+			data_ring_lease_ttl,
+			advertise_address,
+			lease_signing_secret: _,
+			allow_dev_keys,
+			trusted_lease_signers,
+			transfer_signing_secret: _,
+			trusted_transfer_signers,
+			audit_root_signing_secret: _,
+			trusted_audit_root_keys,
+			cluster,
+			l2,
+			tiering,
+			lsm_compaction_paused,
+			control_retention,
+			consensus_timing,
+			decision_mode,
+			decision_signing_secret,
+			trusted_decision_signers,
+			mvcc_retention_paused,
+			rehydration,
+			l2_column_fetch,
+			row_group_writer,
+			l2_row_group_fetch,
+			encoding_writer,
+			l2_chunk_layout,
+			l2_encoding_fetch,
+			encoding_compute,
+			root_kek_provider,
+			crypto_cache,
+			protocol,
+			transport_tls,
+			transport_admission,
+			drift_max_offset_ms,
+			mvcc_retention_policy,
+			parent_decisions_retention_window,
+			counter_retention,
+			observability,
+			audit,
+		} = self;
+		/// Printed in place of a signing secret.
+		struct Redacted;
+		impl std::fmt::Debug for Redacted {
+			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				f.write_str("<redacted>")
+			}
+		}
+		let redacted = Redacted;
+		let mut d = f.debug_struct("NodeBootstrapConfig");
+		#[cfg(test)]
+		d.field(
+			"hold_cleanup_at_start_for_test",
+			hold_cleanup_at_start_for_test,
+		);
+		#[cfg(test)]
+		d.field(
+			"hold_certification_at_start_for_test",
+			hold_certification_at_start_for_test,
+		);
+		#[cfg(test)]
+		d.field("startup_probe", startup_probe);
+		#[cfg(test)]
+		d.field("startup_fault", startup_fault);
+		#[cfg(test)]
+		d.field("test_time", test_time);
+		d.field("node_id", node_id);
+		d.field("data_dir", data_dir);
+		d.field("slab_max_bytes", slab_max_bytes);
+		d.field("group_commit", group_commit);
+		d.field("tier_history_budget_bytes", tier_history_budget_bytes);
+		d.field("rf", rf);
+		d.field("wal_io_depth", wal_io_depth);
+		d.field("slab_io_depth", slab_io_depth);
+		d.field("storage_shutdown_timeout", storage_shutdown_timeout);
+		#[cfg(feature = "test-support")]
+		d.field("slab_file_ops", slab_file_ops);
+		#[cfg(feature = "test-support")]
+		d.field("join_promotion_gate", join_promotion_gate);
+		d.field("query_stall_bound", query_stall_bound);
+		d.field("write_stall_trace", write_stall_trace);
+		d.field(
+			"cdc_locality_heartbeat_interval",
+			cdc_locality_heartbeat_interval,
+		);
+		d.field("data_ring_lease_ttl", data_ring_lease_ttl);
+		d.field("advertise_address", advertise_address);
+		d.field("lease_signing_secret", &redacted);
+		d.field("allow_dev_keys", allow_dev_keys);
+		d.field("trusted_lease_signers", trusted_lease_signers);
+		d.field("transfer_signing_secret", &redacted);
+		d.field("trusted_transfer_signers", trusted_transfer_signers);
+		d.field("audit_root_signing_secret", &redacted);
+		d.field("trusted_audit_root_keys", trusted_audit_root_keys);
+		d.field("cluster", cluster);
+		d.field("l2", l2);
+		d.field("tiering", tiering);
+		d.field("lsm_compaction_paused", lsm_compaction_paused);
+		d.field("control_retention", control_retention);
+		d.field("consensus_timing", consensus_timing);
+		d.field("decision_mode", decision_mode);
+		// `DecisionSigningSecret`'s own `Debug` redacts it.
+		d.field("decision_signing_secret", decision_signing_secret);
+		d.field("trusted_decision_signers", trusted_decision_signers);
+		d.field("mvcc_retention_paused", mvcc_retention_paused);
+		d.field("rehydration", rehydration);
+		d.field("l2_column_fetch", l2_column_fetch);
+		d.field("row_group_writer", row_group_writer);
+		d.field("l2_row_group_fetch", l2_row_group_fetch);
+		d.field("encoding_writer", encoding_writer);
+		d.field("l2_chunk_layout", l2_chunk_layout);
+		d.field("l2_encoding_fetch", l2_encoding_fetch);
+		d.field("encoding_compute", encoding_compute);
+		d.field("root_kek_provider", root_kek_provider);
+		d.field("crypto_cache", crypto_cache);
+		d.field("protocol", protocol);
+		d.field("transport_tls", transport_tls);
+		d.field("transport_admission", transport_admission);
+		d.field("drift_max_offset_ms", drift_max_offset_ms);
+		d.field("mvcc_retention_policy", mvcc_retention_policy);
+		d.field(
+			"parent_decisions_retention_window",
+			parent_decisions_retention_window,
+		);
+		d.field("counter_retention", counter_retention);
+		d.field("observability", observability);
+		d.field("audit", audit);
+		d.finish()
+	}
 }
 
 pub const DEFAULT_MVCC_RETENTION_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);

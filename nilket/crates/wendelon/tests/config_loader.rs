@@ -2444,6 +2444,31 @@ fn the_decision_authority_defaults_to_today_and_is_selected_with_its_own_keys() 
 	assert!(printed.contains("decision_signing_secret: Some(<redacted>)"));
 	assert!(!printed.contains(&format!("{DECISION_SECRET:?}")));
 	assert!(!printed.contains(&hex32(DECISION_SECRET)));
+	// DC-309: nor any other signing secret the file names (the example's fresh keys), in either
+	// form; each prints `<redacted>` and the safe fields still print.
+	for printed in [format!("{cfg:?}"), format!("{cfg:#?}")] {
+		let flat: String = printed.chars().filter(|c| !c.is_whitespace()).collect();
+		for secret in [
+			cfg.lease_signing_secret,
+			cfg.transfer_signing_secret,
+			cfg.audit_root_signing_secret,
+			DECISION_SECRET,
+		] {
+			let decimal = secret.map(|byte| byte.to_string()).join(",");
+			assert!(
+				!flat.contains(&decimal) && !flat.contains(&hex32(secret)),
+				"a loaded signing secret rendered"
+			);
+		}
+		for required in [
+			"lease_signing_secret:<redacted>,",
+			"transfer_signing_secret:<redacted>,",
+			"audit_root_signing_secret:<redacted>,",
+			"allow_dev_keys:false,",
+		] {
+			assert!(flat.contains(required), "missing {required}");
+		}
+	}
 
 	let (_root, explicit) = parent_decisions_config(
 		"authority-today",
