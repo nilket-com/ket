@@ -17,8 +17,9 @@ pub const DATASET_KEYS: &[&str] = &[
 	"schema_sha256",
 ];
 
-/// Per-block, never compared: paths and addresses, and the Debug dump that
-/// embeds them (its structured fields are compared instead).
+/// Per-block, never compared: paths and addresses, and a legacy record's Debug dump that
+/// embeds them. DC-309: new writers omit the dump; it is ignored on input and never read, so its
+/// text never reaches a comparison or its output.
 pub const PER_BLOCK_CONFIG: &[&str] = &["data_dir", "advertise_address", "l2", "debug_full"];
 
 /// Allowed to differ between arms, and only between arms: the arm itself and
@@ -190,5 +191,134 @@ mod tests {
 			"{p:?}"
 		);
 		assert!(p.iter().any(|p| p.contains("ipc_stream_sha256")), "{p:?}");
+	}
+
+	/// DC-309: a synthetic stand-in for a legacy record's Debug dump, never a real one.
+	const LEGACY_DUMP_SENTINEL: &str = "dc309-legacy-dump-sentinel";
+
+	/// A record as written before DC-309: a Debug dump embedding the block's own paths, `l2` as a
+	/// Debug string, and none of the fields the new writer adds.
+	fn legacy(name: &str, arm: &str) -> Block {
+		let mut b = block(name, arm, "h");
+		b.effective_config["debug_full"] = json!(format!(
+			"{LEGACY_DUMP_SENTINEL} {{ data_dir: \"/x/{name}/store\", l2: \"/x/{name}/l2\" }}"
+		));
+		b.effective_config["l2"] = json!(format!("Some(LocalFs {{ root: \"/x/{name}/l2\" }})"));
+		b
+	}
+
+	/// A record as the DC-309 writer produces it: no dump, the added provenance fields.
+	fn current(name: &str, arm: &str) -> Block {
+		let mut b = block(name, arm, "h");
+		let config = b.effective_config.as_object_mut().unwrap();
+		config.remove("debug_full");
+		config.insert(
+			"l2".into(),
+			json!({"kind": "local_fs", "root": format!("/x/{name}/l2")}),
+		);
+		config.insert("allow_dev_keys".into(), json!(true));
+		config.insert("wal_io_depth".into(), json!(64));
+		config.insert("cluster".into(), json!({"mode": "bootstrap"}));
+		b
+	}
+
+	/// No comparison result or report carries any of a legacy dump's text.
+	fn no_dump_text(blocks: &[Block]) -> bool {
+		let out = serde_json::to_string(&report(blocks)).unwrap();
+		!out.contains(LEGACY_DUMP_SENTINEL) && !out.contains("/store")
+	}
+
+	/// Legacy records that differ only in their dumps (per-block paths) stay comparable: the
+	/// dump is ignored on input, never compared and never echoed.
+	#[test]
+	fn legacy_records_differing_only_in_their_dumps_are_comparable() {
+		let blocks = [
+			legacy("b1", "base"),
+			legacy("f2", "fix"),
+			legacy("f3", "fix"),
+		];
+		assert!(
+			blocks[1].effective_config["debug_full"] != blocks[2].effective_config["debug_full"],
+			"the fixture's dumps differ"
+		);
+		assert!(
+			compare(&blocks).is_empty(),
+			"legacy records differing only in their dumps are refused"
+		);
+		assert!(no_dump_text(&blocks), "a legacy dump reached the output");
+	}
+
+	/// Control: a real compared field still separates legacy records, across and within arms,
+	/// and the refusal carries no dump text.
+	#[test]
+	fn a_legacy_record_differing_in_a_compared_field_is_still_refused() {
+		let mut f3 = legacy("f3", "fix");
+		f3.effective_config["slab_max_bytes"] = json!(1);
+		let within = [legacy("f2", "fix"), f3];
+		assert!(
+			compare(&within).iter().any(|p| p.contains("within arm")),
+			"a compared difference within an arm was accepted"
+		);
+		assert!(no_dump_text(&within), "a legacy dump reached the output");
+		let mut b1 = legacy("b1", "base");
+		b1.effective_config["slab_max_bytes"] = json!(1);
+		let across = [b1, legacy("f2", "fix")];
+		assert!(
+			compare(&across)
+				.iter()
+				.any(|p| p.contains("effective config differs beyond the arm fields")),
+			"a compared difference across arms was accepted"
+		);
+		assert!(no_dump_text(&across), "a legacy dump reached the output");
+	}
+
+	/// Mixed and incomplete provenance is never declared equivalent. A field present in one
+	/// record and missing from the other is a difference, never a default: a legacy record's value
+	/// for it exists only inside its dump, which is not read, so equality cannot be shown.
+	#[test]
+	fn mixed_or_missing_provenance_is_not_declared_equivalent() {
+		let mixed = [legacy("b1", "base"), current("f2", "fix")];
+		assert!(
+			compare(&mixed)
+				.iter()
+				.any(|p| p.contains("effective config differs beyond the arm fields")),
+			"a legacy and a current record were declared equivalent"
+		);
+		let same_arm = [legacy("f2", "fix"), current("f3", "fix")];
+		assert!(
+			compare(&same_arm).iter().any(|p| p.contains("within arm")),
+			"a legacy and a current record were declared equivalent within an arm"
+		);
+		assert!(
+			no_dump_text(&mixed) && no_dump_text(&same_arm),
+			"a legacy dump reached the output"
+		);
+		let mut missing = current("f3", "fix");
+		missing
+			.effective_config
+			.as_object_mut()
+			.unwrap()
+			.remove("allow_dev_keys");
+		assert!(
+			compare(&[current("f2", "fix"), missing])
+				.iter()
+				.any(|p| p.contains("within arm")),
+			"a record missing a provenance field was declared equivalent"
+		);
+		let mut differing = current("b1", "base");
+		differing.effective_config["wal_io_depth"] = json!(8);
+		assert!(
+			!compare(&[differing, current("f2", "fix")]).is_empty(),
+			"records with different provenance were declared equivalent"
+		);
+		assert!(
+			compare(&[
+				current("b1", "base"),
+				current("f2", "fix"),
+				current("f3", "fix")
+			])
+			.is_empty(),
+			"current records with equal provenance are refused"
+		);
 	}
 }

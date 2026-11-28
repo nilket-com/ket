@@ -108,12 +108,44 @@ fn build_config(
 	cfg
 }
 
-/// The values read back from the built config: what the node actually runs.
+/// A duration in whole milliseconds, as the record carries it.
+fn ms(d: Duration) -> u64 {
+	d.as_millis() as u64
+}
+
+/// The L2 backend as structured fields: its kind and location, never a credential (DC-309).
+fn l2_fields(l2: Option<&ObjectStoreConfig>) -> Value {
+	use wendelon::storage::RemoteObjectStoreProvider as P;
+	match l2 {
+		None => Value::Null,
+		Some(ObjectStoreConfig::LocalFs { root }) => json!({"kind": "local_fs", "root": root}),
+		Some(ObjectStoreConfig::Remote(r)) => json!({
+			"kind": "remote",
+			"bucket": r.bucket,
+			"root": r.root,
+			"provider": match r.provider {
+				P::S3Compatible(_) => "s3_compatible",
+				P::BackblazeB2(_) => "backblaze_b2",
+				P::GoogleCloudStorage(_) => "google_cloud_storage",
+			},
+		}),
+	}
+}
+
+/// The values read back from the built config: what the node actually runs. DC-309: explicitly
+/// selected nonsecret fields only (every one present in the base arm's configuration too), nested
+/// configuration as structured fields; no signing secret, credential or `Debug` rendering of the
+/// configuration is recorded.
 fn effective_config(cfg: &NodeBootstrapConfig) -> Value {
+	use wendelon::consensus::ControlRetention;
+	use wendelon::crypto::RootKekProviderConfig as Kek;
+	use wendelon::node::ClusterBootstrapConfig;
 	#[cfg(s7_fix)]
 	let budget = json!(cfg.tier_history_budget_bytes);
 	#[cfg(not(s7_fix))]
 	let budget = json!("N/A: NodeBootstrapConfig has no tier_history_budget_bytes on base");
+	let signer_ids =
+		|m: &std::collections::BTreeMap<u32, [u8; 32]>| m.keys().copied().collect::<Vec<_>>();
 	json!({
 		"arm": ARM,
 		"cfg_s7_fix": cfg!(s7_fix),
@@ -123,21 +155,93 @@ fn effective_config(cfg: &NodeBootstrapConfig) -> Value {
 		"slab_max_bytes": cfg.slab_max_bytes,
 		"tier_history_budget_bytes": budget,
 		"rf": cfg.rf,
-		"l2": format!("{:?}", cfg.l2),
+		"l2": l2_fields(cfg.l2.as_ref()),
 		"tiering": {
-			"scan_interval_ms": cfg.tiering.scan_interval.as_millis() as u64,
+			"scan_interval_ms": ms(cfg.tiering.scan_interval),
 			"min_slab_bytes": cfg.tiering.min_slab_bytes,
 			"max_upload_bytes_per_sec": cfg.tiering.max_upload_bytes_per_sec,
 			"key_prefix": cfg.tiering.key_prefix,
 			"max_plaintext_rewrites_per_pass": cfg.tiering.max_plaintext_rewrites_per_pass,
 			"max_dek_rewraps_per_pass": cfg.tiering.max_dek_rewraps_per_pass,
 		},
-		"mvcc_retention_policy": format!("{:?}", cfg.mvcc_retention_policy),
+		"mvcc_retention_policy": match cfg.mvcc_retention_policy {
+			MvccRetentionPolicy::Disabled => json!({"kind": "disabled"}),
+			MvccRetentionPolicy::FixedWindow(w) => json!({"kind": "fixed_window", "window_ms": ms(w)}),
+		},
 		"mvcc_retention_paused": cfg.mvcc_retention_paused,
 		"lsm_compaction_paused": cfg.lsm_compaction_paused,
-		"group_commit": format!("{:?}", cfg.group_commit),
-		"cluster": format!("{:?}", cfg.cluster),
-		"debug_full": format!("{cfg:#?}"),
+		"group_commit": {
+			"floor_us": cfg.group_commit.floor.as_micros() as u64,
+			"ceiling_us": cfg.group_commit.ceiling.as_micros() as u64,
+			"per_write_cost_estimate_us": cfg.group_commit.per_write_cost_estimate.as_micros() as u64,
+		},
+		"cluster": match &cfg.cluster {
+			ClusterBootstrapConfig::Bootstrap => json!({"mode": "bootstrap"}),
+			ClusterBootstrapConfig::Join { seeds } => json!({
+				"mode": "join",
+				"seeds": seeds.iter().map(|s| json!({"node_id": s.node_id, "address": s.address})).collect::<Vec<_>>(),
+			}),
+		},
+		// The identity, by what it permits and whom it trusts: node ids only, never a key.
+		"allow_dev_keys": cfg.allow_dev_keys,
+		"trusted_signer_node_ids": {
+			"lease": signer_ids(&cfg.trusted_lease_signers),
+			"transfer": signer_ids(&cfg.trusted_transfer_signers),
+			"audit_root": signer_ids(&cfg.trusted_audit_root_keys),
+		},
+		"wal_io_depth": cfg.wal_io_depth,
+		"slab_io_depth": cfg.slab_io_depth,
+		"storage_shutdown_timeout_ms": ms(cfg.storage_shutdown_timeout),
+		"cdc_locality_heartbeat_interval_ms": ms(cfg.cdc_locality_heartbeat_interval),
+		"data_ring_lease_ttl_ms": ms(cfg.data_ring_lease_ttl),
+		"drift_max_offset_ms": cfg.drift_max_offset_ms,
+		"control_retention": match cfg.control_retention {
+			ControlRetention::Compacting => "compacting",
+			ControlRetention::Full => "full",
+		},
+		"rehydration": {
+			"promote_after_l2_reads": cfg.rehydration.promote_after_l2_reads,
+			"min_local_residency_ms": ms(cfg.rehydration.min_local_residency),
+			"tail_read_window_bytes": cfg.rehydration.tail_read_window_bytes,
+		},
+		"crypto_cache": {
+			"tenant_kek_cache_max_entries": cfg.crypto_cache.tenant_kek_cache_max_entries,
+			"slab_dek_cache_max_entries": cfg.crypto_cache.slab_dek_cache_max_entries,
+		},
+		"root_kek_provider": match cfg.root_kek_provider {
+			Kek::DevInsecure => "dev_insecure",
+			Kek::LocalSealed(_) => "local_sealed",
+			Kek::AwsKms(_) => "aws_kms",
+			Kek::Pkcs11(_) => "pkcs11",
+		},
+		"transport_admission": {
+			"max_inbound_connections": cfg.transport_admission.max_inbound_connections,
+			"max_inbound_connections_per_ip": cfg.transport_admission.max_inbound_connections_per_ip,
+			"max_inbound_streams_per_connection": cfg.transport_admission.max_inbound_streams_per_connection,
+			"max_concurrent_stream_tasks": cfg.transport_admission.max_concurrent_stream_tasks,
+		},
+		"counter_retention": {
+			"attempt_horizon_ms": cfg.counter_retention.attempt_horizon_ms,
+			"clock_skew_ms": cfg.counter_retention.clock_skew_ms,
+			"expiry_ms": cfg.counter_retention.expiry_ms,
+		},
+		"row_group_writer_enabled": cfg.row_group_writer.enabled,
+		"l2_row_group_fetch": {
+			"enabled": cfg.l2_row_group_fetch.enabled,
+			"max_selected_row_group_fraction_micros": cfg.l2_row_group_fetch.max_selected_row_group_fraction_micros,
+			"max_selected_byte_fraction_micros": cfg.l2_row_group_fetch.max_selected_byte_fraction_micros,
+		},
+		// Data-only strategy types with their own serde form (no key material).
+		"l2_column_fetch": serde_json::to_value(&cfg.l2_column_fetch).unwrap_or(Value::Null),
+		"encoding_writer": serde_json::to_value(&cfg.encoding_writer).unwrap_or(Value::Null),
+		"l2_chunk_layout": serde_json::to_value(&cfg.l2_chunk_layout).unwrap_or(Value::Null),
+		"l2_encoding_fetch": serde_json::to_value(&cfg.l2_encoding_fetch).unwrap_or(Value::Null),
+		"encoding_compute": serde_json::to_value(&cfg.encoding_compute).unwrap_or(Value::Null),
+		"protocol": serde_json::to_value(cfg.protocol).unwrap_or(Value::Null),
+		// Present or not; their paths are per block (the block's PKI) or unset.
+		"transport_tls": cfg.transport_tls.is_some(),
+		"observability": cfg.observability.is_some(),
+		"audit_sinks": !cfg.audit.is_empty(),
 	})
 }
 
@@ -386,5 +490,178 @@ impl Control {
 			}
 		}
 		write_json_atomic(&block.control_ack(req.seq), &ack)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn frozen() -> Manifest {
+		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("../../scripts/s7-measure/manifest.json");
+		Manifest::load(&path).unwrap().0
+	}
+
+	fn scratch(tag: &str) -> BlockPaths {
+		let root = std::env::temp_dir().join(format!(
+			"s7-node-config-{tag}-{}-{}",
+			std::process::id(),
+			mono_ns()
+		));
+		std::fs::create_dir_all(&root).unwrap();
+		BlockPaths::new(root)
+	}
+
+	/// DC-309 sentinels: one distinctive byte per secret field, never a real key.
+	const LEASE_SENTINEL: [u8; 32] = [0xA5; 32];
+	const TRANSFER_SENTINEL: [u8; 32] = [0x5A; 32];
+	const AUDIT_SENTINEL: [u8; 32] = [0xC3; 32];
+	const CREDENTIAL_SENTINELS: [&str; 3] = [
+		"dc309-access-sentinel",
+		"dc309-secret-key-sentinel",
+		"dc309-session-sentinel",
+	];
+
+	/// Whether `text` carries `secret` as its decimal array (compact or pretty), its `{:x?}`
+	/// array or its hex string, in either case.
+	fn renders(text: &str, secret: [u8; 32]) -> bool {
+		let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+		let list = |each: &dyn Fn(u8) -> String| secret.map(each).join(",");
+		[
+			list(&|b| b.to_string()),
+			list(&|b| format!("{b:x}")),
+			crate::common::hex(&secret),
+		]
+		.into_iter()
+		.any(|form| flat.contains(&form) || flat.contains(&form.to_uppercase()))
+	}
+
+	/// Whether the record carries `secret`: in its serialized text, or in any decoded string
+	/// value or key (a multi-line string serializes its line breaks as escapes).
+	fn renders_anywhere(v: &Value, secret: [u8; 32]) -> bool {
+		fn strings(v: &Value, out: &mut Vec<String>) {
+			match v {
+				Value::String(s) => out.push(s.clone()),
+				Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+				Value::Object(o) => o.iter().for_each(|(k, x)| {
+					out.push(k.clone());
+					strings(x, out)
+				}),
+				_ => {}
+			}
+		}
+		let mut all = vec![serde_json::to_string(v).unwrap()];
+		strings(v, &mut all);
+		all.iter().any(|s| renders(s, secret))
+	}
+
+	/// DC-309: the effective configuration (sealed as `effective-config.json` and copied into the
+	/// start record) records explicitly selected nonsecret fields, structured, with no signing
+	/// secret, nested credential or `Debug` rendering; the provenance fields carry their values.
+	#[test]
+	fn the_effective_config_records_selected_nonsecret_fields_and_no_secret() {
+		use wendelon::storage::{
+			RemoteObjectStoreConfig, RemoteObjectStoreProvider, S3CompatibleProviderConfig,
+		};
+		let m = frozen();
+		let block = scratch("dc309");
+		let pki = pki::write(&block.pki_dir(), m.node_id).unwrap();
+		let mut cfg = build_config(&m, &block, "127.0.0.1:1".into(), &pki);
+		cfg.lease_signing_secret = LEASE_SENTINEL;
+		cfg.transfer_signing_secret = TRANSFER_SENTINEL;
+		cfg.audit_root_signing_secret = AUDIT_SENTINEL;
+		let local = effective_config(&cfg);
+		let [access, secret_key, session] = CREDENTIAL_SENTINELS;
+		let mut remote_cfg = cfg.clone();
+		remote_cfg.l2 = Some(ObjectStoreConfig::Remote(RemoteObjectStoreConfig {
+			bucket: "dc309-bucket".into(),
+			root: "dc309-root".into(),
+			provider: RemoteObjectStoreProvider::S3Compatible(S3CompatibleProviderConfig {
+				endpoint: "http://dc309.invalid".into(),
+				region: "dc309-region".into(),
+				access_key_id: Some(access.into()),
+				secret_access_key: Some(secret_key.into()),
+				session_token: Some(session.into()),
+				allow_anonymous: false,
+				virtual_host_style: false,
+			}),
+		}));
+		let remote = effective_config(&remote_cfg);
+		for (form, effective) in [("local L2", &local), ("remote L2", &remote)] {
+			for (name, secret) in [
+				("lease", LEASE_SENTINEL),
+				("transfer", TRANSFER_SENTINEL),
+				("audit root", AUDIT_SENTINEL),
+			] {
+				assert!(
+					!renders_anywhere(effective, secret),
+					"{form}: the {name} signing secret is recorded"
+				);
+			}
+			let text = serde_json::to_string(effective).unwrap();
+			for credential in CREDENTIAL_SENTINELS {
+				assert!(
+					!text.contains(credential),
+					"{form}: an object-store credential is recorded"
+				);
+			}
+			assert!(
+				effective.get("debug_full").is_none(),
+				"{form}: a Debug dump is recorded"
+			);
+			// The Debug opener: a base build's budget placeholder names the type in prose.
+			assert!(
+				!text.contains("<redacted>") && !text.contains("NodeBootstrapConfig {"),
+				"{form}: a Debug rendering is recorded"
+			);
+			// The provenance, with its values.
+			assert_eq!(effective["node_id"], m.node_id);
+			assert_eq!(effective["allow_dev_keys"], true);
+			assert_eq!(effective["slab_max_bytes"], m.slab_max_bytes);
+			assert_eq!(effective["rf"], cfg.rf);
+			assert_eq!(
+				effective["tiering"]["scan_interval_ms"],
+				m.sweeper_scan_interval_ms
+			);
+			assert_eq!(
+				effective["tiering"]["min_slab_bytes"],
+				m.sweeper_min_slab_bytes
+			);
+			assert_eq!(
+				effective["mvcc_retention_policy"],
+				json!({"kind": "fixed_window", "window_ms": m.cluster_retention_window_secs * 1000})
+			);
+			assert_eq!(effective["cluster"], json!({"mode": "bootstrap"}));
+			assert_eq!(
+				effective["trusted_signer_node_ids"],
+				json!({"lease": [m.node_id], "transfer": [m.node_id], "audit_root": [m.node_id]})
+			);
+			assert_eq!(
+				effective["group_commit"]["floor_us"],
+				cfg.group_commit.floor.as_micros() as u64
+			);
+			assert_eq!(
+				effective["crypto_cache"]["tenant_kek_cache_max_entries"],
+				cfg.crypto_cache.tenant_kek_cache_max_entries
+			);
+			assert_eq!(
+				effective["crypto_cache"]["slab_dek_cache_max_entries"],
+				cfg.crypto_cache.slab_dek_cache_max_entries
+			);
+			assert_eq!(effective["wal_io_depth"], cfg.wal_io_depth);
+			assert_eq!(effective["transport_tls"], true);
+			assert_eq!(effective["control_retention"], "compacting");
+			assert!(effective["encoding_compute"].is_object());
+		}
+		assert_eq!(
+			local["l2"],
+			json!({"kind": "local_fs", "root": block.l2_dir()})
+		);
+		assert_eq!(
+			remote["l2"],
+			json!({"kind": "remote", "bucket": "dc309-bucket", "root": "dc309-root", "provider": "s3_compatible"})
+		);
+		let _ = std::fs::remove_dir_all(&block.root);
 	}
 }
