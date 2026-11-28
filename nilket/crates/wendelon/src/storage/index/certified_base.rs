@@ -19,6 +19,64 @@ use super::*;
 use crate::consensus::decisions::generations::{ChunkSum, chunk_sums_of};
 use serde::{Deserialize, Serialize};
 
+/// Test-only (DC-301): read faults injected into `activate_base`'s scans of the staged table,
+/// standing in for a storage error on one row. Each is keyed by the database it applies to
+/// and consumed once.
+#[cfg(test)]
+pub(crate) mod staged_scan_faults {
+	use std::sync::Mutex;
+
+	/// The scan a fault applies to: the check that decodes the rows, or the copy into the
+	/// active table.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(crate) enum Scan {
+		Check,
+		Copy,
+	}
+
+	static FAULTS: Mutex<Vec<(usize, Scan, usize)>> = Mutex::new(Vec::new());
+
+	fn database(db: &redb::Database) -> usize {
+		std::ptr::from_ref(db) as usize
+	}
+
+	/// Fails `scan`'s read of row `row` (counted from 0) in the next activation on `db`.
+	pub(crate) fn arm(db: &redb::Database, scan: Scan, row: usize) {
+		FAULTS
+			.lock()
+			.expect("staged scan faults")
+			.push((database(db), scan, row));
+	}
+
+	/// The row armed for `scan` on `db`, if any, consumed: taken once, before the scan.
+	pub(crate) fn take(db: &redb::Database, scan: Scan) -> Option<usize> {
+		let mut faults = FAULTS.lock().ok()?;
+		let at = faults
+			.iter()
+			.position(|fault| (fault.0, fault.1) == (database(db), scan))?;
+		Some(faults.swap_remove(at).2)
+	}
+
+	/// `read`, the result of the scan's next row (`*row`, then counted), or the storage error
+	/// that stands for it when that row is `fault`. The caller propagates it as any row's read.
+	pub(crate) fn inject<T>(
+		read: std::io::Result<T>,
+		fault: Option<usize>,
+		scan: Scan,
+		row: &mut usize,
+	) -> std::io::Result<T> {
+		let this = *row;
+		*row += 1;
+		if fault == Some(this) {
+			Err(std::io::Error::other(format!(
+				"injected staged-table read fault: {scan:?} row {this}"
+			)))
+		} else {
+			read
+		}
+	}
+}
+
 pub(super) const BASE_ACTIVE_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("base_active_v1");
 pub(super) const BASE_STAGED_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -1292,21 +1350,42 @@ impl PersistentLocalIndex {
 				if !matches {
 					return Ok(Err(ActivateRefusal::NoMatchingCandidate));
 				}
-				let staged_rows: Vec<(Vec<u8>, Vec<u8>)> = {
-					let staged = tx.open_table(BASE_STAGED_TABLE).map_err(redb_to_io)?;
-					let mut rows = Vec::new();
-					for row in staged.iter().map_err(redb_to_io)? {
-						let (key, value) = row.map_err(redb_to_io)?;
-						rows.push((key.value().to_vec(), value.value().to_vec()));
-					}
-					rows
-				};
 				// The rows installed are exactly the certified inventory: they
 				// must hash to the certificate's chunks, not only the metadata.
-				let entries = staged_rows
-					.iter()
-					.map(|(_, value)| decode_entry(value))
-					.collect::<std::io::Result<Vec<_>>>()?;
+				// DC-301: decoded as the staged table is read, with no owned copy
+				// of its rows. The first undecodable row is reported after every
+				// row has been read, so a storage error on any row still wins.
+				let entries = {
+					let staged = tx.open_table(BASE_STAGED_TABLE).map_err(redb_to_io)?;
+					let mut entries = Vec::new();
+					let mut undecodable = None;
+					#[cfg(test)]
+					let (fault, mut at) = (
+						staged_scan_faults::take(db, staged_scan_faults::Scan::Check),
+						0,
+					);
+					for row in staged.iter().map_err(redb_to_io)? {
+						let row = row.map_err(redb_to_io);
+						#[cfg(test)]
+						let row = staged_scan_faults::inject(
+							row,
+							fault,
+							staged_scan_faults::Scan::Check,
+							&mut at,
+						);
+						let (_, value) = row?;
+						if undecodable.is_none() {
+							match decode_entry(value.value()) {
+								Ok(entry) => entries.push(entry),
+								Err(error) => undecodable = Some(error),
+							}
+						}
+					}
+					if let Some(error) = undecodable {
+						return Err(error);
+					}
+					entries
+				};
 				if chunk_sums(&entries) != activation.chunks {
 					return Ok(Err(ActivateRefusal::StagedRowsMismatch));
 				}
@@ -1336,11 +1415,29 @@ impl PersistentLocalIndex {
 					}
 					previous
 				};
+				// DC-301: the staged keys and values, borrowed from the same
+				// transaction's staged table, as `publish_recovered` copies its
+				// recovery rows; the staged table is emptied only after the copy.
 				{
 					let mut active = emptied(&tx, BASE_ACTIVE_TABLE)?;
-					for (key, value) in &staged_rows {
+					let staged = tx.open_table(BASE_STAGED_TABLE).map_err(redb_to_io)?;
+					#[cfg(test)]
+					let (fault, mut at) = (
+						staged_scan_faults::take(db, staged_scan_faults::Scan::Copy),
+						0,
+					);
+					for row in staged.iter().map_err(redb_to_io)? {
+						let row = row.map_err(redb_to_io);
+						#[cfg(test)]
+						let row = staged_scan_faults::inject(
+							row,
+							fault,
+							staged_scan_faults::Scan::Copy,
+							&mut at,
+						);
+						let (key, value) = row?;
 						active
-							.insert(key.as_slice(), value.as_slice())
+							.insert(key.value(), value.value())
 							.map_err(redb_to_io)?;
 					}
 				}
@@ -1806,6 +1903,75 @@ impl PersistentLocalIndex {
 						.map_err(redb_to_io)?;
 				}
 				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Test-only (DC-301): rewrites the first staged row's value with `damage`, leaving the
+	/// metadata, as damage to the staged rows would.
+	pub(crate) async fn damage_staged_row_for_test(
+		&self,
+		damage: impl FnOnce(&mut Vec<u8>) + Send + 'static,
+	) -> std::io::Result<()> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut staged = tx.open_table(BASE_STAGED_TABLE).map_err(redb_to_io)?;
+					let (key, mut value) = {
+						let mut rows = staged.iter().map_err(redb_to_io)?;
+						let (key, value) = rows
+							.next()
+							.ok_or_else(|| Error::other("no staged row"))?
+							.map_err(redb_to_io)?;
+						(key.value().to_vec(), value.value().to_vec())
+					};
+					damage(&mut value);
+					staged
+						.insert(key.as_slice(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Test-only (DC-301): the raw rows, in key order, of every table an activation reads or
+	/// writes: active, staged, aged staged, debt, intents, owners, and the base's metadata.
+	pub(crate) async fn activation_tables_for_test(
+		&self,
+	) -> std::io::Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let mut tables = Vec::new();
+				for definition in [
+					BASE_ACTIVE_TABLE,
+					BASE_STAGED_TABLE,
+					BASE_AGED_STAGED_TABLE,
+					CLEANUP_DEBT_TABLE,
+					super::parent_intents::PARENT_INTENTS_TABLE,
+					super::parent_intents::PARENT_ROW_OWNERS_TABLE,
+				] {
+					let table = tx.open_table(definition).map_err(redb_to_io)?;
+					let mut rows = Vec::new();
+					for row in table.iter().map_err(redb_to_io)? {
+						let (key, value) = row.map_err(redb_to_io)?;
+						rows.push((key.value().to_vec(), value.value().to_vec()));
+					}
+					tables.push(rows);
+				}
+				{
+					let meta = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+					let mut rows = Vec::new();
+					for row in meta.iter().map_err(redb_to_io)? {
+						let (key, value) = row.map_err(redb_to_io)?;
+						rows.push((key.value().as_bytes().to_vec(), value.value().to_vec()));
+					}
+					tables.push(rows);
+				}
+				tx.abort().map_err(redb_to_io)?;
+				Ok(tables)
 			})
 			.await
 	}
@@ -3254,5 +3420,98 @@ mod tests {
 				.unwrap();
 			assert_eq!(kept, Some(1), "table {which} was not deleted by name");
 		}
+	}
+
+	/// DC-301: the activation reads its staged rows once to check them and once to copy them,
+	/// with no owned copy. An undecodable row alone fails as it did with the copy (the decode
+	/// error, `InvalidData`); a storage error on a later row still wins over an earlier
+	/// undecodable row, as when every row was read before any was decoded. Nothing changes.
+	#[tokio::test]
+	async fn a_staged_storage_error_wins_over_an_earlier_undecodable_row() {
+		use staged_scan_faults::{Scan, arm};
+		let garbage = || vec![0xFF; 3];
+		let expected = decode_entry(&garbage()).unwrap_err().to_string();
+
+		let (_dir, index, staged) =
+			a_populated_base_with_generation_two_staged("undecodable-alone").await;
+		index
+			.damage_staged_row_for_test(move |value| *value = garbage())
+			.await
+			.unwrap();
+		let before = index.activation_tables_for_test().await.unwrap();
+		let error = activate_staged(&index, &staged)
+			.await
+			.expect_err("an undecodable staged row fails the activation");
+		assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+		assert_eq!(error.to_string(), expected, "the row's decode error");
+		assert!(
+			index.activation_tables_for_test().await.unwrap() == before,
+			"an undecodable row changes nothing"
+		);
+
+		let (_dir, index, staged) =
+			a_populated_base_with_generation_two_staged("undecodable-then-storage").await;
+		index
+			.damage_staged_row_for_test(move |value| *value = garbage())
+			.await
+			.unwrap();
+		let before = index.activation_tables_for_test().await.unwrap();
+		arm(&index.db.test_handle(), Scan::Check, 5);
+		let error = activate_staged(&index, &staged)
+			.await
+			.expect_err("a storage error fails the activation");
+		assert_eq!(
+			error.to_string(),
+			"injected staged-table read fault: Check row 5",
+			"the later storage error wins over the earlier undecodable row"
+		);
+		assert!(
+			index.activation_tables_for_test().await.unwrap() == before,
+			"a storage error changes nothing"
+		);
+	}
+
+	/// DC-301: a storage error partway through the copy, after rows were already inserted into
+	/// the emptied active table, fails the activation and commits nothing: after a real reopen
+	/// every table an activation touches is as it was, and the same activation then succeeds.
+	#[tokio::test]
+	async fn a_copy_that_fails_partway_changes_nothing_across_a_reopen_and_the_retry_installs() {
+		use staged_scan_faults::{Scan, arm};
+		let (dir, index, staged) = a_populated_base_with_generation_two_staged("copy-fault").await;
+		let before = index.activation_tables_for_test().await.unwrap();
+		assert!(before[1].len() > 3, "premise: rows copied before the fault");
+		arm(&index.db.test_handle(), Scan::Copy, 3);
+		let error = activate_staged(&index, &staged)
+			.await
+			.expect_err("a storage error during the copy fails the activation");
+		assert_eq!(
+			error.to_string(),
+			"injected staged-table read fault: Copy row 3",
+			"the copy's error is returned"
+		);
+		drop(index);
+		let index = PersistentLocalIndex::open(dir.join("index.redb"))
+			.await
+			.unwrap();
+		let reopened = index.activation_tables_for_test().await.unwrap();
+		for (table, name) in [
+			"active", "staged", "aged", "debt", "intents", "owners", "meta",
+		]
+		.iter()
+		.enumerate()
+		{
+			assert!(
+				reopened[table] == before[table],
+				"{name}: changed by the failed activation"
+			);
+		}
+		activate_staged(&index, &staged).await.unwrap().unwrap();
+		let after = index.activation_tables_for_test().await.unwrap();
+		assert!(after[0] == before[1], "the retry installs the staged rows");
+		assert!(
+			after[1].is_empty() && after[2].is_empty(),
+			"the retry empties the staging"
+		);
+		assert!(!after[3].is_empty(), "the retry records its debt");
 	}
 }
