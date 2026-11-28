@@ -74064,3 +74064,148 @@ async fn a_stale_successful_promotion_attempt_never_disturbs_a_newer_attempt() {
 	stale_promotion_attempt_after_republication("stale-promotion-pass", HeldFetchRelease::Pass)
 		.await;
 }
+
+// ------------------------------------------------------------------
+// DC-305: a read cancelled while its admitted promotion fetch is in flight,
+// before local installation. The next eligible read retries the promotion,
+// and a cancelled stale attempt leaves a newer attempt's admission alone.
+// ------------------------------------------------------------------
+
+/// Aborts a held read's task and waits until it has ended cancelled. The
+/// caller keeps the release sender alive, so the held fetch never sees a
+/// release or a dropped sender: the read ends only by being cancelled.
+async fn cancel_held_promotion_read(
+	task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+	attempt: &str,
+) {
+	task.abort();
+	match tokio::time::timeout(Duration::from_secs(10), task).await {
+		Ok(Err(error)) if error.is_cancelled() => {}
+		Ok(Err(error)) => panic!("BLOCKER: attempt {attempt}: the read task failed: {error}"),
+		Ok(Ok(_)) => panic!("BLOCKER: attempt {attempt}: the held read completed, not cancelled"),
+		Err(_) => panic!("BLOCKER: attempt {attempt}: the aborted read did not end within 10 s"),
+	}
+}
+
+/// `promotion_slab` behind a `HeldFetchStore`.
+async fn held_promotion_slab(tag: &str) -> (PromotionSlab, Arc<HeldFetchControl>) {
+	let control = Arc::new(HeldFetchControl::default());
+	let wrap = {
+		let control = control.clone();
+		move |inner: Arc<dyn ObjectStore>| -> Arc<dyn ObjectStore> {
+			Arc::new(HeldFetchStore { inner, control })
+		}
+	};
+	(promotion_slab(tag, wrap).await, control)
+}
+
+/// DC-305: the threshold read is cancelled while its promotion fetch is held.
+/// The first read after the cancellation has completed retries the promotion
+/// with one whole-object fetch and installs the copy; reads after it are local.
+#[tokio::test]
+async fn a_read_cancelled_at_its_promotion_fetch_lets_the_next_read_retry() {
+	let (f, control) = held_promotion_slab("cancelled-promotion-retry").await;
+	let calls = &control.calls;
+	let slab = f.pointer.slab_id;
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, calls, &format!("read {n}")).await;
+		assert_eq!(bytes, 0, "premise: read {n} reads ranges only");
+	}
+	let (task, release) = spawn_held_promotion_read(&f, &control, "cancelled").await;
+	cancel_held_promotion_read(task, "cancelled").await;
+	assert!(
+		!f.mgr.is_rehydrated(slab).await,
+		"premise: the cancelled read installed no copy"
+	);
+
+	let (bytes, _) = read_promotion_row(&f, calls, "the read after the cancellation").await;
+	assert_eq!(
+		bytes, 1,
+		"the read after the cancellation retries the promotion with exactly one whole-object fetch"
+	);
+	assert!(
+		f.mgr.is_rehydrated(slab).await,
+		"the retry after the cancellation installs the copy"
+	);
+	assert_promotion_copy_serves_reads(&f, calls).await;
+	drop(release);
+}
+
+/// DC-305: attempt A is held at its promotion fetch; a same-pointer replay ends
+/// its admission and attempt B is admitted and held. A is then cancelled: B
+/// keeps its admission, a concurrent eligible read starts no third fetch, and
+/// B installs and serves its copy.
+#[tokio::test]
+async fn a_cancelled_stale_attempt_leaves_a_newer_attempt_its_admission() {
+	let (f, control) = held_promotion_slab("cancelled-stale-promotion").await;
+	let calls = &control.calls;
+	let slab = f.pointer.slab_id;
+
+	// Attempt A.
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, calls, &format!("A read {n}")).await;
+		assert_eq!(bytes, 0, "premise: A read {n} reads ranges only");
+	}
+	let (a, release_a) = spawn_held_promotion_read(&f, &control, "A").await;
+	assert!(
+		f.mgr.rehydrating_for_test(slab).await,
+		"premise: A holds the slab's admission"
+	);
+
+	// The same pointer, applied again, ends every admission of the slab.
+	let replay = tokio::time::timeout(
+		Duration::from_secs(10),
+		f.mgr.apply_tier_slab(f.pointer.clone()),
+	)
+	.await;
+	match replay {
+		Ok(Ok(())) => {}
+		Ok(Err(error)) => panic!("BLOCKER: the same-pointer replay failed: {error}"),
+		Err(_) => panic!("BLOCKER: the same-pointer replay waited on A's held fetch"),
+	}
+	if f.mgr.rehydrating_for_test(slab).await {
+		panic!("BLOCKER: the same-pointer replay did not end A's admission");
+	}
+
+	// Attempt B.
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, calls, &format!("B read {n}")).await;
+		assert_eq!(bytes, 0, "premise: B read {n} reads ranges only");
+	}
+	let (b, release_b) = spawn_held_promotion_read(&f, &control, "B").await;
+	assert!(
+		f.mgr.rehydrating_for_test(slab).await,
+		"premise: B holds the slab's admission"
+	);
+
+	// The stale attempt A is cancelled.
+	cancel_held_promotion_read(a, "A").await;
+	assert!(
+		f.mgr.rehydrating_for_test(slab).await,
+		"A's cancellation never ends B's admission"
+	);
+	let fetches = calls.get_bytes_calls();
+	let (bytes, _) = read_promotion_row(&f, calls, "a concurrent eligible read").await;
+	assert_eq!(
+		(bytes, calls.get_bytes_calls()),
+		(0, fetches),
+		"while B's fetch is live, an eligible read starts no third fetch"
+	);
+	assert!(!b.is_finished(), "premise: B is still held");
+
+	// B completes.
+	release_b
+		.send(HeldFetchRelease::Pass)
+		.expect("premise: B's held fetch awaits its release");
+	assert_eq!(
+		released_promotion_read(b, "B").await,
+		PROMOTION_ROW,
+		"B's read returns its row"
+	);
+	assert!(
+		!f.mgr.rehydrating_for_test(slab).await,
+		"no admission is left once B completes"
+	);
+	assert_promotion_copy_serves_reads(&f, calls).await;
+	drop(release_a);
+}

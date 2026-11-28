@@ -75,6 +75,43 @@ impl RehydrationAttempt {
 	}
 }
 
+/// A slab's promotion admission. While its attempt fetches the object, the
+/// admission lasts only while the attempt's read holds its lease: a read
+/// cancelled during the fetch leaves an entry that admits nothing, and the next
+/// eligible read replaces it. From the handoff to local installation on, the
+/// admission is held until its attempt ends it or a publication, retirement
+/// or quarantine of the slab removes it.
+pub(super) enum RehydrationAdmission {
+	Fetching {
+		attempt: RehydrationAttempt,
+		lease: std::sync::Weak<()>,
+	},
+	Installing(RehydrationAttempt),
+}
+
+impl RehydrationAdmission {
+	fn attempt(&self) -> RehydrationAttempt {
+		match self {
+			Self::Fetching { attempt, .. } | Self::Installing(attempt) => *attempt,
+		}
+	}
+
+	/// Whether the admission still excludes another attempt.
+	fn is_held(&self) -> bool {
+		match self {
+			Self::Fetching { lease, .. } => lease.strong_count() > 0,
+			Self::Installing(_) => true,
+		}
+	}
+}
+
+/// The admitted attempt as its read holds it during the fetch. Dropping it, as
+/// a cancelled read does, releases a fetching admission.
+pub(super) struct AdmittedRehydration {
+	attempt: RehydrationAttempt,
+	_lease: Arc<()>,
+}
+
 /// A rehydrated local copy of one tier object (ADR 0705 §3): the object's
 /// plaintext, dense on disk, with the object's validated layout and the
 /// generation it was made from. Every local read of it converts the location
@@ -2473,7 +2510,12 @@ impl SlabManager {
 	/// Test-only read: whether a promotion attempt holds the slab's admission.
 	#[cfg(test)]
 	pub(crate) async fn rehydrating_for_test(&self, slab_id: SlabId) -> bool {
-		self.state.lock().await.rehydrating.contains_key(&slab_id)
+		self.state
+			.lock()
+			.await
+			.rehydrating
+			.get(&slab_id)
+			.is_some_and(RehydrationAdmission::is_held)
 	}
 
 	/// Test-only read: the slab's counted L2 reads toward promotion.
@@ -2493,7 +2535,9 @@ impl SlabManager {
 	pub(super) async fn admit_rehydration_for_test(&self, slab_id: SlabId) -> RehydrationAttempt {
 		let mut state = self.state.lock().await;
 		let attempt = RehydrationAttempt::issue();
-		state.rehydrating.insert(slab_id, attempt);
+		state
+			.rehydrating
+			.insert(slab_id, RehydrationAdmission::Installing(attempt));
 		attempt
 	}
 
@@ -2605,7 +2649,11 @@ impl SlabManager {
 	pub async fn drop_rehydrated_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
 		let removed = {
 			let state = self.state.lock().await;
-			if state.rehydrating.contains_key(&slab_id) {
+			if state
+				.rehydrating
+				.get(&slab_id)
+				.is_some_and(RehydrationAdmission::is_held)
+			{
 				return Ok(false);
 			}
 			let removed = state.rehydrated.remove(&slab_id).is_some();
@@ -3283,7 +3331,8 @@ impl SlabManager {
 			plaintext_for_rehydration = Some(plaintext);
 			record
 		};
-		if let Some(attempt) = self.note_l2_read(pointer.slab_id).await {
+		if let Some(admitted) = self.note_l2_read(pointer.slab_id).await {
+			let attempt = admitted.attempt;
 			let plaintext = match plaintext_for_rehydration.take() {
 				Some(plaintext) => Ok(plaintext),
 				None => self.fetch_full_tiered_plaintext(l2.as_ref(), pointer).await,
@@ -3292,8 +3341,17 @@ impl SlabManager {
 				// A rehydrated copy is dense on disk; its local reads take
 				// the object's layout (ADR 0705 §3).
 				Ok(plaintext) => {
-					self.rehydrate_tiered_slab(pointer.clone(), attempt, plaintext)
+					if self
+						.begin_rehydration_install(pointer.slab_id, attempt)
 						.await
+					{
+						drop(admitted);
+						self.rehydrate_tiered_slab(pointer.clone(), attempt, plaintext)
+							.await
+					} else {
+						// Superseded during the fetch: nothing to install.
+						Ok(())
+					}
 				}
 				Err(err) => {
 					self.abandon_rehydration_attempt(pointer.slab_id, attempt)
@@ -3453,15 +3511,23 @@ impl SlabManager {
 	}
 
 	/// Counts one L2 read of `slab_id`; at the promotion threshold it admits one
-	/// promotion attempt and returns its token.
-	pub(super) async fn note_l2_read(&self, slab_id: SlabId) -> Option<RehydrationAttempt> {
+	/// promotion attempt and returns it, with the lease its fetch holds.
+	pub(super) async fn note_l2_read(&self, slab_id: SlabId) -> Option<AdmittedRehydration> {
 		let promote_after = self.config.rehydration.promote_after_l2_reads;
 		if promote_after == 0 {
 			return None;
 		}
 		let mut state = self.state.lock().await;
-		if state.rehydrated.contains_key(&slab_id) || state.rehydrating.contains_key(&slab_id) {
+		if state.rehydrated.contains_key(&slab_id) {
 			return None;
+		}
+		match state.rehydrating.get(&slab_id) {
+			Some(admission) if admission.is_held() => return None,
+			// A read cancelled during its fetch left this entry; it admits nothing.
+			Some(_) => {
+				state.rehydrating.remove(&slab_id);
+			}
+			None => {}
 		}
 		let hits = state.hot_read_counts.entry(slab_id).or_insert(0);
 		*hits = hits.saturating_add(1);
@@ -3476,8 +3542,16 @@ impl SlabManager {
 			return None;
 		}
 		let attempt = RehydrationAttempt::issue();
-		state.rehydrating.insert(slab_id, attempt);
-		Some(attempt)
+		let lease = Arc::new(());
+		let admission = RehydrationAdmission::Fetching {
+			attempt,
+			lease: Arc::downgrade(&lease),
+		};
+		state.rehydrating.insert(slab_id, admission);
+		Some(AdmittedRehydration {
+			attempt,
+			_lease: lease,
+		})
 	}
 
 	/// Ends `attempt`'s admission of `slab_id` if it still owns it, returning
@@ -3489,11 +3563,33 @@ impl SlabManager {
 		slab_id: SlabId,
 		attempt: RehydrationAttempt,
 	) -> bool {
-		if state.rehydrating.get(&slab_id) != Some(&attempt) {
-			return false;
+		let owned = state
+			.rehydrating
+			.get(&slab_id)
+			.is_some_and(|admission| admission.attempt() == attempt);
+		if owned {
+			state.rehydrating.remove(&slab_id);
 		}
-		state.rehydrating.remove(&slab_id);
-		true
+		owned
+	}
+
+	/// The handoff from the fetch to local installation. Only the attempt that
+	/// still owns the admission installs; from here its admission no longer
+	/// ends with its read, so no later attempt can start while this one's file
+	/// I/O may still run against the slab's paths.
+	async fn begin_rehydration_install(
+		&self,
+		slab_id: SlabId,
+		attempt: RehydrationAttempt,
+	) -> bool {
+		let mut state = self.state.lock().await;
+		match state.rehydrating.get_mut(&slab_id) {
+			Some(admission) if admission.attempt() == attempt => {
+				*admission = RehydrationAdmission::Installing(attempt);
+				true
+			}
+			_ => false,
+		}
 	}
 
 	/// A failed attempt that still owned its admission returns the slab to one
