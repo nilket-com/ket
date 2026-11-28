@@ -1348,10 +1348,13 @@ impl PersistentLocalIndex {
 				// Wendelon ADR 0122 D3: the aged evidence goes with the staging; the
 				// index above was read from it first.
 				emptied(&tx, BASE_AGED_STAGED_TABLE)?;
-				// ADR 0699 S5b: the new base's entries by key, for the debt the
-				// activation records below.
-				let new_base: std::collections::HashMap<[u8; 56], BaseEntry> =
-					entries.iter().map(|entry| (entry.key(), *entry)).collect();
+				// ADR 0699 S5b: the new base's HLC and kind by key, for the debt the
+				// activation records below; nothing else of an entry is compared.
+				let new_base: std::collections::HashMap<[u8; 56], (HybridTimestamp, bool)> =
+					entries
+						.iter()
+						.map(|entry| (entry.key(), (entry.hlc, entry.tombstone)))
+						.collect();
 				let mut debt = tx.open_table(CLEANUP_DEBT_TABLE).map_err(redb_to_io)?;
 				let mut record_debt =
 					|key: VersionKey, record: DebtRecord| -> std::io::Result<()> {
@@ -1361,9 +1364,9 @@ impl PersistentLocalIndex {
 					};
 				// Each displaced previous base entry is obsolete.
 				for entry in &displaced {
-					let replaced = new_base
-						.get(&entry.key())
-						.is_none_or(|new| new.hlc != entry.hlc || new.tombstone != entry.tombstone);
+					let replaced = new_base.get(&entry.key()).is_none_or(|&(hlc, tombstone)| {
+						hlc != entry.hlc || tombstone != entry.tombstone
+					});
 					if replaced {
 						let key = VersionKey {
 							tenant: entry.tenant,
@@ -1425,7 +1428,7 @@ impl PersistentLocalIndex {
 									version.table,
 									&version.key_identity,
 								))
-								.is_some_and(|entry| entry.hlc == version.hlc);
+								.is_some_and(|&(hlc, _)| hlc == version.hlc);
 							if owned_here && !winner {
 								let key = VersionKey {
 									tenant: intent.tenant,
@@ -2123,6 +2126,62 @@ mod tests {
 			index.debt_page(None, 100).await.unwrap().len(),
 			1,
 			"only the re-owned loser's debt stays"
+		);
+	}
+
+	/// DC-301: the two new-base decisions compare different facts. A displaced entry whose
+	/// key keeps its HLC but changes kind is debt; a retired intent's version is protected by
+	/// an equal HLC whatever the new entry's kind, and only by an equal HLC.
+	#[tokio::test]
+	async fn a_kind_change_at_the_same_hlc_is_debt_and_only_an_equal_hlc_protects_an_intent() {
+		let (_dir, index) = open("kind-vs-hlc").await;
+		let flipped = entry(1, 1, 0);
+		let kept = entry(2, 2, 0);
+		activate(&index, 1, 0, 0, vec![flipped, kept]).await;
+		let protected = owned(3, 4, 0x33);
+		let superseded = owned(4, 5, 0x44);
+		begin(&index, 5, vec![protected, superseded]).await;
+		let new_base = vec![
+			BaseEntry {
+				tombstone: true,
+				..flipped
+			},
+			kept,
+			BaseEntry {
+				tombstone: true,
+				..as_entry(&protected)
+			},
+			entry(4, 6, 0),
+		];
+		activate(&index, 2, 1, 8, new_base).await;
+		let listed: Vec<(VersionKey, DebtSource)> = index
+			.debt_page(None, 100)
+			.await
+			.unwrap()
+			.iter()
+			.map(|(key, record)| (*key, record.source))
+			.collect();
+		let displaced = VersionKey {
+			tenant: TENANT,
+			table: flipped.table,
+			key_identity: flipped.key_identity,
+			hlc: flipped.hlc,
+		};
+		assert!(
+			listed.contains(&(displaced, DebtSource::DisplacedBase { tombstone: false })),
+			"a kind change at the same HLC is debt: {listed:?}"
+		);
+		assert!(
+			listed.contains(&(
+				version_key(&superseded),
+				DebtSource::RetiredIntent { rsv: 5, ordinal: 0 }
+			)),
+			"another HLC does not protect an intent's version: {listed:?}"
+		);
+		assert_eq!(
+			listed.len(),
+			2,
+			"an equal HLC and kind, and an equal HLC of either kind, owe nothing: {listed:?}"
 		);
 	}
 
