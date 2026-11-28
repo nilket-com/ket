@@ -241,6 +241,7 @@ pub use tier_generation::{
 };
 use version_identity::IncomingVersion;
 pub(crate) use witnessed_reads::CopyWitness;
+mod local_file_ledger;
 mod rehydration_install;
 mod slab_file_quarantine;
 mod tiered_io;
@@ -897,11 +898,10 @@ pub struct SlabManager {
 	unresolved_tier_cleanup: Arc<retention_reclaim::UnresolvedTierCleanup>,
 	deferred_table_drop_l2: retention_reclaim::DeferredTableDropL2,
 	cleanup_scan_schedule: retention_reclaim::CleanupScanSchedule,
-	/// Local slab files open found disagreeing with the committed tier state;
-	/// fixed at open, never served or unlinked.
+	/// Slab files open found disagreeing with the committed tier state; never served or unlinked.
 	quarantined_slab_files: slab_file_quarantine::SlabFileQuarantine,
-	/// Released slab files not yet unlinked, each with its identity: the only ones it may unlink.
-	released_slab_files: rehydration_install::ReleasedSlabFiles,
+	/// ADR 0132: the copies and released files to dispose of, shared with the directory owner.
+	local_files: Arc<local_file_ledger::LocalFileLedger>,
 	rehydration_installs: rehydration_install::RehydrationInstalls,
 	live_reservations: Arc<DashSet<SlabId>>,
 	/// Test-only pause points (manager/pause_hooks.rs).

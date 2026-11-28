@@ -920,3 +920,74 @@ async fn dc276_a_tiered_stores_skipped_rebuild_keeps_the_debt_of_a_copy_only_in_
 	}
 	eprintln!("DC-276 C3 eventual: the copy was erased and the debt retired");
 }
+
+/// Wendelon ADR 0132 K10: a follower promotes its own offloaded slab by
+/// ordinary reads, then `Node::shutdown` closes its storage with the slab
+/// manager alive. The close disposes of the registered copy and records a
+/// clean shutdown; the reopened node finds no file at the slab's path,
+/// quarantines nothing, and promotes the slab again by ordinary reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_node_shutdown_disposes_of_a_promoted_copy_and_the_reopened_node_promotes_again() {
+	let (mut cluster, leader, descriptor, _root) = offload_cluster("close-disposal").await;
+	let follower = followers(leader)[0];
+	let ids = [1i64];
+	write_rows(&cluster, leader, &descriptor, &[(1, "a")]).await;
+	let frames = frames_at(&cluster, follower, &descriptor, &ids).await;
+	let id = cluster
+		.node(follower)
+		.slab
+		.force_seal_active_for_test()
+		.await;
+	until_offloaded(&cluster, follower, id, "before the promotion").await;
+	until_no_intents(&cluster, follower, "before the promotion").await;
+	let threshold = cluster.configs[&follower]
+		.rehydration
+		.promote_after_l2_reads as usize;
+	assert!(threshold >= 1, "premise: promotion is enabled");
+	for n in 1..=threshold {
+		assert_eq!(
+			frames_at(&cluster, follower, &descriptor, &ids).await,
+			frames,
+			"read {n} before the shutdown"
+		);
+	}
+	let slab = &cluster.node(follower).slab;
+	assert!(
+		slab.is_rehydrated(id).await,
+		"premise: ordinary reads registered a copy"
+	);
+	assert!(
+		slab.slab_file_exists_for_test(id),
+		"premise: the copy's file"
+	);
+	assert!(
+		cluster.close(follower).await,
+		"the shutdown recorded a clean close"
+	);
+	cluster.reopen(follower).await;
+	until_ready(&cluster, follower, "after the reopen").await;
+	let slab = &cluster.node(follower).slab;
+	assert!(
+		!slab.slab_file_exists_for_test(id),
+		"the shutdown disposed of the copy's file"
+	);
+	let report = slab.quarantined_slab_files();
+	assert!(
+		report.files.iter().all(|file| file.slab_id != id),
+		"the reopened node quarantines nothing of the slab: {report:?}"
+	);
+	assert!(!slab.is_rehydrated(id).await, "no copy before the reads");
+	for n in 1..=threshold {
+		assert_eq!(
+			frames_at(&cluster, follower, &descriptor, &ids).await,
+			frames,
+			"read {n} after the reopen"
+		);
+	}
+	let slab = &cluster.node(follower).slab;
+	assert!(
+		slab.is_rehydrated(id).await,
+		"the reopened node promotes the slab again"
+	);
+	assert_eq!(slab.quarantined_slab_files().rehydrations_skipped, 0);
+}

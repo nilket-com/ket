@@ -31,15 +31,34 @@ impl ManagerState {
 		self.tiered.insert(slab_id, pointer);
 	}
 
-	/// Install `slab_id`'s rehydrated copy (see `install_sealed`).
+	/// Install `slab_id`'s rehydrated copy (see `install_sealed`). Every insertion into
+	/// `rehydrated` goes through here, and registers the copy's file in `ledger` in the
+	/// same critical section (ADR 0132 D5).
 	pub(super) fn install_rehydrated(
 		&self,
 		budget: &Arc<super::tier_budget::TierMemoryBudget>,
+		ledger: &super::local_file_ledger::LocalFileLedger,
 		slab_id: SlabId,
 		copy: super::RehydratedCopy,
 	) {
 		self.disposal_evidence.forget(budget, slab_id);
+		ledger.register(slab_id, copy.store.cached_file_identity());
 		self.rehydrated.insert(slab_id, copy);
+	}
+
+	/// ADR 0132 D5: remove `slab_id`'s rehydrated copy. Every removal from `rehydrated`
+	/// goes through here, and withdraws the copy's registration in `ledger` in the same
+	/// critical section. With `Release` the caller records the copy's release; with
+	/// `Evidence` the file stays as quarantine evidence and nothing may unlink it.
+	pub(super) fn take_rehydrated(
+		&self,
+		ledger: &super::local_file_ledger::LocalFileLedger,
+		slab_id: SlabId,
+		disposition: super::local_file_ledger::CopyDisposition,
+	) -> Option<super::RehydratedCopy> {
+		let (_, copy) = self.rehydrated.remove(&slab_id)?;
+		ledger.unregister(slab_id, disposition);
+		Some(copy)
 	}
 
 	/// Publish `layout` as `slab_id`'s current generation. Every write of

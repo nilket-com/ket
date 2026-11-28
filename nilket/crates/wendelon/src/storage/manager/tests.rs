@@ -74267,6 +74267,14 @@ struct InstallerGate {
 	open_failures_after_creating: std::sync::Mutex<Option<(String, usize)>>,
 	/// This many more directory syncs fail.
 	fsync_dir_failures: std::sync::atomic::AtomicUsize,
+	/// Holds the next read through a descriptor opened at this exact path
+	/// (ADR 0132 K9).
+	read_hold: std::sync::Mutex<Option<(PathBuf, GateHold)>>,
+	/// Length reads of a name with this suffix fail, this many more times
+	/// (ADR 0132: a collision's fallible preparation).
+	file_len_failures: std::sync::Mutex<Option<(String, usize)>>,
+	/// Holds the next length read of a name with this suffix.
+	file_len_hold: std::sync::Mutex<Option<(String, GateHold)>>,
 }
 
 impl InstallerGate {
@@ -74280,6 +74288,22 @@ impl InstallerGate {
 	fn hold_next_unlink(&self, suffix: &str) -> GateHold {
 		let hold = gate_hold();
 		*self.unlink_hold.lock().unwrap() = Some((suffix.to_owned(), hold.clone()));
+		hold
+	}
+
+	fn hold_next_read(&self, path: &Path) -> GateHold {
+		let hold = gate_hold();
+		*self.read_hold.lock().unwrap() = Some((path.to_path_buf(), hold.clone()));
+		hold
+	}
+
+	fn fail_file_lens(&self, suffix: &str, times: usize) {
+		*self.file_len_failures.lock().unwrap() = Some((suffix.to_owned(), times));
+	}
+
+	fn hold_next_file_len(&self, suffix: &str) -> GateHold {
+		let hold = gate_hold();
+		*self.file_len_hold.lock().unwrap() = Some((suffix.to_owned(), hold.clone()));
 		hold
 	}
 
@@ -74434,6 +74458,25 @@ impl AsyncFileOps for InstallerGateFileOps {
 		offset: u64,
 		buf: crate::storage::io_uring::AlignedBuf,
 	) -> std::io::Result<(usize, crate::storage::io_uring::AlignedBuf)> {
+		let hold = {
+			let opened = self
+				.gate
+				.opened
+				.lock()
+				.unwrap()
+				.get(&handle.raw_fd())
+				.cloned();
+			let mut held = self.gate.read_hold.lock().unwrap();
+			let armed = held.as_ref().map(|(path, _)| path.clone());
+			if opened.is_some() && opened == armed {
+				held.take().map(|(_, hold)| hold)
+			} else {
+				None
+			}
+		};
+		if let Some(hold) = hold {
+			pass_gate_hold(hold).await;
+		}
 		self.inner.read_at(handle, offset, buf).await
 	}
 
@@ -74466,6 +74509,30 @@ impl AsyncFileOps for InstallerGateFileOps {
 	}
 
 	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
+		let name = path.to_string_lossy().into_owned();
+		let hold = {
+			let mut held = self.gate.file_len_hold.lock().unwrap();
+			if held
+				.as_ref()
+				.is_some_and(|(suffix, _)| name.ends_with(suffix.as_str()))
+			{
+				held.take().map(|(_, hold)| hold)
+			} else {
+				None
+			}
+		};
+		if let Some(hold) = hold {
+			pass_gate_hold(hold).await;
+		}
+		{
+			let mut failures = self.gate.file_len_failures.lock().unwrap();
+			if let Some((suffix, left)) = failures.as_mut()
+				&& *left > 0 && name.ends_with(suffix.as_str())
+			{
+				*left -= 1;
+				return Err(Error::other("injected length read failure (test)"));
+			}
+		}
 		self.inner.file_len(path).await
 	}
 
@@ -74959,6 +75026,10 @@ async fn close_waits_for_a_held_installer_and_refuses_everything_else() {
 	let g = gated_promotion_slab("installer-close", true).await;
 	let owner = g.owner.clone().expect("premise: an owned store");
 	let (task, release) = spawn_held_installer(&g, "close").await;
+	let outcome =
+		g.f.mgr
+			.rehydration_outcome_for_test(g.slab())
+			.expect("premise: the held installer's outcome");
 	use crate::storage::ownership::ShutdownIncomplete;
 	let error = owner
 		.close(Duration::from_millis(300))
@@ -75003,10 +75074,14 @@ async fn close_waits_for_a_held_installer_and_refuses_everything_else() {
 		.expect("close completes once the installer settles")
 		.unwrap()
 		.unwrap();
-	assert!(
-		g.f.mgr.is_rehydrated(g.slab()).await,
+	assert_eq!(
+		installer_outcome(outcome, "close").await,
+		rehydration_install::InstallOutcome::Registered,
 		"the installer finished through its child permits"
 	);
+	// ADR 0132: the close's settle then disposed of the registered copy.
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	assert!(!g.final_path().exists());
 	assert!(!owner.clean_record_revoked());
 	assert!(g.f.mgr.config.dir.join("CLEAN_SHUTDOWN").exists());
 }
@@ -75027,7 +75102,9 @@ async fn gc_release_and_copy_drop_refuse_a_slab_whose_installer_holds_its_names(
 			.await
 			.unwrap_err();
 	assert_eq!(gc.kind(), ErrorKind::WouldBlock, "GC refuses: {gc}");
-	g.f.mgr.released_slab_files.owe(g.slab(), (0, 0));
+	g.f.mgr
+		.local_files
+		.owe(g.slab(), (0, 0), local_file_ledger::ReleaseOrigin::Copy);
 	let unlink =
 		g.f.mgr
 			.unlink_released_slab_file(g.slab())
@@ -75038,7 +75115,7 @@ async fn gc_release_and_copy_drop_refuse_a_slab_whose_installer_holds_its_names(
 		ErrorKind::WouldBlock,
 		"the release refuses: {unlink}"
 	);
-	g.f.mgr.released_slab_files.forget_owed(g.slab());
+	g.f.mgr.local_files.forget_owed(g.slab());
 	release.add_permits(1);
 	assert_eq!(
 		released_promotion_read(task, "exclusion").await,
@@ -75065,7 +75142,7 @@ async fn a_released_slab_file_replaced_at_its_path_is_left_alone() {
 		"a file of another identity is never unlinked"
 	);
 	assert_eq!(
-		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		g.f.mgr.local_files.phase_for_test(g.slab()),
 		None,
 		"the settler ended the release"
 	);
@@ -75090,7 +75167,7 @@ async fn a_dropped_release_waiter_leaves_the_unlink_to_its_settler() {
 	waiter.abort();
 	assert!(waiter.await.unwrap_err().is_cancelled());
 	assert_eq!(
-		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		g.f.mgr.local_files.phase_for_test(g.slab()),
 		Some("unlinking"),
 		"the release stays the settler's"
 	);
@@ -75099,7 +75176,7 @@ async fn a_dropped_release_waiter_leaves_the_unlink_to_its_settler() {
 	let mgr = g.f.mgr.clone();
 	let slab = g.slab();
 	wait_until("the settler's unlink", || {
-		mgr.released_slab_files.phase_for_test(slab).is_none()
+		mgr.local_files.phase_for_test(slab).is_none()
 	})
 	.await;
 	assert!(!g.final_path().exists(), "the settler unlinked the copy");
@@ -75359,7 +75436,7 @@ async fn an_open_without_its_identity_fails_and_every_opened_slab_release_unlink
 	assert!(refused.is_err(), "an open without its identity fails");
 	assert!(!path.exists(), "nothing was opened");
 	assert_eq!(
-		g.f.mgr.released_slab_files.phase_for_test(slab),
+		g.f.mgr.local_files.phase_for_test(slab),
 		None,
 		"nothing is owed"
 	);
@@ -75377,17 +75454,18 @@ async fn an_open_without_its_identity_fails_and_every_opened_slab_release_unlink
 		(metadata.dev(), metadata.ino())
 	};
 	assert_eq!(store.cached_file_identity(), on_disk);
+	let identity = store.cached_file_identity();
 	g.f.mgr
-		.release_slab_file(slab, store.cached_file_identity());
+		.release_slab_file(slab, identity, local_file_ledger::ReleaseOrigin::Backing);
 	assert_eq!(
-		g.f.mgr.released_slab_files.phase_for_test(slab),
+		g.f.mgr.local_files.phase_for_test(slab),
 		Some("owed"),
 		"every opened store's release is recorded"
 	);
 	drop(store);
 	g.f.mgr.unlink_released_slab_file(slab).await.unwrap();
 	assert!(!path.exists(), "the release really unlinked the file");
-	assert_eq!(g.f.mgr.released_slab_files.phase_for_test(slab), None);
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), None);
 }
 
 /// ADR 0131 D4 (review), control (a): a directory sync that fails once after
@@ -75408,7 +75486,7 @@ async fn a_transient_directory_sync_failure_after_a_release_unlink_is_retried() 
 	);
 	assert!(!g.final_path().exists());
 	assert_eq!(
-		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		g.f.mgr.local_files.phase_for_test(g.slab()),
 		None,
 		"the release ended once its sync succeeded"
 	);
@@ -75434,7 +75512,7 @@ async fn a_persistent_directory_sync_failure_keeps_only_the_sync_owed() {
 	assert_eq!(g.gate.fsync_dir_failures_left(), 0, "three tries");
 	assert!(!g.final_path().exists(), "the unlink stands");
 	assert_eq!(
-		g.f.mgr.released_slab_files.phase_for_test(g.slab()),
+		g.f.mgr.local_files.phase_for_test(g.slab()),
 		Some("sync_owed"),
 		"the sync obligation is kept"
 	);
@@ -75449,7 +75527,7 @@ async fn a_persistent_directory_sync_failure_keeps_only_the_sync_owed() {
 		b"a later occupant",
 		"the path is never touched again"
 	);
-	assert_eq!(g.f.mgr.released_slab_files.phase_for_test(g.slab()), None);
+	assert_eq!(g.f.mgr.local_files.phase_for_test(g.slab()), None);
 }
 
 // ------------------------------------------------------------------
@@ -75718,7 +75796,7 @@ impl SyncOwedGc {
 	}
 
 	fn phase(&self) -> Option<&'static str> {
-		self.mgr.released_slab_files.phase_for_test(self.slab_id)
+		self.mgr.local_files.phase_for_test(self.slab_id)
 	}
 
 	/// Whether the op under test (this slab's removal, of exactly this file)
@@ -75754,7 +75832,7 @@ impl SyncOwedGc {
 	async fn assert_never_advanced_with_its_release_left(&self, what: &str) {
 		if !self.recorded().await {
 			assert_eq!(
-				self.mgr.released_slab_files.identity_for_test(self.slab_id),
+				self.mgr.local_files.identity_for_test(self.slab_id),
 				None,
 				"{what}: GC advanced and left a matching release"
 			);
@@ -75853,7 +75931,7 @@ async fn sync_owed_gc(tag: &str) -> SyncOwedGc {
 	assert_eq!(gc.phase(), Some("sync_owed"));
 	gc.identity = gc
 		.mgr
-		.released_slab_files
+		.local_files
 		.identity_for_test(slab_id)
 		.expect("premise: the release's identity");
 	assert!(
@@ -75969,4 +76047,1192 @@ async fn a_gc_resume_joins_a_held_sync_only_owner_that_succeeds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_gc_resume_joins_a_held_sync_only_owner_that_fails() {
 	gc_resume_joins_a_held_sync_only_owner("gc-resume-owner-fails", true).await;
+}
+
+// ------------------------------------------------------------------
+// ADR 0132: a clean close disposes of the registered local copies it owns.
+// Benign, state-level controls, one actor per name. A control whose debt is
+// injected through a test seam says so ("constructed"); every other reaches
+// its state through the ordinary transitions.
+// ------------------------------------------------------------------
+
+/// The (device, inode) of whatever `path` names, if anything.
+fn file_identity_at(path: &Path) -> Option<(u64, u64)> {
+	use std::os::unix::fs::MetadataExt;
+	std::fs::symlink_metadata(path)
+		.ok()
+		.map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+fn clean_record_in(dir: &Path) -> bool {
+	dir.join("CLEAN_SHUTDOWN").exists()
+}
+
+/// Whether another owner is refused `dir`. Only for a lock expected held: a
+/// free lock is taken, and the clean-shutdown record consumed.
+fn lock_held(dir: &Path) -> bool {
+	DataDirectoryOwner::acquire_existing(dir).is_err()
+}
+
+fn is_shutdown_incomplete(error: &Error) -> bool {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<crate::storage::ownership::ShutdownIncomplete>())
+		.is_some()
+}
+
+fn gated_owner(g: &GatedPromotion) -> DataDirectoryOwner {
+	g.owner.clone().expect("premise: an owned store")
+}
+
+/// Ordinary reads up to the threshold register the slab's copy; returns the
+/// copy's file identity, which the ledger registered.
+async fn promote_gated(g: &GatedPromotion, what: &str) -> (u64, u64) {
+	for n in 1..=g.f.threshold {
+		read_promotion_row(&g.f, &g.calls, &format!("{what}: read {n}")).await;
+	}
+	assert!(
+		g.f.mgr.is_rehydrated(g.slab()).await,
+		"premise: {what}: a registered copy"
+	);
+	let identity = file_identity_at(&g.final_path()).expect("premise: the copy's file");
+	assert_eq!(
+		g.f.mgr.local_files.registered_for_test(g.slab()),
+		Some(identity),
+		"premise: {what}: the ledger registered the copy by its identity"
+	);
+	identity
+}
+
+/// Drops the manager and every handle of `g` but its directories, and waits
+/// until the manager is gone; the caller keeps its own owner clone, if any.
+async fn drop_promotion_manager(g: GatedPromotion) -> [crate::test_support::TestDir; 2] {
+	let GatedPromotion {
+		f: PromotionSlab { _dirs, mgr, .. },
+		l2,
+		gate,
+		calls,
+		owner,
+	} = g;
+	let manager = Arc::downgrade(&mgr);
+	drop((mgr, l2, gate, calls, owner));
+	wait_until("premise: the manager is gone", || {
+		manager.upgrade().is_none()
+	})
+	.await;
+	_dirs
+}
+
+/// `dir` reopened as a new process would: empty key caches, a new owner,
+/// the production file operations, and its tier authority ready.
+async fn reopen_promotion_dir(
+	dir: &Path,
+	l2: &Arc<dyn ObjectStore>,
+	crypto: Arc<CryptoManager>,
+) -> (DataDirectoryOwner, Arc<SlabManager>) {
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	let owner =
+		DataDirectoryOwner::acquire_existing(dir).expect("the close released the directory");
+	let mgr = SlabManager::open_with_owner(
+		SlabManagerConfig {
+			crypto,
+			..tiered_input_config(dir, l2)
+		},
+		owner.clone(),
+	)
+	.await
+	.expect("the reopen");
+	tokio::time::timeout(Duration::from_secs(10), mgr.wait_tier_authority_ready())
+		.await
+		.expect("the tier authority is ready in time after the reopen")
+		.expect("the tier authority is ready after the reopen");
+	(owner, mgr)
+}
+
+/// Arms a hold on the next `job` at exactly `path`, inside its blocking job;
+/// returns (`entered`, `release`). A dropped `release` lets the job go too.
+fn held_blocking_job(
+	job: crate::storage::file_ops::blocking_job_seam::Job,
+	path: &Path,
+	after: Option<Box<dyn FnOnce() + Send>>,
+) -> (Arc<tokio::sync::Semaphore>, std::sync::mpsc::Sender<()>) {
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let (release, released) = std::sync::mpsc::channel();
+	crate::storage::file_ops::blocking_job_seam::arm(
+		job,
+		path,
+		crate::storage::file_ops::blocking_job_seam::Action::Hold {
+			entered: entered.clone(),
+			release: released,
+			after,
+		},
+	);
+	(entered, release)
+}
+
+/// A storage worker that counts its joins.
+struct CountedJoins(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl crate::storage::ownership::StorageWorker for CountedJoins {
+	async fn close_and_join(&self) -> std::io::Result<()> {
+		self.0.fetch_add(1, Ordering::SeqCst);
+		Ok(())
+	}
+}
+
+/// A storage worker whose join waits on a hold.
+struct HeldJoin(GateHold);
+
+#[async_trait::async_trait]
+impl crate::storage::ownership::StorageWorker for HeldJoin {
+	async fn close_and_join(&self) -> std::io::Result<()> {
+		pass_gate_hold(self.0.clone()).await;
+		Ok(())
+	}
+}
+
+/// K1 (DC-308; C5a before and after, the parent 4d9357484 is RED): a copy
+/// promoted by ordinary reads on an owned manager, then the ordinary clean close
+/// (`DataDirectoryOwner::close`, as `Node::shutdown` closes storage) with the
+/// manager alive. The copy's file is gone and the clean-shutdown record is
+/// written. A reopen under a new owner quarantines nothing, reads every row
+/// correctly from L2, promotes the slab at the normal threshold and serves a
+/// later read locally. The text uses only APIs the parent has.
+#[tokio::test]
+async fn a_clean_close_disposes_of_a_promoted_copy_and_the_reopen_promotes_again() {
+	use std::os::unix::fs::MetadataExt;
+	let identity = |path: &Path| {
+		std::fs::symlink_metadata(path)
+			.ok()
+			.map(|meta| (meta.dev(), meta.ino()))
+	};
+	let dir = fresh_dir("adr0132-k1-l1");
+	let l2_root = fresh_dir("adr0132-k1-l2");
+	let dir_path = dir.to_path_buf();
+	let calls = Arc::new(PromotionFetchControl::default());
+	let l2: Arc<dyn ObjectStore> = Arc::new(PromotionFetchFaultStore {
+		inner: Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap()),
+		control: calls.clone(),
+	});
+	let owner = DataDirectoryOwner::acquire_existing(&dir_path).unwrap();
+	let mgr = SlabManager::initialize_new_store_with_owner(
+		tiered_input_config(&dir_path, &l2),
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	let crypto = mgr.config.crypto.clone();
+	let rows: [(Identity, &[u8]); 3] = [
+		(id(0x0132_c501), b"adr0132-k1-row-1"),
+		(id(0x0132_c502), b"adr0132-k1-row-2"),
+		(id(0x0132_c503), b"adr0132-k1-row-3"),
+	];
+	for (key, value) in rows {
+		mgr.append(tenant(), key, hlc(10), value).await.unwrap();
+	}
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/adr0132-k1.wnd").await;
+	let slab = pointer.slab_id;
+	assert!(pointer.is_encrypted, "premise: an encrypted pointer");
+	let threshold = mgr.config.rehydration.promote_after_l2_reads as usize;
+	assert!(threshold >= 1, "premise: promotion is enabled");
+	for (key, _) in rows {
+		let location = mgr
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("premise: the row is indexed");
+		assert_eq!(
+			location.slab_id, slab,
+			"premise: {key} is in the tiered slab"
+		);
+	}
+	let path = slab_path(&dir_path, slab);
+	let (first_key, first_value) = rows[0];
+	let first_location = mgr.lookup(tenant(), first_key).unwrap().unwrap();
+	for n in 1..=threshold {
+		let row = mgr.read(first_location).await.unwrap();
+		assert_eq!(row, first_value, "{first_key}: pre-close read {n}");
+	}
+	assert!(
+		mgr.is_rehydrated(slab).await,
+		"premise: ordinary reads registered a copy"
+	);
+	let before_close = identity(&path).expect("premise: the copy's file is at the slab's path");
+
+	// The ordinary clean close, the manager alive (as Node::shutdown closes).
+	match tokio::time::timeout(Duration::from_secs(10), owner.close(Duration::from_secs(5))).await {
+		Ok(Ok(())) => {}
+		Ok(Err(error)) => panic!("the clean close failed: {error}"),
+		Err(_) => panic!("the clean close did not return within its bound"),
+	}
+	assert_eq!(
+		identity(&path),
+		None,
+		"the copy's file ({before_close:?}) is gone after the clean close"
+	);
+	assert!(
+		dir_path.join("CLEAN_SHUTDOWN").exists(),
+		"the clean close recorded a clean shutdown"
+	);
+	assert!(
+		!mgr.is_rehydrated(slab).await,
+		"no copy is left registered after the close"
+	);
+	drop(mgr);
+	drop(owner);
+
+	// Reopen, as a new process: a new owner and empty key caches.
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	let next =
+		DataDirectoryOwner::acquire_existing(&dir_path).expect("the close released the lock");
+	assert!(
+		next.previous_shutdown_clean(),
+		"the reopen sees a clean shutdown"
+	);
+	let mgr = SlabManager::open_with_owner(
+		SlabManagerConfig {
+			crypto: crypto.clone(),
+			..tiered_input_config(&dir_path, &l2)
+		},
+		next.clone(),
+	)
+	.await
+	.expect("the reopen");
+	tokio::time::timeout(Duration::from_secs(10), mgr.wait_tier_authority_ready())
+		.await
+		.expect("the tier authority is ready in time")
+		.expect("the tier authority is ready");
+	let report = mgr.quarantined_slab_files();
+	assert!(
+		report.files.iter().all(|file| file.slab_id != slab),
+		"the reopen quarantines nothing of the slab: {report:?}"
+	);
+	assert!(mgr.is_tiered(slab).await, "the slab is tiered");
+	assert!(!mgr.is_rehydrated(slab).await, "no copy before the reads");
+
+	// Every row from L2; the slab promotes at the normal threshold.
+	for n in 1..=threshold {
+		let (key, value) = rows[(n - 1) % rows.len()];
+		let location = mgr
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("premise: the row is indexed after the reopen");
+		let before = (calls.get_bytes_calls(), calls.get_range_calls());
+		let row = match mgr.read(location).await {
+			Ok(row) => row,
+			Err(error) => panic!("{key}: post-reopen read {n} failed: {error}"),
+		};
+		assert_eq!(row, value, "{key}: post-reopen read {n}");
+		let fetched = (
+			calls.get_bytes_calls() - before.0,
+			calls.get_range_calls() - before.1,
+		);
+		assert_ne!(
+			fetched,
+			(0, 0),
+			"{key}: post-reopen read {n} is served from L2"
+		);
+		assert_eq!(
+			mgr.is_rehydrated(slab).await,
+			n == threshold,
+			"post-reopen read {n}: the slab promotes at the threshold ({threshold})"
+		);
+	}
+	assert_eq!(mgr.quarantined_slab_files().rehydrations_skipped, 0);
+	for (key, value) in rows {
+		let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+		let before = (calls.get_bytes_calls(), calls.get_range_calls());
+		assert_eq!(
+			mgr.read(location).await.unwrap(),
+			value,
+			"{key}: a later read"
+		);
+		assert_eq!(
+			(
+				calls.get_bytes_calls() - before.0,
+				calls.get_range_calls() - before.1
+			),
+			(0, 0),
+			"{key}: a later read is local"
+		);
+	}
+	let close = next.close(Duration::from_secs(5));
+	let _ = tokio::time::timeout(Duration::from_secs(10), close).await;
+	drop(mgr);
+}
+
+/// K1b: the close's disposal of a copy held inside its unlink job, then inside
+/// its directory sync job, across closes that time out. Neither records a
+/// clean shutdown or releases the lock; once both jobs pass, the repeat
+/// completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_timed_out_in_its_disposal_unlink_or_sync_completes_on_repeat() {
+	use crate::storage::file_ops::blocking_job_seam::{self, Job};
+	let g = gated_promotion_slab("adr0132-k1b", true).await;
+	let owner = gated_owner(&g);
+	promote_gated(&g, "k1b").await;
+	let dir = g.f.mgr.config.dir.clone();
+	let path = g.final_path();
+	let (unlink_in, unlink_release) = held_blocking_job(Job::Unlink, &path, None);
+	let (sync_in, sync_release) = held_blocking_job(Job::FsyncDir, &dir, None);
+	let error = owner
+		.close(Duration::from_millis(300))
+		.await
+		.expect_err("the close times out in the disposal's unlink");
+	assert!(is_shutdown_incomplete(&error), "{error}");
+	gate_hold_entered(&unlink_in, "the disposal's unlink job").await;
+	assert!(path.exists(), "premise: the held unlink has not run");
+	assert!(!clean_record_in(&dir) && lock_held(&dir));
+	unlink_release.send(()).unwrap();
+	gate_hold_entered(&sync_in, "the disposal's directory sync job").await;
+	assert!(!path.exists(), "the unlink ran");
+	let error = owner
+		.close(Duration::from_millis(300))
+		.await
+		.expect_err("the close times out while the sync is held");
+	assert!(is_shutdown_incomplete(&error), "{error}");
+	assert!(!clean_record_in(&dir) && lock_held(&dir));
+	sync_release.send(()).unwrap();
+	owner
+		.close(Duration::from_secs(10))
+		.await
+		.expect("the repeat completes");
+	assert!(clean_record_in(&dir));
+	assert_eq!(g.f.mgr.local_files.phase_for_test(g.slab()), None);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	blocking_job_seam::clear(&path);
+	blocking_job_seam::clear(&dir);
+}
+
+/// K2 (a): a registered copy whose manager is dropped before the owner's close.
+/// The ledger the owner keeps disposes of it through the transient owner-bound
+/// backend: the file is gone, the record is written, and the next owner finds
+/// a clean shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_managers_registered_copy_is_disposed_of_at_close() {
+	let g = gated_promotion_slab("adr0132-k2a", true).await;
+	let owner = gated_owner(&g);
+	promote_gated(&g, "k2a").await;
+	let (dir, path, slab) = (g.f.mgr.config.dir.clone(), g.final_path(), g.slab());
+	let ledger = g.f.mgr.local_files.clone();
+	let _dirs = drop_promotion_manager(g).await;
+	owner
+		.close(Duration::from_secs(10))
+		.await
+		.expect("the close disposes of the copy without its manager");
+	assert!(!path.exists(), "the copy's file is gone");
+	assert_eq!(ledger.registered_for_test(slab), None);
+	assert_eq!(ledger.phase_for_test(slab), None);
+	assert!(clean_record_in(&dir));
+	drop(owner);
+	let next = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	assert!(next.previous_shutdown_clean());
+}
+
+/// K2 (b), constructed: an owed copy release and a sync-only copy release
+/// (both owed through the ledger's own entry point; the sync-only one reached
+/// by a runtime release whose directory syncs failed), then the manager
+/// dropped. The close settles both through the transient backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_managers_owed_and_sync_owed_copy_releases_are_settled_at_close() {
+	let g = gated_promotion_slab("adr0132-k2b", true).await;
+	let owner = gated_owner(&g);
+	let dir = g.f.mgr.config.dir.clone();
+	let ledger = g.f.mgr.local_files.clone();
+	let (owed, sync_owed) = (SlabId::new(0x7132_2b01), SlabId::new(0x7132_2b02));
+	for slab in [owed, sync_owed] {
+		let path = slab_path(&dir, slab);
+		std::fs::write(&path, b"a released copy (constructed)").unwrap();
+		let identity = file_identity_at(&path).unwrap();
+		ledger.owe(slab, identity, local_file_ledger::ReleaseOrigin::Copy);
+	}
+	g.gate.fail_fsync_dirs(3);
+	assert!(
+		g.f.mgr.unlink_released_slab_file(sync_owed).await.is_err(),
+		"premise: the runtime release's syncs fail"
+	);
+	assert_eq!(ledger.phase_for_test(sync_owed), Some("sync_owed"));
+	assert!(
+		!slab_path(&dir, sync_owed).exists(),
+		"premise: the unlink stands"
+	);
+	assert_eq!(ledger.phase_for_test(owed), Some("owed"));
+	let _dirs = drop_promotion_manager(g).await;
+	owner
+		.close(Duration::from_secs(10))
+		.await
+		.expect("the close settles both");
+	assert!(!slab_path(&dir, owed).exists(), "the owed copy is unlinked");
+	assert_eq!(ledger.phase_for_test(owed), None);
+	assert_eq!(
+		ledger.phase_for_test(sync_owed),
+		None,
+		"its sync was settled"
+	);
+	assert!(clean_record_in(&dir));
+}
+
+/// K2 (c): a manager with nothing to dispose of, dropped before the close:
+/// the settle is `Ok` and the record is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_manager_with_nothing_owed_closes_clean() {
+	let g = gated_promotion_slab("adr0132-k2c", true).await;
+	let owner = gated_owner(&g);
+	let dir = g.f.mgr.config.dir.clone();
+	let _dirs = drop_promotion_manager(g).await;
+	owner.close(Duration::from_secs(10)).await.unwrap();
+	assert!(owner.close_settled_for_test());
+	assert!(clean_record_in(&dir));
+}
+
+/// K3: an installer held at its write when close begins. The first drain waits
+/// for it; it registers its copy through its child permits; the settle then
+/// disposes of that copy, and the record follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_installers_copy_is_registered_then_disposed_of_by_the_close() {
+	let g = gated_promotion_slab("adr0132-k3", true).await;
+	let owner = gated_owner(&g);
+	let dir = g.f.mgr.config.dir.clone();
+	let (task, release) = spawn_held_installer(&g, "k3").await;
+	let outcome =
+		g.f.mgr
+			.rehydration_outcome_for_test(g.slab())
+			.expect("premise: the held installer's outcome");
+	let closing = {
+		let owner = owner.clone();
+		tokio::spawn(async move { owner.close(Duration::from_secs(30)).await })
+	};
+	owner.wait_until_closing().await;
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	assert!(
+		!closing.is_finished(),
+		"the first drain waits for the installer"
+	);
+	assert!(!clean_record_in(&dir));
+	release.add_permits(1);
+	assert_eq!(released_promotion_read(task, "k3").await, PROMOTION_ROW);
+	assert_eq!(
+		installer_outcome(outcome, "k3").await,
+		rehydration_install::InstallOutcome::Registered,
+		"the late installer registered its copy"
+	);
+	tokio::time::timeout(Duration::from_secs(30), closing)
+		.await
+		.expect("the close completes")
+		.unwrap()
+		.expect("the close completes cleanly");
+	assert!(
+		!g.final_path().exists(),
+		"the close disposed of the late copy"
+	);
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	assert_eq!(g.f.mgr.local_files.registered_for_test(g.slab()), None);
+	assert_eq!(g.f.mgr.local_files.phase_for_test(g.slab()), None);
+	assert!(clean_record_in(&dir));
+}
+
+/// K4: another file replaced the copy at its path before the close. The settle
+/// leaves it, with a warning, and the close completes; the reopen quarantines
+/// it as evidence, and the row reads correctly from L2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_leaves_a_file_that_replaced_the_copy_and_the_reopen_quarantines_it() {
+	let g = gated_promotion_slab("adr0132-k4", true).await;
+	let owner = gated_owner(&g);
+	let copy = promote_gated(&g, "k4").await;
+	let (dir, path, slab) = (g.f.mgr.config.dir.clone(), g.final_path(), g.slab());
+	std::fs::remove_file(&path).unwrap();
+	std::fs::write(&path, b"another file").unwrap();
+	let other = file_identity_at(&path).unwrap();
+	assert_ne!(other, copy, "premise: another inode");
+	owner
+		.close(Duration::from_secs(10))
+		.await
+		.expect("a file of another identity does not fail the close");
+	assert_eq!(
+		file_identity_at(&path),
+		Some(other),
+		"the other file is left"
+	);
+	assert_eq!(std::fs::read(&path).unwrap(), b"another file");
+	assert!(clean_record_in(&dir));
+	let (l2, crypto) = (g.l2.clone(), g.f.mgr.config.crypto.clone());
+	let _dirs = drop_promotion_manager(g).await;
+	drop(owner);
+	let (next, mgr) = reopen_promotion_dir(&dir, &l2, crypto).await;
+	let report = mgr.quarantined_slab_files();
+	assert!(
+		report.files.iter().any(|file| {
+			file.slab_id == slab && file.reason == DisagreeingSlabFileReason::TierPointer
+		}),
+		"the reopen quarantines the other file: {report:?}"
+	);
+	let location = mgr.lookup(tenant(), id(0x3040_0001)).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), PROMOTION_ROW);
+	assert_eq!(file_identity_at(&path), Some(other));
+	let _ = next.close(Duration::from_secs(10)).await;
+}
+
+/// K5: the disposal's unlink fails persistently. The close returns
+/// `ShutdownIncomplete` before any join, with no record and the lock held; the
+/// copy release is owed again. Once the fault clears, the repeat settles and
+/// joins, and the record follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_disposal_fails_the_close_and_its_repeat_settles() {
+	use crate::storage::file_ops::blocking_job_seam::{self, Action, Job};
+	let g = gated_promotion_slab("adr0132-k5", true).await;
+	let owner = gated_owner(&g);
+	let copy = promote_gated(&g, "k5").await;
+	let (dir, path, slab) = (g.f.mgr.config.dir.clone(), g.final_path(), g.slab());
+	let joins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	owner
+		.register_worker(Arc::new(CountedJoins(joins.clone())))
+		.unwrap();
+	blocking_job_seam::arm(Job::Unlink, &path, Action::Fail(3));
+	let error = owner
+		.close(Duration::from_secs(10))
+		.await
+		.expect_err("the disposal fails");
+	assert!(is_shutdown_incomplete(&error), "{error}");
+	assert_eq!(
+		joins.load(Ordering::SeqCst),
+		0,
+		"no join after a failed settle"
+	);
+	assert!(!owner.close_settled_for_test());
+	assert_eq!(file_identity_at(&path), Some(copy), "the copy stays");
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("owed"));
+	assert_eq!(
+		g.f.mgr.local_files.origin_for_test(slab),
+		Some(local_file_ledger::ReleaseOrigin::Copy)
+	);
+	assert!(!clean_record_in(&dir) && lock_held(&dir));
+	owner
+		.close(Duration::from_secs(10))
+		.await
+		.expect("the repeat settles once the fault cleared");
+	assert_eq!(joins.load(Ordering::SeqCst), 1);
+	assert!(!path.exists());
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), None);
+	assert!(clean_record_in(&dir));
+	blocking_job_seam::clear(&path);
+}
+
+/// K8, naturally reachable: a registered copy meets the real collision
+/// quarantine (`quarantine_bootstrap_collision_locked`). Its file is evidence:
+/// the registration goes, and no release of it is recorded. With the manager
+/// then dropped, the owner's close leaves the same inode, and the reopen's
+/// quarantine report names it with its evidence intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_that_became_collision_evidence_survives_the_close_and_the_reopen() {
+	let g = gated_promotion_slab("adr0132-k8", true).await;
+	let owner = gated_owner(&g);
+	let copy = promote_gated(&g, "k8").await;
+	let (dir, path, slab) = (g.f.mgr.config.dir.clone(), g.final_path(), g.slab());
+	let bytes = std::fs::read(&path).unwrap();
+	g.f.mgr
+		.quarantine_collision_for_test(slab)
+		.await
+		.expect("the collision quarantine");
+	assert!(
+		!g.f.mgr.is_rehydrated(slab).await,
+		"the copy no longer serves"
+	);
+	assert!(
+		g.f.mgr
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab),
+		"the copy's file is evidence"
+	);
+	assert_eq!(
+		g.f.mgr.local_files.registered_for_test(slab),
+		None,
+		"no registration authorizes its unlink"
+	);
+	assert_eq!(
+		g.f.mgr.local_files.phase_for_test(slab),
+		None,
+		"no release of it is recorded"
+	);
+	let (l2, crypto) = (g.l2.clone(), g.f.mgr.config.crypto.clone());
+	let _dirs = drop_promotion_manager(g).await;
+	owner.close(Duration::from_secs(10)).await.unwrap();
+	assert_eq!(
+		file_identity_at(&path),
+		Some(copy),
+		"the same inode survives the close"
+	);
+	assert_eq!(
+		std::fs::read(&path).unwrap(),
+		bytes,
+		"its evidence is intact"
+	);
+	assert!(clean_record_in(&dir));
+	drop(owner);
+	let (next, mgr) = reopen_promotion_dir(&dir, &l2, crypto).await;
+	let report = mgr.quarantined_slab_files();
+	assert!(
+		report.files.iter().any(|file| {
+			file.slab_id == slab
+				&& file.reason == DisagreeingSlabFileReason::TierPointer
+				&& file.bytes == bytes.len() as u64
+		}),
+		"the reopen's report names the evidence: {report:?}"
+	);
+	assert_eq!(file_identity_at(&path), Some(copy));
+	let location = mgr.lookup(tenant(), id(0x3040_0001)).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), PROMOTION_ROW);
+	let _ = next.close(Duration::from_secs(10)).await;
+}
+
+/// K8, constructed debt (an owed copy release of the very copy, injected
+/// through the ledger while the copy is registered): the collision withdraws
+/// its unlink authority and keeps the file; the close leaves the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_an_owed_copy_release_is_withdrawn_when_its_file_becomes_evidence() {
+	let g = gated_promotion_slab("adr0132-k8-owed", true).await;
+	let owner = gated_owner(&g);
+	let copy = promote_gated(&g, "k8 owed").await;
+	let (path, slab) = (g.final_path(), g.slab());
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Copy);
+	g.f.mgr.quarantine_collision_for_test(slab).await.unwrap();
+	assert_eq!(
+		g.f.mgr.local_files.phase_for_test(slab),
+		None,
+		"the owed release is withdrawn"
+	);
+	assert_eq!(file_identity_at(&path), Some(copy), "the file is kept");
+	owner.close(Duration::from_secs(10)).await.unwrap();
+	assert_eq!(file_identity_at(&path), Some(copy), "the close leaves it");
+}
+
+/// K8, constructed debt (an owed copy release of the very copy, injected, then
+/// claimed by a runtime release held inside its unlink): the collision waits
+/// (`WouldBlock`) and records nothing. The held unlink then fails, so the
+/// release is owed again, and the retry reads that state afresh: it withdraws
+/// the release and quarantines the file it keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_collision_waits_for_an_unlinking_copy_release_then_acts_on_what_is_left() {
+	let g = gated_promotion_slab("adr0132-k8-unlinking", true).await;
+	let copy = promote_gated(&g, "k8 unlinking").await;
+	let (path, slab) = (g.final_path(), g.slab());
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Copy);
+	let (entered, release) = g.gate.hold_next_unlink(&g.final_suffix());
+	g.gate.fail_unlinks(&g.final_suffix(), 3);
+	let waiter = {
+		let mgr = g.f.mgr.clone();
+		tokio::spawn(async move { mgr.unlink_released_slab_file(slab).await })
+	};
+	gate_hold_entered(&entered, "the runtime release's unlink").await;
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("unlinking"));
+	let error =
+		g.f.mgr
+			.quarantine_collision_for_test(slab)
+			.await
+			.expect_err("the collision waits for the release in flight");
+	assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}");
+	assert!(
+		g.f.mgr
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.all(|file| file.slab_id != slab),
+		"nothing is recorded"
+	);
+	assert!(g.f.mgr.is_rehydrated(slab).await, "the copy is untouched");
+	assert_eq!(g.f.mgr.local_files.registered_for_test(slab), Some(copy));
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("unlinking"));
+	release.add_permits(1);
+	assert!(waiter.await.unwrap().is_err(), "premise: the unlink failed");
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("owed"));
+	g.f.mgr
+		.quarantine_collision_for_test(slab)
+		.await
+		.expect("the retry acts on the owed release");
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), None, "withdrawn");
+	assert!(
+		g.f.mgr
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab)
+	);
+	assert_eq!(file_identity_at(&path), Some(copy), "the file is kept");
+}
+
+/// The collision changed nothing: the copy still serves, registered by its
+/// identity, its release (if any) stands in `phase`, and nothing of the slab
+/// is quarantined.
+async fn assert_collision_changed_nothing(
+	g: &GatedPromotion,
+	copy: (u64, u64),
+	phase: Option<&str>,
+	what: &str,
+) {
+	let slab = g.slab();
+	assert!(g.f.mgr.is_rehydrated(slab).await, "{what}: the copy serves");
+	assert_eq!(
+		g.f.mgr.local_files.registered_for_test(slab),
+		Some(copy),
+		"{what}: the registration stands"
+	);
+	assert_eq!(
+		g.f.mgr.local_files.phase_for_test(slab),
+		phase,
+		"{what}: the release stands as it was"
+	);
+	assert!(
+		g.f.mgr
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.all(|file| file.slab_id != slab),
+		"{what}: nothing is quarantined"
+	);
+}
+
+/// K8, constructed debt (as above, but the held unlink succeeds): the retry
+/// finds the release settled and no file. Absence alone proves nothing, so
+/// the collision refuses `NotFound` and changes nothing: the registration
+/// stays, and nothing is quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_collision_after_its_copy_release_settled_refuses_the_missing_file() {
+	let g = gated_promotion_slab("adr0132-k8-settled", true).await;
+	let copy = promote_gated(&g, "k8 settled").await;
+	let (path, slab) = (g.final_path(), g.slab());
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Copy);
+	let (entered, release) = g.gate.hold_next_unlink(&g.final_suffix());
+	let waiter = {
+		let mgr = g.f.mgr.clone();
+		tokio::spawn(async move { mgr.unlink_released_slab_file(slab).await })
+	};
+	gate_hold_entered(&entered, "the runtime release's unlink").await;
+	let error =
+		g.f.mgr
+			.quarantine_collision_for_test(slab)
+			.await
+			.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}");
+	release.add_permits(1);
+	waiter.await.unwrap().expect("premise: the release settled");
+	assert!(!path.exists(), "premise: the file is gone");
+	let error =
+		g.f.mgr
+			.quarantine_collision_for_test(slab)
+			.await
+			.expect_err("a missing file is refused");
+	assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+	assert_collision_changed_nothing(&g, copy, None, "after the refusal").await;
+}
+
+/// D5: a registered copy whose file was removed out from under it, with no
+/// release ever run. The collision refuses `NotFound` and changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collision_refuses_a_registered_copy_whose_file_vanished_without_a_release() {
+	let g = gated_promotion_slab("adr0132-k8-vanished", true).await;
+	let copy = promote_gated(&g, "k8 vanished").await;
+	std::fs::remove_file(g.final_path()).unwrap();
+	assert_eq!(
+		g.f.mgr.local_files.phase_for_test(g.slab()),
+		None,
+		"premise: no release"
+	);
+	let error =
+		g.f.mgr
+			.quarantine_collision_for_test(g.slab())
+			.await
+			.expect_err("a missing file is refused");
+	assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+	assert_collision_changed_nothing(&g, copy, None, "after the refusal").await;
+}
+
+/// D5 (a), constructed debt (an owed copy release of the very copy, injected
+/// through the ledger): the collision's preparation fails (its length read of
+/// the file, through the test gate). The release is still owed, the copy still
+/// registered, and nothing is quarantined; the retry then publishes the
+/// evidence and withdraws the release together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_failed_collision_preparation_leaves_the_owed_release_and_the_copy() {
+	let g = gated_promotion_slab("adr0132-k8-failed", true).await;
+	let copy = promote_gated(&g, "k8 failed").await;
+	let slab = g.slab();
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Copy);
+	g.gate.fail_file_lens(&g.final_suffix(), 1);
+	assert!(
+		g.f.mgr.quarantine_collision_for_test(slab).await.is_err(),
+		"premise: the preparation fails"
+	);
+	assert_collision_changed_nothing(&g, copy, Some("owed"), "after the failure").await;
+	g.f.mgr
+		.quarantine_collision_for_test(slab)
+		.await
+		.expect("the retry publishes the evidence");
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), None, "withdrawn");
+	assert_eq!(g.f.mgr.local_files.registered_for_test(slab), None);
+	assert!(
+		g.f.mgr
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab)
+	);
+	assert_eq!(file_identity_at(&g.final_path()), Some(copy), "kept");
+}
+
+/// D5 (b), constructed debt (as above): the collision is cancelled inside its
+/// fallible preparation (held in its length read). Meanwhile the held release
+/// refuses every claim, so no unlink can take the file; once cancelled, the
+/// release is owed again, the copy still registered, and nothing quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_cancelled_collision_preparation_leaves_the_owed_release_and_the_copy() {
+	let g = gated_promotion_slab("adr0132-k8-cancelled", true).await;
+	let copy = promote_gated(&g, "k8 cancelled").await;
+	let slab = g.slab();
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Copy);
+	let (entered, _release) = g.gate.hold_next_file_len(&g.final_suffix());
+	let collision = {
+		let mgr = g.f.mgr.clone();
+		tokio::spawn(async move { mgr.quarantine_collision_for_test(slab).await })
+	};
+	gate_hold_entered(&entered, "the collision's length read").await;
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("withheld"));
+	let refused =
+		g.f.mgr
+			.unlink_released_slab_file(slab)
+			.await
+			.expect_err("the held release refuses a claim");
+	assert_eq!(refused.kind(), ErrorKind::WouldBlock, "{refused}");
+	assert_eq!(
+		file_identity_at(&g.final_path()),
+		Some(copy),
+		"not unlinked"
+	);
+	collision.abort();
+	assert!(collision.await.unwrap_err().is_cancelled());
+	assert_collision_changed_nothing(&g, copy, Some("owed"), "after the cancellation").await;
+}
+
+/// D5 (c), constructed debt (an owed release of origin `Backing` naming the
+/// very file of the registered copy): its unlink authority stands, so the
+/// collision refuses (`WouldBlock`) and publishes no evidence over it; the
+/// release and the copy are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_collision_refuses_an_owed_backing_release_of_the_same_file() {
+	let g = gated_promotion_slab("adr0132-k8-backing-same", true).await;
+	let copy = promote_gated(&g, "k8 backing same").await;
+	let slab = g.slab();
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Backing);
+	let error =
+		g.f.mgr
+			.quarantine_collision_for_test(slab)
+			.await
+			.expect_err("the collision refuses");
+	assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}");
+	assert_collision_changed_nothing(&g, copy, Some("owed"), "after the refusal").await;
+	assert_eq!(
+		g.f.mgr.local_files.origin_for_test(slab),
+		Some(local_file_ledger::ReleaseOrigin::Backing)
+	);
+	assert_eq!(g.f.mgr.local_files.identity_for_test(slab), Some(copy));
+	assert_eq!(file_identity_at(&g.final_path()), Some(copy));
+}
+
+/// K8, constructed debt (a `Backing` release of another identity, injected
+/// while the copy is registered): the collision leaves it exactly as it was,
+/// and so does the close settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_backing_release_of_another_identity_is_unchanged_by_the_collision() {
+	let g = gated_promotion_slab("adr0132-k8-backing", true).await;
+	let owner = gated_owner(&g);
+	let copy = promote_gated(&g, "k8 backing").await;
+	let (path, slab) = (g.final_path(), g.slab());
+	let foreign = (copy.0, copy.1.wrapping_add(1));
+	g.f.mgr
+		.local_files
+		.owe(slab, foreign, local_file_ledger::ReleaseOrigin::Backing);
+	g.f.mgr.quarantine_collision_for_test(slab).await.unwrap();
+	let unchanged = |mgr: &SlabManager| {
+		(
+			mgr.local_files.identity_for_test(slab),
+			mgr.local_files.origin_for_test(slab),
+			mgr.local_files.phase_for_test(slab),
+		)
+	};
+	let expected = (
+		Some(foreign),
+		Some(local_file_ledger::ReleaseOrigin::Backing),
+		Some("owed"),
+	);
+	assert_eq!(
+		unchanged(g.f.mgr.as_ref()),
+		expected,
+		"the collision left it"
+	);
+	owner.close(Duration::from_secs(10)).await.unwrap();
+	assert_eq!(
+		unchanged(g.f.mgr.as_ref()),
+		expected,
+		"the close settle left it"
+	);
+	assert_eq!(file_identity_at(&path), Some(copy), "the evidence stays");
+}
+
+/// K8b: a copy release unlinks the copy, but its directory syncs fail
+/// (`SyncOwed`). A replacement file at the path, of another inode, is then
+/// quarantined by the collision while the sync-only debt is kept (the copy's
+/// registration with the old identity is constructed: from the reachable
+/// transitions a sync-owed copy release leaves `rehydrated` without the slab,
+/// so the release is owed here through the ledger while the copy stays
+/// registered). The retried sync discharges the debt, the replacement keeps
+/// its identity, and no debt is left over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_a_sync_owed_copy_release_survives_a_collision_with_its_replacement() {
+	let g = gated_promotion_slab("adr0132-k8b", true).await;
+	let owner = gated_owner(&g);
+	let copy = promote_gated(&g, "k8b").await;
+	let (dir, path, slab) = (g.f.mgr.config.dir.clone(), g.final_path(), g.slab());
+	g.f.mgr
+		.local_files
+		.owe(slab, copy, local_file_ledger::ReleaseOrigin::Copy);
+	g.gate.fail_fsync_dirs(3);
+	assert!(
+		g.f.mgr.unlink_released_slab_file(slab).await.is_err(),
+		"premise: the release's syncs fail"
+	);
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("sync_owed"));
+	assert!(!path.exists(), "premise: the unlink stands");
+	std::fs::write(&path, b"a replacement").unwrap();
+	let replacement = file_identity_at(&path).unwrap();
+	assert_ne!(replacement, copy);
+	g.f.mgr
+		.quarantine_collision_for_test(slab)
+		.await
+		.expect("the collision quarantines the replacement");
+	let report = g.f.mgr.quarantined_slab_files();
+	assert!(
+		report
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab && file.bytes == b"a replacement".len() as u64),
+		"the replacement is quarantined by what it is: {report:?}"
+	);
+	assert_eq!(
+		g.f.mgr.local_files.phase_for_test(slab),
+		Some("sync_owed"),
+		"the sync-only debt is kept"
+	);
+	assert_eq!(g.f.mgr.local_files.identity_for_test(slab), Some(copy));
+	g.f.mgr
+		.unlink_released_slab_file(slab)
+		.await
+		.expect("the retried sync discharges the debt");
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), None);
+	assert_eq!(
+		file_identity_at(&path),
+		Some(replacement),
+		"the replacement keeps its identity"
+	);
+	owner.close(Duration::from_secs(10)).await.unwrap();
+	assert_eq!(file_identity_at(&path), Some(replacement));
+	assert!(clean_record_in(&dir));
+}
+
+/// K9, a direct owner: a read held inside its local read of the copy while
+/// the close's settle unlinks that copy. Released before the joins (a first
+/// test worker holds them), the read returns the correct row from the handle
+/// it holds; reads after the joins are not relied on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_held_in_the_copy_while_the_close_disposes_of_it_returns_its_row() {
+	let g = gated_promotion_slab("adr0132-k9", true).await;
+	let owner = gated_owner(&g);
+	promote_gated(&g, "k9").await;
+	let (dir, path) = (g.f.mgr.config.dir.clone(), g.final_path());
+	let joins = gate_hold();
+	owner.register_first_test_worker(Arc::new(HeldJoin(joins.clone())));
+	let (read_in, read_release) = g.gate.hold_next_read(&path);
+	let read = {
+		let mgr = g.f.mgr.clone();
+		let location = g.f.location;
+		tokio::spawn(async move { mgr.read(location).await })
+	};
+	gate_hold_entered(&read_in, "the local read of the copy").await;
+	let closing = {
+		let owner = owner.clone();
+		tokio::spawn(async move { owner.close(Duration::from_secs(30)).await })
+	};
+	wait_until("the settle unlinks the copy", || !path.exists()).await;
+	gate_hold_entered(&joins.0, "the joins").await;
+	assert!(!closing.is_finished());
+	read_release.add_permits(1);
+	assert_eq!(released_promotion_read(read, "k9").await, PROMOTION_ROW);
+	joins.1.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(30), closing)
+		.await
+		.expect("the close completes")
+		.unwrap()
+		.unwrap();
+	assert!(clean_record_in(&dir));
+}
+
+/// K12: an owned manager over the production backend (owner-bound
+/// `IoUringFileOps::with_isolated_blocking`, under the test gate) with a
+/// registered copy, dropped with every owner clone and never closed. The lock
+/// is released promptly, so nothing cycles through the ledger, and the copy's
+/// file stays, as an unclean exit leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_dropped_without_close_with_a_registered_copy_releases_its_lock() {
+	let g = gated_promotion_slab("adr0132-k12", true).await;
+	let copy = promote_gated(&g, "k12").await;
+	let (dir, path) = (g.f.mgr.config.dir.clone(), g.final_path());
+	let _dirs = drop_promotion_manager(g).await;
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+	let next = loop {
+		match DataDirectoryOwner::acquire_existing(&dir) {
+			Ok(next) => break next,
+			Err(error) => {
+				assert!(
+					tokio::time::Instant::now() < deadline,
+					"the dropped owner never released its lock: {error}"
+				);
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		}
+	};
+	assert!(!next.previous_shutdown_clean(), "an unclean exit");
+	assert_eq!(
+		file_identity_at(&path),
+		Some(copy),
+		"the copy is left as an unclean exit leaves it"
+	);
+}
+
+/// K13, constructed: an owed release of origin `Backing` (a sealed slab file,
+/// as publication releases one; owed here through the ledger) at close. The
+/// close settle never touches it: the file and the entry stay as they were,
+/// and the close still records a clean shutdown, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constructed_an_owed_backing_release_is_left_by_the_close_settle() {
+	let g = gated_promotion_slab("adr0132-k13", true).await;
+	let owner = gated_owner(&g);
+	let dir = g.f.mgr.config.dir.clone();
+	let slab = SlabId::new(0x7132_0d13);
+	let path = slab_path(&dir, slab);
+	std::fs::write(&path, b"a released sealed slab (constructed)").unwrap();
+	let identity = file_identity_at(&path).unwrap();
+	g.f.mgr
+		.local_files
+		.owe(slab, identity, local_file_ledger::ReleaseOrigin::Backing);
+	owner.close(Duration::from_secs(10)).await.unwrap();
+	assert_eq!(file_identity_at(&path), Some(identity), "the file stays");
+	assert_eq!(g.f.mgr.local_files.phase_for_test(slab), Some("owed"));
+	assert_eq!(
+		g.f.mgr.local_files.origin_for_test(slab),
+		Some(local_file_ledger::ReleaseOrigin::Backing)
+	);
+	assert!(clean_record_in(&dir));
+}
+
+/// K14: the disposal's unlink held inside its actual blocking job (the seam
+/// runs in the job's closure, after its write permit moved in), with the
+/// close's caller timed out and a second caller cancelled. When the job
+/// completes it observes no record and the lock still held; only then do the
+/// second drain, the record and the lock's release follow. A leftover
+/// temporary name (the kind ADR 0131 inhibits promotion on) is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_disposal_job_finishes_before_the_drain_the_record_and_the_lock() {
+	use crate::storage::file_ops::blocking_job_seam::{self, Job};
+	let g = gated_promotion_slab("adr0132-k14", true).await;
+	let owner = gated_owner(&g);
+	promote_gated(&g, "k14").await;
+	let (dir, path, tmp) = (g.f.mgr.config.dir.clone(), g.final_path(), g.tmp_path());
+	std::fs::write(&tmp, b"a leftover temporary name").unwrap();
+	let tmp_identity = file_identity_at(&tmp).unwrap();
+	let observed = Arc::new(std::sync::Mutex::new(None));
+	let after: Box<dyn FnOnce() + Send> = {
+		let (observed, dir) = (observed.clone(), dir.clone());
+		Box::new(move || {
+			*observed.lock().unwrap() = Some((clean_record_in(&dir), lock_held(&dir)));
+		})
+	};
+	let (job_in, job_release) = held_blocking_job(Job::Unlink, &path, Some(after));
+	let error = owner
+		.close(Duration::from_millis(300))
+		.await
+		.expect_err("the close's caller times out on the held job");
+	assert!(is_shutdown_incomplete(&error), "{error}");
+	gate_hold_entered(&job_in, "the disposal's blocking unlink").await;
+	let cancelled = {
+		let owner = owner.clone();
+		tokio::spawn(async move { owner.close(Duration::from_secs(30)).await })
+	};
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	cancelled.abort();
+	assert!(cancelled.await.unwrap_err().is_cancelled());
+	assert!(path.exists() && !clean_record_in(&dir) && lock_held(&dir));
+	let closing = {
+		let owner = owner.clone();
+		tokio::spawn(async move { owner.close(Duration::from_secs(30)).await })
+	};
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	assert!(!closing.is_finished(), "the drain waits for the held job");
+	job_release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(30), closing)
+		.await
+		.expect("the close completes")
+		.unwrap()
+		.expect("the close completes cleanly");
+	assert_eq!(
+		*observed.lock().unwrap(),
+		Some((false, true)),
+		"when the job completed there was no record and the lock was held"
+	);
+	assert!(!path.exists());
+	assert!(clean_record_in(&dir));
+	assert_eq!(file_identity_at(&tmp), Some(tmp_identity), "untouched");
+	blocking_job_seam::clear(&path);
+	drop(owner);
+	assert!(
+		DataDirectoryOwner::acquire_existing(&dir).is_ok(),
+		"the lock was released"
+	);
+}
+
+/// ADR 0132 D5 census guard, behavioural half: an eviction (`Release`) and a
+/// publication of the same pointer (`Release`, the copy half) each withdraw
+/// the copy's registration in the same step that records its release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_copy_removal_withdraws_its_registration_with_its_release() {
+	let g = gated_promotion_slab("adr0132-d5", true).await;
+	let owner = gated_owner(&g);
+	promote_gated(&g, "d5 eviction").await;
+	assert!(g.f.mgr.drop_rehydrated_slab(g.slab()).await.unwrap());
+	assert_eq!(g.f.mgr.local_files.registered_for_test(g.slab()), None);
+	assert_eq!(g.f.mgr.local_files.phase_for_test(g.slab()), None);
+	assert!(!g.final_path().exists());
+	promote_gated(&g, "d5 publication").await;
+	replay_same_pointer(&g.f).await;
+	assert!(!g.f.mgr.is_rehydrated(g.slab()).await);
+	assert_eq!(g.f.mgr.local_files.registered_for_test(g.slab()), None);
+	assert_eq!(g.f.mgr.local_files.phase_for_test(g.slab()), None);
+	assert!(!g.final_path().exists());
+	owner.close(Duration::from_secs(10)).await.unwrap();
 }

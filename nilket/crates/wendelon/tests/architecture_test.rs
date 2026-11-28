@@ -9769,6 +9769,9 @@ fn adr078_manager_source_concatenates_submodules() {
 			"encoding_compute.rs",
 			"gc_disposal.rs",
 			"index_publication.rs",
+			// Wendelon ADR 0132: the copy files a clean close disposes of, kept with the
+			// directory owner.
+			"local_file_ledger.rs",
 			// ADR 0699 S4: the poison-recovery lock helpers, moved out of the root.
 			"lock_recovery.rs",
 			"lsm_driver.rs",
@@ -12848,7 +12851,10 @@ fn an_unclassified_lifecycle_permit_site_fails_the_census() {
 /// its owner closes, so it stays narrow. Only the rehydration installer's
 /// handoff and the release settler's claim take one, only their two task
 /// bodies run inside one, and the task-local scope lives in `ownership.rs`
-/// alone. A classification guard; the behavioural controls are the evidence.
+/// alone. Wendelon ADR 0132 D2: only the settler claim mints a child
+/// operation, only the local file ledger registers a close settler, and only
+/// the settle phase of `close` mints a settle's operation. A classification
+/// guard; the behavioural controls are the evidence.
 #[test]
 fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operations() {
 	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -12856,6 +12862,9 @@ fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operatio
 	let mut scoped = Vec::new();
 	let mut typed = Vec::new();
 	let mut task_local = Vec::new();
+	let mut children = Vec::new();
+	let mut settlers = Vec::new();
+	let mut settler_impls = Vec::new();
 	walk_dir(&src, &mut |path| {
 		let name = path.file_name().unwrap().to_string_lossy().into_owned();
 		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
@@ -12873,6 +12882,19 @@ fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operatio
 			&["admitted_operation()", "::admitted_operation"],
 		));
 		scoped.extend(production_call_sites(&file, &source, &["operation.run("]));
+		children.extend(production_call_sites(
+			&file,
+			&source,
+			&["child_operation()", ".child_operation("],
+		));
+		settlers.extend(production_call_sites(
+			&file,
+			&source,
+			&[".register_close_settler("],
+		));
+		if production_part(&source).contains("impl CloseSettler for ") {
+			settler_impls.push(file.clone());
+		}
 		if production_part(&source).contains("AdmittedOperation") {
 			typed.push(file.clone());
 		}
@@ -12920,12 +12942,32 @@ fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operatio
 	assert_eq!(
 		typed,
 		vec![
+			"storage/manager/local_file_ledger.rs".to_string(),
 			"storage/manager/rehydration_install.rs".to_string(),
 			"storage/manager/slab_file_quarantine.rs".to_string(),
 			"storage/ownership.rs".to_string(),
 		]
 	);
 	assert_eq!(task_local, vec!["storage/ownership.rs".to_string()]);
+	children.sort();
+	assert_eq!(
+		children,
+		owned(&[(
+			"storage/manager/slab_file_quarantine.rs",
+			"claim_released_slab_file"
+		)]),
+		"a child operation minted outside the settler claim"
+	);
+	settlers.sort();
+	assert_eq!(
+		settlers,
+		owned(&[("storage/manager/local_file_ledger.rs", "bind")]),
+		"a close settler registered outside the local file ledger"
+	);
+	assert_eq!(
+		settler_impls,
+		vec!["storage/manager/local_file_ledger.rs".to_string()]
+	);
 	// The child permit is minted at the one write admission, only for the same
 	// owner, and only while it closes; every other admission stays fenced.
 	let ownership = fs::read_to_string(src.join("storage/ownership.rs")).unwrap();
@@ -12936,7 +12978,12 @@ fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operatio
 	assert!(
 		manager_method_body(&ownership, "in_admitted_scope").contains("Arc::as_ptr(&self.inner)")
 	);
-	for fenced in ["lifecycle_permit", "admitted_operation", "register_worker"] {
+	for fenced in [
+		"lifecycle_permit",
+		"admitted_operation",
+		"register_worker",
+		"register_close_settler",
+	] {
 		let body = manager_method_body(&ownership, fenced);
 		assert!(
 			body.contains("if state.phase != OwnerPhase::Active {")
@@ -12944,6 +12991,137 @@ fn only_the_rehydration_installer_and_the_release_settler_take_admitted_operatio
 			"{fenced} stays fenced once close began"
 		);
 	}
+	// Wendelon ADR 0132 D2: an operation is minted only by the fenced admission,
+	// from an outstanding parent, or by the settle phase of `close`.
+	let construction = "AdmittedOperation {\n\t\t\tinner: self.inner.clone(),";
+	assert_eq!(production_part(&ownership).matches(construction).count(), 3);
+	for minted in ["admitted_operation", "child_operation", "settle_operation"] {
+		assert!(
+			manager_method_body(&ownership, minted).contains(construction),
+			"{minted} mints an operation"
+		);
+	}
+	assert_eq!(
+		production_call_sites("storage/ownership.rs", &ownership, &[".settle_operation("],),
+		owned(&[("storage/ownership.rs", "settle_registered")]),
+		"a settle's operation minted outside the settle phase"
+	);
+	// One deadline from entry bounds the gate as well: the gate is the first
+	// step of the one future the deadline bounds, and is taken nowhere else.
+	// The settle runs between two drains and is recorded before any join and
+	// the clean-shutdown record.
+	let close = manager_method_body(&ownership, "close");
+	assert_eq!(close.matches("close_gate").count(), 1);
+	assert_eq!(close.matches("closing.await").count(), 1);
+	let order: Vec<_> = [
+		"let deadline = tokio::time::Instant::now().checked_add(bound);",
+		"self.begin_close();",
+		"let closing = async {\n\t\t\tlet _close = self.inner.close_gate.lock().await;",
+		"self.drain().await;",
+		"self.settle_registered().await?;\n\t\t\t\tself.drain().await;",
+		"self.inner.state.lock().unwrap().settled = true;",
+		"worker.close_and_join().await",
+		"!self.may_record_clean_shutdown() || !state.settled",
+		"write_clean_shutdown_record(self.path())",
+		"state.lock.take();",
+		"Some(deadline) => tokio::time::timeout_at(deadline, closing).await,",
+		"None => Ok(closing.await),",
+	]
+	.iter()
+	.map(|step| {
+		close
+			.find(step)
+			.unwrap_or_else(|| panic!("close lacks `{step}`"))
+	})
+	.collect();
+	assert!(
+		order.windows(2).all(|pair| pair[0] < pair[1]),
+		"the close sequence: {order:?}"
+	);
+}
+
+/// Wendelon ADR 0132 D5: `rehydrated` changes only through
+/// `ManagerState::{install_rehydrated, take_rehydrated}`, which keep the local
+/// file ledger's registration in step in the same critical section, and the
+/// collision quarantine takes its copy as evidence, after deciding on the
+/// copy's releases and with no release of its own.
+#[test]
+fn every_rehydrated_change_updates_the_local_file_ledger() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	// Chains split across lines count too.
+	let compact = |source: &str| source.split_whitespace().collect::<String>();
+	let install =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/backing_install.rs")).unwrap();
+	for (write, helper, ledger) in [
+		(
+			".rehydrated.insert(",
+			"fn install_rehydrated(",
+			"ledger.register(",
+		),
+		(
+			".rehydrated.remove(",
+			"fn take_rehydrated(",
+			"ledger.unregister(",
+		),
+	] {
+		let found = manager_occurrences(manifest_dir, |source| {
+			compact(source).matches(write).count()
+		});
+		assert_eq!(
+			found,
+			vec![("backing_install.rs".to_string(), 1)],
+			"`{write}` only inside ManagerState::{helper}"
+		);
+		let start = install.find(helper).expect("the helper exists");
+		let body = &install[start..start + install[start..].find("\n\t}").unwrap()];
+		assert!(
+			body.contains(write) && body.contains(ledger),
+			"{helper} updates the ledger"
+		);
+	}
+	for forbidden in [
+		".rehydrated.clear(",
+		".rehydrated.retain(",
+		".rehydrated.entry(",
+		".rehydrated.get_mut(",
+		".rehydrated.alter(",
+		".rehydrated.remove_if(",
+	] {
+		assert!(
+			manager_occurrences(manifest_dir, |source| compact(source)
+				.matches(forbidden)
+				.count())
+			.is_empty(),
+			"no `{forbidden}` bypasses the ledger"
+		);
+	}
+	let authority =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/tier_authority.rs")).unwrap();
+	let collision = manager_method_body(&authority, "quarantine_bootstrap_collision_locked");
+	assert!(!collision.contains("release_slab_file("));
+	let withheld = collision
+		.find("self.local_files.withhold_for_evidence(")
+		.expect("the collision decides on the copy's releases");
+	let measured = collision.find(".file_len(").unwrap();
+	let replaced = collision.find("LocalSlabStore::open(").unwrap();
+	let published = collision
+		.find("withheld.publish();")
+		.expect("a held release is withdrawn only with the evidence");
+	let recorded = collision.find(".insert_bootstrap(").unwrap();
+	let taken = collision
+		.find("CopyDisposition::Evidence);\n\t\t\tif let Some(replacement)")
+		.expect("the collision takes its copy as evidence");
+	assert!(
+		withheld < measured
+			&& measured < replaced
+			&& replaced < published
+			&& published < recorded
+			&& recorded < taken
+	);
+	// The withdrawal and the publication are one critical section: no await,
+	// and no fallible step, between them.
+	let section = &collision[published..taken];
+	assert!(!section.contains(".await") && !section.contains('?'));
 }
 
 /// ADR 0707: decision maintenance proposes only through its stop-aware

@@ -12,7 +12,8 @@
 //! name it owns is removed by identity. It alone publishes the outcome, before
 //! its record (the slab's exclusion) goes. A released slab file carries the
 //! identity its backing read at open; its unlink belongs to a release settler
-//! (`slab_file_quarantine.rs`).
+//! (`slab_file_quarantine.rs`) and its record to the local file ledger
+//! (`local_file_ledger.rs`, ADR 0132).
 use super::*;
 use crate::storage::FileHandle;
 use crate::storage::manager::tiered_io::{AdmittedRehydration, RehydrationAttempt};
@@ -230,6 +231,11 @@ impl RehydrationInstalls {
 		self.lock().installers.contains_key(&slab_id)
 	}
 
+	/// ADR 0132 D3: whether any installer still holds a slab's names.
+	pub(super) fn holds_any_record(&self) -> bool {
+		!self.lock().installers.is_empty()
+	}
+
 	pub(super) fn inhibition(&self, slab_id: SlabId) -> Option<RehydrationInhibition> {
 		self.lock().inhibited.get(&slab_id).copied()
 	}
@@ -277,22 +283,6 @@ impl RehydrationInstalls {
 	}
 }
 
-/// D4: one released slab file: the identity its backing read at open, and
-/// whether its unlink is owed or under way.
-pub(super) struct ReleasedFile {
-	pub(super) identity: FileIdentity,
-	pub(super) phase: ReleasePhase,
-}
-
-pub(super) enum ReleasePhase {
-	Owed,
-	/// The file was unlinked; only its directory sync is still owed, and only
-	/// that is ever retried: the path is never examined or unlinked again.
-	SyncOwed,
-	/// A settler owns the unlink; its outcome arrives here.
-	Unlinking(watch::Receiver<Option<ReleaseOutcome>>),
-}
-
 /// A settler's outcome, shared among its waiters.
 pub(super) type ReleaseOutcome = Result<(), (ErrorKind, String)>;
 
@@ -312,77 +302,6 @@ pub(super) enum ReleaseClaim {
 	Claimed(watch::Receiver<Option<ReleaseOutcome>>),
 	/// Another claim's settler owns it.
 	InProgress(watch::Receiver<Option<ReleaseOutcome>>),
-}
-
-/// D4: the slab files this process released and has not finished unlinking.
-/// An entry leaves only through its settler (or as owed, when GC finds its
-/// path changed before claiming it), so the exclusion lasts through the unlink.
-#[derive(Default)]
-pub(super) struct ReleasedSlabFiles {
-	files: std::sync::Mutex<HashMap<SlabId, ReleasedFile>>,
-}
-
-impl ReleasedSlabFiles {
-	pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SlabId, ReleasedFile>> {
-		self.files
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner)
-	}
-
-	/// Owes the unlink of `slab_id`'s file, by `identity`. A release already
-	/// recorded for the slab stays as it is.
-	pub(super) fn owe(&self, slab_id: SlabId, identity: FileIdentity) {
-		self.lock().entry(slab_id).or_insert(ReleasedFile {
-			identity,
-			phase: ReleasePhase::Owed,
-		});
-	}
-
-	pub(super) fn contains(&self, slab_id: SlabId) -> bool {
-		self.lock().contains_key(&slab_id)
-	}
-
-	/// Drops an owed release; one whose settler runs stays the settler's.
-	pub(super) fn forget_owed(&self, slab_id: SlabId) {
-		let mut files = self.lock();
-		if files
-			.get(&slab_id)
-			.is_some_and(|file| matches!(file.phase, ReleasePhase::Owed))
-		{
-			files.remove(&slab_id);
-		}
-	}
-
-	/// Whether the slab's release waits only for its directory sync.
-	pub(super) fn owes_sync(&self, slab_id: SlabId) -> bool {
-		self.lock()
-			.get(&slab_id)
-			.is_some_and(|file| matches!(file.phase, ReleasePhase::SyncOwed))
-	}
-
-	/// Whether a release of the file `identity` names is still recorded for the
-	/// slab, in any phase: the same slab and the same file, nothing narrower.
-	pub(super) fn holds_release_of(&self, slab_id: SlabId, identity: FileIdentity) -> bool {
-		self.lock()
-			.get(&slab_id)
-			.is_some_and(|file| file.identity == identity)
-	}
-
-	/// Test-only read: the identity of the slab's release, if it has one.
-	#[cfg(test)]
-	pub(super) fn identity_for_test(&self, slab_id: SlabId) -> Option<FileIdentity> {
-		self.lock().get(&slab_id).map(|file| file.identity)
-	}
-
-	/// Test-only read: the phase of the slab's release, if it has one.
-	#[cfg(test)]
-	pub(super) fn phase_for_test(&self, slab_id: SlabId) -> Option<&'static str> {
-		self.lock().get(&slab_id).map(|file| match file.phase {
-			ReleasePhase::Owed => "owed",
-			ReleasePhase::SyncOwed => "sync_owed",
-			ReleasePhase::Unlinking(_) => "unlinking",
-		})
-	}
 }
 
 /// The outcome a release waiter is told: the settler's, or an error if it
@@ -831,7 +750,7 @@ impl SlabManager {
 		}
 		state.rehydrating.remove(&slab_id);
 		state.hot_read_counts.remove(&slab_id);
-		state.install_rehydrated(&self.tier_budget, slab_id, copy);
+		state.install_rehydrated(&self.tier_budget, &self.local_files, slab_id, copy);
 		installs.settle(slab_id, attempt, InstallOutcome::Registered, None);
 		None
 	}

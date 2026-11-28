@@ -1,4 +1,5 @@
 //! Process-local verification of committed tier authority before any answer.
+use super::local_file_ledger::CopyDisposition;
 use super::*;
 use crate::storage::ownership::StorageWorker;
 use std::collections::VecDeque;
@@ -3239,6 +3240,21 @@ impl SlabManager {
 			|| state.sealed.contains_key(&id)
 			|| state.rehydrated.contains_key(&id);
 		if local_collision {
+			// ADR 0132 D5: checked before the first fallible step. A release of the
+			// colliding copy's file in flight, or an owed release of a sealed
+			// backing naming it, makes the collision wait, recording nothing. An
+			// owed copy release of it is held out of every claim until the
+			// evidence is published below, with which it is withdrawn; any error
+			// or cancellation before then drops the hold and leaves it owed. A
+			// sync-only release is kept.
+			let copy = state
+				.rehydrated
+				.get(&id)
+				.map(|copy| copy.store.cached_file_identity());
+			let withheld = match copy {
+				Some(identity) => self.local_files.withhold_for_evidence(id, identity)?,
+				None => None,
+			};
 			let bytes = self
 				.file_ops
 				.file_len(&slab_path(&self.config.dir, id))
@@ -3279,6 +3295,12 @@ impl SlabManager {
 			} else {
 				None
 			};
+			// ADR 0132 D5: one critical section, no await: the evidence is
+			// published together with the withdrawal of the held release, and no
+			// registration or release of the file is left to authorize its unlink.
+			if let Some(withheld) = withheld {
+				withheld.publish();
+			}
 			self.quarantined_slab_files
 				.insert_bootstrap(QuarantinedSlabFile {
 					slab_id: id,
@@ -3286,7 +3308,7 @@ impl SlabManager {
 					reason: DisagreeingSlabFileReason::TierPointer,
 				});
 			state.sealed.remove(&id);
-			state.rehydrated.remove(&id);
+			state.take_rehydrated(&self.local_files, id, CopyDisposition::Evidence);
 			if let Some(replacement) = replacement {
 				state.active = replacement;
 			}
@@ -3315,6 +3337,18 @@ impl SlabManager {
 		}
 		let mut state = self.state.lock().await;
 		self.quarantine_bootstrap_collision_locked(&mut state, id, floor, true)
+			.await
+	}
+
+	/// Test-only: the collision quarantine of `id` itself, under the gates an
+	/// accepted snapshot's retry holds, with `id` as its floor (ADR 0132 K8).
+	#[cfg(test)]
+	pub(super) async fn quarantine_collision_for_test(&self, id: SlabId) -> std::io::Result<()> {
+		let lock = self.tier_publication_lock(id);
+		let _publication = lock.lock().await;
+		let _gate = self.persistent_index_gate.clone().read_owned().await;
+		let mut state = self.state.lock().await;
+		self.quarantine_bootstrap_collision_locked(&mut state, id, id, true)
 			.await
 	}
 

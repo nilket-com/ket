@@ -1,3 +1,4 @@
+use super::local_file_ledger::{CopyDisposition, ReleaseOrigin, released_backing};
 use super::tier_deferral::{DeferralOutcome, FenceCause, TierDeferral, TierReplay, fenced_error};
 use super::tier_plan::tier_row_owner;
 use super::*;
@@ -1906,11 +1907,10 @@ impl SlabManager {
 			let mut state = self.state.lock().await;
 			let released_sealed = state.sealed.remove(&pointer.slab_id).map(|(_, slab)| slab);
 			let released_copy = state
-				.rehydrated
-				.remove(&pointer.slab_id)
-				.map(|(_, copy)| copy.store);
-			if let Some(released) = released_sealed.or(released_copy) {
-				self.release_slab_file(pointer.slab_id, released.cached_file_identity());
+				.take_rehydrated(&self.local_files, pointer.slab_id, CopyDisposition::Release)
+				.map(|copy| copy.store);
+			if let Some((released, origin)) = released_backing(released_sealed, released_copy) {
+				self.release_slab_file(pointer.slab_id, released.cached_file_identity(), origin);
 			}
 			state.install_tiered(&self.tier_budget, pointer.slab_id, pointer.clone());
 			if let Some(layout) = next_layout {
@@ -2292,11 +2292,10 @@ impl SlabManager {
 			let mut state = self.state.lock().await;
 			let released_sealed = state.sealed.remove(&slab_id).map(|(_, slab)| slab);
 			let released_copy = state
-				.rehydrated
-				.remove(&slab_id)
-				.map(|(_, copy)| copy.store);
-			if let Some(released) = released_sealed.or(released_copy) {
-				self.release_slab_file(slab_id, released.cached_file_identity());
+				.take_rehydrated(&self.local_files, slab_id, CopyDisposition::Release)
+				.map(|copy| copy.store);
+			if let Some((released, origin)) = released_backing(released_sealed, released_copy) {
+				self.release_slab_file(slab_id, released.cached_file_identity(), origin);
 			}
 			let _old = state.tiered.remove(&slab_id);
 			let _old = state.remove_tier_layout(&self.tier_budget, slab_id);
@@ -2452,11 +2451,10 @@ impl SlabManager {
 			let mut state = self.state.lock().await;
 			let released_sealed = state.sealed.remove(&slab_id).map(|(_, slab)| slab);
 			let released_copy = state
-				.rehydrated
-				.remove(&slab_id)
-				.map(|(_, copy)| copy.store);
-			if let Some(released) = released_sealed.or(released_copy) {
-				self.release_slab_file(slab_id, released.cached_file_identity());
+				.take_rehydrated(&self.local_files, slab_id, CopyDisposition::Release)
+				.map(|copy| copy.store);
+			if let Some((released, origin)) = released_backing(released_sealed, released_copy) {
+				self.release_slab_file(slab_id, released.cached_file_identity(), origin);
 			}
 			state.tiered.remove(&slab_id);
 			state.remove_tier_layout(&self.tier_budget, slab_id);
@@ -2660,9 +2658,11 @@ impl SlabManager {
 			{
 				return Ok(false);
 			}
-			let removed = state.rehydrated.remove(&slab_id);
-			if let Some((_, copy)) = &removed {
-				self.release_slab_file(slab_id, copy.store.cached_file_identity());
+			let removed =
+				state.take_rehydrated(&self.local_files, slab_id, CopyDisposition::Release);
+			if let Some(copy) = &removed {
+				let identity = copy.store.cached_file_identity();
+				self.release_slab_file(slab_id, identity, ReleaseOrigin::Copy);
 			}
 			removed.is_some()
 		};
@@ -3560,9 +3560,7 @@ impl SlabManager {
 			return None;
 		}
 		// The names are another owner's until it settles; the reads keep counting.
-		if self.rehydration_installs.has_record(slab_id)
-			|| self.released_slab_files.contains(slab_id)
-		{
+		if self.rehydration_installs.has_record(slab_id) || self.local_files.contains(slab_id) {
 			return None;
 		}
 		// D5: capacity before admission, never waited for.

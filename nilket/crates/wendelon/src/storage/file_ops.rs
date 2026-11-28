@@ -772,6 +772,8 @@ impl AsyncFileOps for BlockingFileOps {
 	async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
 		self.run_blocking_write(move || {
+			#[cfg(test)]
+			let _seam = blocking_job_seam::enter(blocking_job_seam::Job::FsyncDir, &path)?;
 			let dir = File::open(path)?;
 			dir.sync_all()
 		})
@@ -794,8 +796,12 @@ impl AsyncFileOps for BlockingFileOps {
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		self.run_blocking_write(move || std::fs::remove_file(path))
-			.await
+		self.run_blocking_write(move || {
+			#[cfg(test)]
+			let _seam = blocking_job_seam::enter(blocking_job_seam::Job::Unlink, &path)?;
+			std::fs::remove_file(path)
+		})
+		.await
 	}
 }
 
@@ -917,6 +923,104 @@ where
 		f()
 	})
 	.await
+}
+
+/// A test seam inside the blocking job of a [`BlockingFileOps`] unlink or
+/// directory sync (ADR 0132 K14): the next job on one exact path can be held
+/// inside its closure, after its write permit moved in, or fail without
+/// running. Seams are keyed by path, so concurrent tests do not meet.
+#[cfg(test)]
+pub(crate) mod blocking_job_seam {
+	use std::io::{Error, ErrorKind};
+	use std::path::{Path, PathBuf};
+	use std::sync::Arc;
+
+	/// Which job of `BlockingFileOps` a seam stops.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(crate) enum Job {
+		Unlink,
+		FsyncDir,
+	}
+
+	/// What a seam does to the next job on its path.
+	pub(crate) enum Action {
+		/// Signals `entered`, then blocks the job's thread until `release`
+		/// sends (or its sender goes); the job then runs, and `after` runs once
+		/// it has, still inside the job with its permit held.
+		Hold {
+			entered: Arc<tokio::sync::Semaphore>,
+			release: std::sync::mpsc::Receiver<()>,
+			after: Option<Box<dyn FnOnce() + Send>>,
+		},
+		/// Fails this many more jobs without running them.
+		Fail(usize),
+	}
+
+	type Armed = Vec<(Job, PathBuf, Action)>;
+
+	static SEAMS: std::sync::Mutex<Armed> = std::sync::Mutex::new(Vec::new());
+
+	fn seams() -> std::sync::MutexGuard<'static, Armed> {
+		SEAMS
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// Arms `action` for the next `job` on exactly `path`.
+	pub(crate) fn arm(job: Job, path: &Path, action: Action) {
+		seams().push((job, path.to_path_buf(), action));
+	}
+
+	/// Removes every seam still armed on `path`.
+	pub(crate) fn clear(path: &Path) {
+		seams().retain(|(_, armed, _)| armed != path);
+	}
+
+	/// A job that passed its seam: `after` runs when the job's closure ends.
+	pub(crate) struct Passed(Option<Box<dyn FnOnce() + Send>>);
+
+	impl Drop for Passed {
+		fn drop(&mut self) {
+			if let Some(after) = self.0.take() {
+				after();
+			}
+		}
+	}
+
+	/// The seam of `job` on `path`, inside the job's blocking closure.
+	pub(crate) fn enter(job: Job, path: &Path) -> std::io::Result<Passed> {
+		let action = {
+			let mut seams = seams();
+			let Some(at) = seams
+				.iter()
+				.position(|(armed, at, _)| *armed == job && at == path)
+			else {
+				return Ok(Passed(None));
+			};
+			if let Action::Fail(left) = &mut seams[at].2 {
+				*left = left.saturating_sub(1);
+				if *left == 0 {
+					seams.remove(at);
+				}
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					"injected blocking job failure (test)",
+				));
+			}
+			seams.remove(at).2
+		};
+		let Action::Hold {
+			entered,
+			release,
+			after,
+		} = action
+		else {
+			unreachable!("a failing seam returned above");
+		};
+		entered.add_permits(1);
+		let _ = release.recv();
+		Ok(Passed(after))
+	}
 }
 
 type BlockingTask = Box<dyn FnOnce() + Send + 'static>;

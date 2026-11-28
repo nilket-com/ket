@@ -106,6 +106,10 @@ struct OwnerState {
 	phase: OwnerPhase,
 	outstanding: usize,
 	startup_barriers: usize,
+	// ADR 0132 D2: what a clean close settles after its first drain, and
+	// whether a close already settled it, followed by its second drain.
+	settlers: Vec<Arc<dyn CloseSettler>>,
+	settled: bool,
 	// Fields drop in declaration order. Workers (whose closers may still hold a
 	// redb database, which writes on drop) must go before the lock descriptor,
 	// so an owner dropped without close never releases the lock first.
@@ -220,9 +224,46 @@ impl AdmittedOperation {
 		output
 	}
 
-	fn complete(mut self) {
+	/// Completes the operation. A close settler (ADR 0132), which issues no
+	/// write of its own and only mints children, completes its operation here
+	/// once it has its result, whatever that result is.
+	pub(crate) fn complete(mut self) {
 		self.completed = true;
 	}
+
+	/// ADR 0132 D2: a counted operation of the same owner, minted from this one
+	/// while it is outstanding (as a child write permit is), and admitted while
+	/// the owner closes. Every new ordinary admission stays fenced. The child
+	/// is counted on its own, so the drain waits for it even after its parent
+	/// completed; its body runs through [`AdmittedOperation::run`] like any other.
+	pub(crate) fn child_operation(&self) -> AdmittedOperation {
+		let mut state = self
+			.inner
+			.state
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		state.outstanding += 1;
+		AdmittedOperation {
+			inner: self.inner.clone(),
+			completed: false,
+		}
+	}
+}
+
+/// ADR 0132 D2: what a clean close owes after its first drain, settled by one
+/// party the owner keeps for the whole run. `close` calls `settle` once per
+/// close attempt that reaches the settle phase, in its own task, with an
+/// admitted operation that `close` alone mints and a transient backend whose
+/// writes are charged to this owner; a settler never stores that backend.
+/// `Ok` means nothing the settler owes is left, so a repeated settle finds
+/// nothing to do. A settler holds no owner and no owner-bound backend of its
+/// own, so an owner dropped without close is still freed with its lock.
+pub(crate) trait CloseSettler: Send + Sync {
+	fn settle(
+		self: Arc<Self>,
+		operation: AdmittedOperation,
+		io: Arc<dyn crate::storage::file_ops::AsyncFileOps>,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 }
 
 impl Drop for AdmittedOperation {
@@ -727,6 +768,77 @@ impl DataDirectoryOwner {
 		Ok(())
 	}
 
+	/// ADR 0132 D2: `settler` settles what a clean close of this owner owes,
+	/// after the close's first drain. Refused once close began.
+	pub(crate) fn register_close_settler(
+		&self,
+		settler: Arc<dyn CloseSettler>,
+	) -> std::io::Result<()> {
+		let mut state = self.inner.state.lock().unwrap();
+		if state.phase != OwnerPhase::Active {
+			return Err(closed_error());
+		}
+		state.settlers.push(settler);
+		Ok(())
+	}
+
+	/// ADR 0132 D2: the one admitted operation of one settler's settle. Minted
+	/// only by the settle phase of `close`, after its first drain, so it is
+	/// admitted while the owner closes; it counts in the second drain.
+	fn settle_operation(&self) -> AdmittedOperation {
+		let mut state = self.inner.state.lock().unwrap();
+		state.outstanding += 1;
+		AdmittedOperation {
+			inner: self.inner.clone(),
+			completed: false,
+		}
+	}
+
+	/// Waits until nothing admitted is outstanding: no write or lifecycle
+	/// permit, no admitted operation or child, and no startup drain barrier.
+	async fn drain(&self) {
+		loop {
+			let notified = self.inner.drained.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			{
+				let state = self.inner.state.lock().unwrap();
+				if state.outstanding == 0 && state.startup_barriers == 0 {
+					return;
+				}
+			}
+			notified.await;
+		}
+	}
+
+	/// ADR 0132 D2: the settle phase of a close, between its two drains. Each
+	/// registered settler, one at a time, gets one admitted operation and a
+	/// transient backend charged to this owner, which no settler keeps, and
+	/// settles in its own task: a close that times out or is cancelled leaves
+	/// it running with its operation, which the next drain waits for. Any
+	/// settler's error fails this close attempt; a repeat settles again.
+	async fn settle_registered(&self) -> std::io::Result<()> {
+		let settlers = self.inner.state.lock().unwrap().settlers.clone();
+		for settler in settlers {
+			let operation = self.settle_operation();
+			let io: Arc<dyn crate::storage::file_ops::AsyncFileOps> = Arc::new(
+				crate::storage::file_ops::BlockingFileOps::with_owner(self.clone()),
+			);
+			tokio::spawn(settler.settle(operation, io))
+				.await
+				.map_err(|error| {
+					Error::other(format!("a close settler ended without a result: {error}"))
+				})??;
+		}
+		Ok(())
+	}
+
+	/// Whether a close of this owner recorded its settle as complete.
+	#[cfg(test)]
+	pub(crate) fn close_settled_for_test(&self) -> bool {
+		self.inner.state.lock().unwrap().settled
+	}
+
 	// Deterministic timeout controls must reach their held worker before any
 	// filesystem closer can consume the deliberately tiny observation budget.
 	#[cfg(test)]
@@ -736,13 +848,21 @@ impl DataDirectoryOwner {
 		state.workers.insert(0, worker);
 	}
 
-	/// Reject new writes, drain admitted operations and join registered workers.
-	/// Timeout/failure leaves the descriptor held and admission closed. Repeating
-	/// close resumes the same joins; cancellation never treats a live join as done.
+	/// Reject new writes, drain admitted operations, settle what the close owes
+	/// (ADR 0132), drain again and join registered workers. One deadline, taken
+	/// on entry, bounds the whole close, its wait for the close gate included,
+	/// so overlapping callers each wait at most their own bound. Timeout/failure
+	/// leaves the descriptor held and admission closed. Repeating close drains
+	/// again and settles again until a close recorded its settle, then resumes
+	/// the same joins; cancellation never treats a live join as done.
 	pub async fn close(&self, bound: Duration) -> std::io::Result<()> {
+		// A bound past the clock's range (`Duration::MAX`, say) is no deadline.
+		let deadline = tokio::time::Instant::now().checked_add(bound);
 		self.begin_close();
-		let _close = self.inner.close_gate.lock().await;
-		let result = tokio::time::timeout(bound, async {
+		// The gate is taken inside the bounded close, so a caller waiting for an
+		// overlapping close never waits past its own deadline.
+		let closing = async {
+			let _close = self.inner.close_gate.lock().await;
 			{
 				let mut state = self.inner.state.lock().unwrap();
 				if state.phase == OwnerPhase::Closed {
@@ -752,14 +872,14 @@ impl DataDirectoryOwner {
 				state.closing_pin = Some(self.inner.clone());
 				self.inner.drained.notify_waiters();
 			}
-			loop {
-				let notified = self.inner.drained.notified();
-				tokio::pin!(notified);
-				notified.as_mut().enable();
-				if { let state = self.inner.state.lock().unwrap(); state.outstanding == 0 && state.startup_barriers == 0 } {
-					break;
-				}
-				notified.await;
+			self.drain().await;
+			let settled = self.inner.state.lock().unwrap().settled;
+			if !settled {
+				// After the first drain no installer or handoff can add an
+				// obligation; the settle's own operations count in the second.
+				self.settle_registered().await?;
+				self.drain().await;
+				self.inner.state.lock().unwrap().settled = true;
 			}
 			let workers = self.inner.state.lock().unwrap().workers.clone();
 			let mut first_error = None;
@@ -773,10 +893,11 @@ impl DataDirectoryOwner {
 			}
 			let mut state = self.inner.state.lock().unwrap();
 			assert_eq!(state.startup_barriers, 0, "startup drain bypassed");
-			// Every writer has stopped. Record that before releasing the lock so
-			// the next owner can tell a complete shutdown from a crash or kill.
-			// Failure only costs the next boot a recovery pass.
-			if !self.may_record_clean_shutdown() {
+			// Every writer has stopped and every settler settled. Record that
+			// before releasing the lock so the next owner can tell a complete
+			// shutdown from a crash or kill. Failure only costs the next boot a
+			// recovery pass.
+			if !self.may_record_clean_shutdown() || !state.settled {
 				tracing::warn!(
 					path = %self.path().display(),
 					"recovery did not complete during this run; leaving no clean-shutdown record"
@@ -788,10 +909,16 @@ impl DataDirectoryOwner {
 			state.phase = OwnerPhase::Closed;
 			state.closing_pin.take();
 			state.workers.clear();
-			self.inner.closed_signal.store(true, std::sync::atomic::Ordering::Release);
+			state.settlers.clear();
+			self.inner
+				.closed_signal
+				.store(true, std::sync::atomic::Ordering::Release);
 			Ok(())
-		})
-		.await;
+		};
+		let result = match deadline {
+			Some(deadline) => tokio::time::timeout_at(deadline, closing).await,
+			None => Ok(closing.await),
+		};
 		match result {
 			Ok(Ok(())) => Ok(()),
 			result => {
@@ -1024,6 +1151,8 @@ fn acquire_lock(
 				lock: Some(file),
 				outstanding: 0,
 				startup_barriers: 0,
+				settlers: Vec::new(),
+				settled: false,
 				workers: Vec::new(),
 				closing_pin: None,
 			}),
@@ -1748,6 +1877,498 @@ mod tests {
 		other.close(Duration::from_secs(5)).await.unwrap();
 		drop(other);
 		assert!(!other_dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+	}
+
+	type SettleFuture =
+		std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+	/// The transient backend a close passes to its settlers.
+	type Io = Arc<dyn crate::storage::AsyncFileOps>;
+	type SettleFn = dyn Fn(AdmittedOperation, Io) -> SettleFuture + Send + Sync;
+
+	/// A close settler for the owner-level controls (ADR 0132): its settle runs
+	/// the closure with the operation and the transient backend close passed.
+	struct FnSettler(Box<SettleFn>);
+
+	impl CloseSettler for FnSettler {
+		fn settle(self: Arc<Self>, operation: AdmittedOperation, io: Io) -> SettleFuture {
+			(self.0)(operation, io)
+		}
+	}
+
+	fn settler<F, Fut>(settle: F) -> Arc<dyn CloseSettler>
+	where
+		F: Fn(AdmittedOperation, Io) -> Fut + Send + Sync + 'static,
+		Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+	{
+		Arc::new(FnSettler(Box::new(move |operation, io| {
+			Box::pin(settle(operation, io)) as SettleFuture
+		})))
+	}
+
+	/// A settler that counts its settles and completes its operation, failing
+	/// while `failures` remain.
+	fn counting_settler(
+		settles: Arc<std::sync::atomic::AtomicUsize>,
+		failures: Arc<std::sync::atomic::AtomicUsize>,
+	) -> Arc<dyn CloseSettler> {
+		settler(move |operation, _io| {
+			let settles = settles.clone();
+			let failures = failures.clone();
+			async move {
+				settles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				operation.complete();
+				let fail = failures
+					.fetch_update(
+						std::sync::atomic::Ordering::SeqCst,
+						std::sync::atomic::Ordering::SeqCst,
+						|left| left.checked_sub(1),
+					)
+					.is_ok();
+				if fail {
+					return Err(Error::other("injected settle failure"));
+				}
+				Ok(())
+			}
+		})
+	}
+
+	/// A worker whose join runs `observe`, waits for one `release` if it has
+	/// a hold (signalling `entered` first), then fails while `failures` remain.
+	struct ObservingWorker {
+		observe: Box<dyn Fn() + Send + Sync>,
+		hold: Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
+		failures: std::sync::atomic::AtomicUsize,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageWorker for ObservingWorker {
+		async fn close_and_join(&self) -> std::io::Result<()> {
+			(self.observe)();
+			if let Some((entered, release)) = &self.hold {
+				entered.add_permits(1);
+				release.acquire().await.unwrap().forget();
+			}
+			let fail = self
+				.failures
+				.fetch_update(
+					std::sync::atomic::Ordering::SeqCst,
+					std::sync::atomic::Ordering::SeqCst,
+					|left| left.checked_sub(1),
+				)
+				.is_ok();
+			if fail {
+				return Err(Error::other("injected worker join failure"));
+			}
+			Ok(())
+		}
+	}
+
+	fn counted(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+		counter.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	fn shutdown_incomplete(error: &Error) -> bool {
+		error
+			.get_ref()
+			.and_then(|source| source.downcast_ref::<ShutdownIncomplete>())
+			.is_some()
+	}
+
+	/// ADR 0132 D2: the settle runs after the first drain (a held permit delays
+	/// it), once, and before the joins and the clean-shutdown record; a closed
+	/// owner settles nothing again.
+	#[tokio::test]
+	async fn a_close_settles_after_its_first_drain_and_before_its_joins_and_record() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let record = dir.path().join(CLEAN_SHUTDOWN_RECORD);
+		let settles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		{
+			let settles = settles.clone();
+			let record = record.clone();
+			owner
+				.register_close_settler(settler(move |operation, _io| {
+					let settles = settles.clone();
+					let unrecorded = !record.exists();
+					async move {
+						assert!(unrecorded, "no clean-shutdown record before the settle");
+						settles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+						operation.complete();
+						Ok(())
+					}
+				}))
+				.unwrap();
+		}
+		let seen_at_join = Arc::new(Mutex::new(None));
+		{
+			let seen = seen_at_join.clone();
+			let settles = settles.clone();
+			owner
+				.register_worker(Arc::new(ObservingWorker {
+					observe: Box::new(move || *seen.lock().unwrap() = Some(counted(&settles))),
+					hold: None,
+					failures: std::sync::atomic::AtomicUsize::new(0),
+				}))
+				.unwrap();
+		}
+		let permit = owner.write_permit().unwrap();
+		let closing = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(5)).await })
+		};
+		owner.wait_until_closing().await;
+		for _ in 0..8 {
+			tokio::task::yield_now().await;
+		}
+		assert_eq!(counted(&settles), 0, "the settle waits for the first drain");
+		assert!(!closing.is_finished());
+		drop(permit);
+		closing.await.unwrap().unwrap();
+		assert_eq!(counted(&settles), 1, "one settle");
+		assert_eq!(
+			*seen_at_join.lock().unwrap(),
+			Some(1),
+			"the joins follow the settle"
+		);
+		assert!(owner.close_settled_for_test());
+		assert!(record.exists());
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		assert_eq!(counted(&settles), 1, "a closed owner settles nothing again");
+	}
+
+	/// ADR 0132 D2: a settler's child operation is admitted while the owner
+	/// closes, and so are its scope's write permits. The second drain waits for
+	/// a child that outlives its settle: neither the clean-shutdown record nor
+	/// the lock's release comes before the child's last permit goes.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn the_second_drain_waits_for_a_settle_child_that_outlives_its_settle() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let record = dir.path().join(CLEAN_SHUTDOWN_RECORD);
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		{
+			let (entered, release) = (entered.clone(), release.clone());
+			owner
+				.register_close_settler(settler(move |operation, io| {
+					let (entered, release) = (entered.clone(), release.clone());
+					async move {
+						let child = operation.child_operation();
+						tokio::spawn(child.run(async move {
+							let permit = io
+								.write_permit()
+								.expect("the child's scope is admitted while the owner closes")
+								.expect("the transient backend is owned");
+							entered.add_permits(1);
+							release.acquire().await.unwrap().forget();
+							drop(permit);
+						}));
+						operation.complete();
+						Ok(())
+					}
+				}))
+				.unwrap();
+		}
+		let closing = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(10)).await })
+		};
+		tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+			.await
+			.expect("the child runs")
+			.unwrap()
+			.forget();
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert!(
+			!closing.is_finished(),
+			"the second drain waits for the child"
+		);
+		assert!(!record.exists(), "no record before the child's last permit");
+		assert!(
+			DataDirectoryOwner::acquire_existing(dir.path()).is_err(),
+			"the lock is held"
+		);
+		release.add_permits(1);
+		closing.await.unwrap().unwrap();
+		assert!(record.exists());
+		assert!(!owner.clean_record_revoked());
+		drop(owner);
+		DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+	}
+
+	/// ADR 0132 K11: during the settle phase every new ordinary admission is
+	/// refused: a write outside a scope (directly and through the transient
+	/// backend), an admitted operation, a lifecycle permit, a startup drain and
+	/// a new settler. Only the settle's own child scope is admitted.
+	#[tokio::test]
+	async fn the_settle_phase_admits_only_its_own_children() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		// Taken by the settle, so the settler keeps no owner after it.
+		let probe = Arc::new(Mutex::new(Some(owner.clone())));
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		{
+			let (probe, seen) = (probe.clone(), seen.clone());
+			owner
+				.register_close_settler(settler(move |operation, io| {
+					let (probe, seen) = (probe.clone(), seen.clone());
+					async move {
+						let owner = probe.lock().unwrap().take().expect("one settle");
+						let late = counting_settler(Default::default(), Default::default());
+						let mut checks = vec![
+							("a write outside a scope", owner.write_permit().is_err()),
+							(
+								"a backend write outside a scope",
+								io.write_permit().is_err(),
+							),
+							("an admitted operation", owner.admitted_operation().is_err()),
+							("a lifecycle permit", owner.lifecycle_permit().is_err()),
+							("a startup drain", owner.reserve_startup_drain().is_err()),
+							("a settler", owner.register_close_settler(late).is_err()),
+						];
+						let admitted = operation
+							.child_operation()
+							.run(async { owner.write_permit().map(drop).is_ok() })
+							.await;
+						checks.push(("the settle's own child is admitted", admitted));
+						*seen.lock().unwrap() = checks;
+						operation.complete();
+						Ok(())
+					}
+				}))
+				.unwrap();
+		}
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		let seen = seen.lock().unwrap().clone();
+		assert_eq!(seen.len(), 7, "{seen:?}");
+		for (what, held) in seen {
+			assert!(held, "{what}");
+		}
+		assert!(!owner.clean_record_revoked());
+		assert!(dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+	}
+
+	/// ADR 0132 D2: a settler's error fails the close before any join and
+	/// leaves no record, with the lock held; the repeat drains, settles again
+	/// and completes. The failed settle completed its operation, so the run
+	/// still records a clean shutdown.
+	#[tokio::test]
+	async fn a_failed_settle_joins_nothing_and_its_repeat_settles_again() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let record = dir.path().join(CLEAN_SHUTDOWN_RECORD);
+		let settles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let failures = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+		owner
+			.register_close_settler(counting_settler(settles.clone(), failures))
+			.unwrap();
+		let joins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		{
+			let joins = joins.clone();
+			owner
+				.register_worker(Arc::new(ObservingWorker {
+					observe: Box::new(move || {
+						joins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					}),
+					hold: None,
+					failures: std::sync::atomic::AtomicUsize::new(0),
+				}))
+				.unwrap();
+		}
+		let error = owner.close(Duration::from_secs(5)).await.unwrap_err();
+		assert!(shutdown_incomplete(&error), "{error}");
+		assert_eq!(counted(&settles), 1);
+		assert_eq!(counted(&joins), 0, "no join after a failed settle");
+		assert!(!owner.close_settled_for_test());
+		assert!(!record.exists());
+		assert!(DataDirectoryOwner::acquire_existing(dir.path()).is_err());
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		assert_eq!(counted(&settles), 2, "the repeat settles again");
+		assert_eq!(counted(&joins), 1);
+		assert!(!owner.clean_record_revoked());
+		assert!(record.exists());
+	}
+
+	/// ADR 0132 K6: a join that fails after the settle recorded, then a close
+	/// timed out in its joins: each repeat skips the settle and resumes the
+	/// joins, and the clean-shutdown record follows the one that completes.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_repeat_after_the_settle_skips_it_and_resumes_the_joins() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let record = dir.path().join(CLEAN_SHUTDOWN_RECORD);
+		let settles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		owner
+			.register_close_settler(counting_settler(settles.clone(), Default::default()))
+			.unwrap();
+		owner
+			.register_worker(Arc::new(ObservingWorker {
+				observe: Box::new(|| {}),
+				hold: None,
+				failures: std::sync::atomic::AtomicUsize::new(1),
+			}))
+			.unwrap();
+		let (entered, release) = (
+			Arc::new(tokio::sync::Semaphore::new(0)),
+			Arc::new(tokio::sync::Semaphore::new(0)),
+		);
+		owner
+			.register_worker(Arc::new(ObservingWorker {
+				observe: Box::new(|| {}),
+				hold: Some((entered.clone(), release.clone())),
+				failures: std::sync::atomic::AtomicUsize::new(0),
+			}))
+			.unwrap();
+		// The first close settles, then its first join fails.
+		let first = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(10)).await })
+		};
+		tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+			.await
+			.expect("the joins run")
+			.unwrap()
+			.forget();
+		release.add_permits(1);
+		let error = first.await.unwrap().unwrap_err();
+		assert!(shutdown_incomplete(&error), "{error}");
+		assert_eq!(counted(&settles), 1);
+		assert!(owner.close_settled_for_test(), "the settle stays recorded");
+		assert!(!record.exists());
+		// The second times out in the held join: cancelled there.
+		let error = owner.close(Duration::from_millis(300)).await.unwrap_err();
+		assert!(shutdown_incomplete(&error), "{error}");
+		assert_eq!(error.kind(), ErrorKind::TimedOut);
+		entered.acquire().await.unwrap().forget();
+		assert_eq!(counted(&settles), 1, "the repeat skipped the settle");
+		assert!(!record.exists());
+		assert!(DataDirectoryOwner::acquire_existing(dir.path()).is_err());
+		// The third resumes the joins and completes.
+		let third = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(10)).await })
+		};
+		tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+			.await
+			.expect("the joins resume")
+			.unwrap()
+			.forget();
+		release.add_permits(1);
+		third.await.unwrap().unwrap();
+		assert_eq!(counted(&settles), 1, "one settle in all");
+		assert!(record.exists());
+		drop(owner);
+		DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+	}
+
+	/// ADR 0132 K7: two closes overlap while the settle is held. Each returns
+	/// within its own bound, the one waiting at the close gate included; the
+	/// held settle keeps running, and a later close completes with exactly one
+	/// disposal of the one obligation.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn overlapping_closes_each_keep_their_own_deadline_and_dispose_once() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let record = dir.path().join(CLEAN_SHUTDOWN_RECORD);
+		let owed = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+		let disposals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let (entered, release) = (
+			Arc::new(tokio::sync::Semaphore::new(0)),
+			Arc::new(tokio::sync::Semaphore::new(0)),
+		);
+		{
+			let (owed, disposals) = (owed.clone(), disposals.clone());
+			let (entered, release) = (entered.clone(), release.clone());
+			owner
+				.register_close_settler(settler(move |operation, _io| {
+					let (owed, disposals) = (owed.clone(), disposals.clone());
+					let (entered, release) = (entered.clone(), release.clone());
+					async move {
+						if counted(&owed) > 0 {
+							entered.add_permits(1);
+							release.acquire().await.unwrap().forget();
+						}
+						if owed.swap(0, std::sync::atomic::Ordering::SeqCst) == 1 {
+							disposals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+						}
+						operation.complete();
+						Ok(())
+					}
+				}))
+				.unwrap();
+		}
+		let bound = Duration::from_millis(300);
+		let timed_close = move |owner: DataDirectoryOwner| {
+			tokio::spawn(async move {
+				let started = tokio::time::Instant::now();
+				let result = owner.close(bound).await;
+				(result, started.elapsed())
+			})
+		};
+		let first = timed_close(owner.clone());
+		tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+			.await
+			.expect("the first close reaches its settle")
+			.unwrap()
+			.forget();
+		let second = timed_close(owner.clone());
+		for (what, close) in [
+			("the settling close", first),
+			("the close at the gate", second),
+		] {
+			let (result, elapsed) = close.await.unwrap();
+			let error = result.expect_err(what);
+			assert!(shutdown_incomplete(&error), "{what}: {error}");
+			assert!(
+				elapsed < bound + Duration::from_secs(2),
+				"{what} waited {elapsed:?}, past its own bound"
+			);
+		}
+		assert_eq!(
+			counted(&disposals),
+			0,
+			"the held settle has not disposed yet"
+		);
+		assert!(!record.exists());
+		release.add_permits(1);
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		assert_eq!(counted(&disposals), 1, "one disposal");
+		assert!(record.exists());
+	}
+
+	/// ADR 0132 D1: an owner holding a settler and dropped without close is
+	/// freed with its lock, as before: no settler holds its owner. Registration
+	/// is refused once close began.
+	#[tokio::test]
+	async fn an_owner_dropped_with_a_settler_releases_its_lock_and_a_closing_one_refuses_settlers()
+	{
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		owner
+			.register_close_settler(counting_settler(Default::default(), Default::default()))
+			.unwrap();
+		drop(owner);
+		let owner = DataDirectoryOwner::acquire_existing(dir.path())
+			.expect("the dropped owner released its lock");
+		owner.begin_close();
+		assert!(
+			owner
+				.register_close_settler(counting_settler(Default::default(), Default::default()))
+				.is_err()
+		);
+		owner.close(Duration::from_secs(5)).await.unwrap();
+	}
+
+	/// ADR 0132: a bound past the clock's range is no deadline rather than a
+	/// panic; an idle owner closed with it completes and records a clean shutdown.
+	#[tokio::test]
+	async fn a_close_bounded_by_the_largest_duration_completes_clean() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		owner.close(Duration::MAX).await.unwrap();
+		assert!(dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+		drop(owner);
+		DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
 	}
 }
 

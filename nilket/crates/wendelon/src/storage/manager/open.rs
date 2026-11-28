@@ -1077,6 +1077,7 @@ impl SlabManager {
 			&(tier_budget.clone() as std::sync::Arc<dyn crate::metrics::TierMeasurementSource>),
 		));
 		let tier_tokens = super::tier_tokens::TierTokenRegistry::new(&tier_budget)?;
+		let local_files = super::local_file_ledger::LocalFileLedger::new(config.dir.clone());
 		let manager = Arc::new(Self {
 			_directory_owner: owner,
 			finality_observation:
@@ -1195,7 +1196,7 @@ impl SlabManager {
 			deferred_table_drop_l2: Default::default(),
 			cleanup_scan_schedule: Default::default(),
 			quarantined_slab_files,
-			released_slab_files: Default::default(),
+			local_files,
 			rehydration_installs: Default::default(),
 			live_reservations: Arc::new(DashSet::new()),
 			#[cfg(test)]
@@ -1203,6 +1204,8 @@ impl SlabManager {
 		});
 		// ADR 0131: the installer and release settler tasks run against this manager.
 		manager.rehydration_installs.bind(&manager);
+		// ADR 0132: the directory owner keeps what this manager's copies owe until it closes.
+		manager.local_files.bind(&manager)?;
 		{
 			// Every tiered slab is verified against its object before its first
 			// serve in this process.

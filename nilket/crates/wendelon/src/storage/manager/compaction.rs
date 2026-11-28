@@ -1,3 +1,4 @@
+use super::local_file_ledger::ReleaseOrigin;
 use super::retention_reclaim::{SealedSlabScan, TombstoneSlabScanOutcome};
 use super::secondary_index_segments::MaintenanceClaims;
 use super::*;
@@ -1580,7 +1581,8 @@ impl SlabManager {
 			{
 				let state = self.state.lock().await;
 				if let Some((_, slab)) = state.sealed.remove(&slab_id) {
-					self.release_slab_file(slab_id, slab.cached_file_identity());
+					let identity = slab.cached_file_identity();
+					self.release_slab_file(slab_id, identity, ReleaseOrigin::Backing);
 				}
 			}
 			// The old slab is disposed: its redirects go with it.

@@ -8,7 +8,11 @@
 //! the slab serves only through its tier generation. The set is fixed before
 //! readiness is first exposed, and reporting it never authorizes cleanup.
 use super::*;
-use crate::storage::manager::rehydration_install::{ReleaseClaim, ReleasePhase, ReleaseRoute};
+use crate::storage::manager::local_file_ledger::{
+	CopyDisposition, LocalFileLedger, ReleaseOrigin, ReleasePhase,
+};
+use crate::storage::manager::rehydration_install::{ReleaseClaim, ReleaseRoute};
+use crate::storage::ownership::AdmittedOperation;
 use std::sync::atomic::AtomicU64;
 
 /// Why open classified a local slab file as disagreeing with the committed
@@ -172,10 +176,16 @@ impl SlabManager {
 	/// the file is then this process's to unlink, by that identity, through
 	/// [`Self::unlink_released_slab_file`], until its settler finishes. Every
 	/// store has its identity (its open fails without one), so every release
-	/// of a backing is recorded.
-	pub(super) fn release_slab_file(&self, slab_id: SlabId, identity: (u64, u64)) {
+	/// of a backing is recorded, with its origin (ADR 0132 D5): a copy's is the
+	/// close settle's to finish if no runtime release did.
+	pub(super) fn release_slab_file(
+		&self,
+		slab_id: SlabId,
+		identity: (u64, u64),
+		origin: ReleaseOrigin,
+	) {
 		if !self.quarantined_slab_files.contains(slab_id) {
-			self.released_slab_files.owe(slab_id, identity);
+			self.local_files.owe(slab_id, identity, origin);
 		}
 	}
 
@@ -241,8 +251,12 @@ impl SlabManager {
 					));
 				}
 				state.sealed.remove(&slab_id);
-				state.rehydrated.remove(&slab_id);
-				self.release_slab_file(slab_id, expected);
+				state.take_rehydrated(&self.local_files, slab_id, CopyDisposition::Release);
+				let origin = match sealed {
+					Some(_) => ReleaseOrigin::Backing,
+					None => ReleaseOrigin::Copy,
+				};
+				self.release_slab_file(slab_id, expected, origin);
 			}
 			state.hot_read_counts.remove(&slab_id);
 			state.rehydrating.remove(&slab_id);
@@ -253,7 +267,7 @@ impl SlabManager {
 				metadata.file_type().is_file() && (metadata.dev(), metadata.ino()) == expected
 			});
 			if !matches {
-				self.released_slab_files.forget_owed(slab_id);
+				self.local_files.forget_owed(slab_id);
 				return Err(Error::new(
 					ErrorKind::InvalidData,
 					"GC slab path changed before unlink",
@@ -265,7 +279,7 @@ impl SlabManager {
 			// entry `Unlinking` until it finishes. GC owns the release only if it
 			// is still owed; the settler keeps GC's failure propagation, its
 			// directory sync and its test holds.
-			let settled = match self.claim_released_slab_file(slab_id, ReleaseRoute::Gc, None)? {
+			let settled = match self.claim_runtime_release(slab_id, ReleaseRoute::Gc, None)? {
 				ReleaseClaim::Claimed(settled) => settled,
 				ReleaseClaim::Absent | ReleaseClaim::InProgress(_) => {
 					return Err(Error::new(
@@ -275,9 +289,9 @@ impl SlabManager {
 				}
 			};
 			rehydration_install::wait_release(settled).await?;
-		} else if self.released_slab_files.owes_sync(slab_id) {
+		} else if self.local_files.owes_sync(slab_id) {
 			// An earlier unlink's directory sync is still owed: only it is retried.
-			match self.claim_released_slab_file(slab_id, ReleaseRoute::Gc, None)? {
+			match self.claim_runtime_release(slab_id, ReleaseRoute::Gc, None)? {
 				ReleaseClaim::Absent => {}
 				ReleaseClaim::Claimed(settled) | ReleaseClaim::InProgress(settled) => {
 					rehydration_install::wait_release(settled).await?;
@@ -307,15 +321,13 @@ impl SlabManager {
 	///    `open_with_owner`, holds the directory's exclusive owner lock.
 	pub(super) async fn unlink_released_slab_file(&self, slab_id: SlabId) -> std::io::Result<()> {
 		// ADR 0131 D1: an installer's names are its own until it settles.
-		if self.released_slab_files.contains(slab_id)
-			&& self.rehydration_installs.has_record(slab_id)
-		{
+		if self.local_files.contains(slab_id) && self.rehydration_installs.has_record(slab_id) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
 				"a rehydration installer holds the slab's names",
 			));
 		}
-		match self.claim_released_slab_file(slab_id, ReleaseRoute::Release, None)? {
+		match self.claim_runtime_release(slab_id, ReleaseRoute::Release, None)? {
 			ReleaseClaim::Absent => Ok(()),
 			ReleaseClaim::Claimed(settled) | ReleaseClaim::InProgress(settled) => {
 				rehydration_install::wait_release(settled).await
@@ -336,12 +348,12 @@ impl SlabManager {
 		identity: (u64, u64),
 	) -> std::io::Result<()> {
 		let settled =
-			match self.claim_released_slab_file(slab_id, ReleaseRoute::Release, Some(identity))? {
+			match self.claim_runtime_release(slab_id, ReleaseRoute::Release, Some(identity))? {
 				ReleaseClaim::Absent => return Ok(()),
 				ReleaseClaim::Claimed(settled) | ReleaseClaim::InProgress(settled) => settled,
 			};
 		rehydration_install::wait_release(settled).await?;
-		if self.released_slab_files.holds_release_of(slab_id, identity) {
+		if self.local_files.holds_release_of(slab_id, identity) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
 				"the release of this slab file is still owed",
@@ -350,20 +362,87 @@ impl SlabManager {
 		Ok(())
 	}
 
-	/// ADR 0131 D4: claims `slab_id`'s release for a settler. An owed release
-	/// moves to `Unlinking` and its settler is spawned, holding an admitted
-	/// operation of the directory owner (D2), with no await between: the entry
-	/// then leaves `Unlinking` only through that settler, never through a
-	/// waiter's drop. A refused operation leaves the release owed. With `of`,
-	/// only a release of that very file is claimed or joined; another is absent.
-	fn claim_released_slab_file(
+	/// ADR 0131 D4: claims `slab_id`'s release for a runtime settler, admitted
+	/// by a new admitted operation of the manager's directory owner and run
+	/// against this manager's file operations (ADR 0132 D2).
+	fn claim_runtime_release(
 		&self,
 		slab_id: SlabId,
 		route: ReleaseRoute,
 		of: Option<(u64, u64)>,
 	) -> std::io::Result<ReleaseClaim> {
-		let mut files = self.released_slab_files.lock();
-		let Some(file) = files
+		let backend = || {
+			self.rehydration_installs
+				.manager()
+				.map(ReleaseBackend::Manager)
+				.ok_or_else(|| Error::other("the manager is not bound to its release settler"))
+		};
+		self.local_files.claim_released_slab_file(
+			slab_id,
+			route,
+			of,
+			ReleaseAdmission::Owner(self._directory_owner.as_ref()),
+			backend,
+		)
+	}
+}
+
+/// ADR 0132 D2: where a release settler's admitted operation comes from.
+pub(super) enum ReleaseAdmission<'a> {
+	/// At runtime: a new admitted operation of the directory owner, if the
+	/// manager has one; refused once its close began.
+	Owner(Option<&'a DataDirectoryOwner>),
+	/// At close: a child of the settle operation `close` minted.
+	Child(&'a AdmittedOperation),
+}
+
+/// ADR 0132 D2: the backend a release settler runs its I/O through; the
+/// release body is the same either way.
+pub(super) enum ReleaseBackend {
+	/// At runtime: the manager's owner-bound file operations. The settler task
+	/// keeps the manager alive until it ends.
+	Manager(Arc<SlabManager>),
+	/// At close: the transient owner-bound backend `close` created, whose
+	/// mutations carry their child write permits into their blocking jobs.
+	Transient(Arc<dyn AsyncFileOps>),
+}
+
+impl ReleaseBackend {
+	fn file_ops(&self) -> &dyn AsyncFileOps {
+		match self {
+			Self::Manager(manager) => manager.file_ops.as_ref(),
+			Self::Transient(file_ops) => file_ops.as_ref(),
+		}
+	}
+
+	/// The manager's GC test holds; a close-time release has none.
+	#[cfg(test)]
+	fn test_holds(&self) -> Option<&pause_hooks::TestHolds> {
+		match self {
+			Self::Manager(manager) => Some(&manager.continuity_test_holds),
+			Self::Transient(_) => None,
+		}
+	}
+}
+
+impl LocalFileLedger {
+	/// ADR 0131 D4: claims `slab_id`'s release for a settler. An owed release
+	/// moves to `Unlinking` and its settler is spawned, holding the admitted
+	/// operation `admission` supplies (ADR 0132 D2), with no await between: the
+	/// entry then leaves `Unlinking` only through that settler, never through a
+	/// waiter's drop. A refused operation leaves the release owed. With `of`,
+	/// only a release of that very file is claimed or joined; another is absent.
+	pub(super) fn claim_released_slab_file(
+		self: &Arc<Self>,
+		slab_id: SlabId,
+		route: ReleaseRoute,
+		of: Option<(u64, u64)>,
+		admission: ReleaseAdmission<'_>,
+		backend: impl FnOnce() -> std::io::Result<ReleaseBackend>,
+	) -> std::io::Result<ReleaseClaim> {
+		let mut tables = self.lock();
+		let Some(file) = tables
+			.released
 			.get_mut(&slab_id)
 			.filter(|file| of.is_none_or(|identity| file.identity == identity))
 		else {
@@ -373,165 +452,183 @@ impl SlabManager {
 			ReleasePhase::Unlinking(settled) => {
 				return Ok(ReleaseClaim::InProgress(settled.clone()));
 			}
+			// ADR 0132 D5: a collision is publishing this file as evidence; the
+			// release goes with it, or is owed again if the collision fails.
+			ReleasePhase::Withheld => {
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"the released file is becoming quarantine evidence",
+				));
+			}
 			ReleasePhase::Owed => false,
 			ReleasePhase::SyncOwed => true,
 		};
-		let manager = self
-			.rehydration_installs
-			.manager()
-			.ok_or_else(|| Error::other("the manager is not bound to its release settler"))?;
-		let operation = match &self._directory_owner {
-			Some(owner) => Some(owner.admitted_operation()?),
-			None => None,
+		let backend = backend()?;
+		let operation = match admission {
+			ReleaseAdmission::Owner(owner) => owner
+				.map(DataDirectoryOwner::admitted_operation)
+				.transpose()?,
+			ReleaseAdmission::Child(parent) => Some(parent.child_operation()),
 		};
 		let (settler, settled) = tokio::sync::watch::channel(None);
 		file.phase = ReleasePhase::Unlinking(settled.clone());
 		let identity = file.identity;
-		drop(files);
-		let task = manager
-			.settle_released_slab_file(slab_id, identity, route, sync_only, operation, settler);
+		drop(tables);
+		let task = settle_released_slab_file(
+			self.clone(),
+			backend,
+			slab_id,
+			identity,
+			route,
+			sync_only,
+			operation,
+			settler,
+		);
 		tokio::spawn(task);
 		Ok(ReleaseClaim::Claimed(settled))
 	}
+}
 
-	/// ADR 0131 D4: the release settler. Inside its admitted operation it
-	/// unlinks the released file only while the path still names it, then
-	/// syncs the directory; a `sync_only` settler (the unlink already done)
-	/// only syncs. Then, in one critical section, it settles the entry and
-	/// publishes the outcome: the entry goes only when the release is done; a
-	/// failed unlink leaves it owed, and a failed sync after an unlink leaves
-	/// it `SyncOwed`. A mismatch or a missing name ends the release with a
-	/// warning: the settler has no authority over another file.
-	async fn settle_released_slab_file(
-		self: Arc<Self>,
-		slab_id: SlabId,
-		identity: (u64, u64),
-		route: ReleaseRoute,
-		sync_only: bool,
-		operation: Option<crate::storage::ownership::AdmittedOperation>,
-		settler: tokio::sync::watch::Sender<Option<rehydration_install::ReleaseOutcome>>,
-	) {
-		let body = async {
-			let path = slab_path(&self.config.dir, slab_id);
-			let end = self
-				.unlink_released_by_identity(&path, identity, route, sync_only)
-				.await;
-			let mut files = self.released_slab_files.lock();
-			let (phase, result) = match end {
-				ReleaseEnd::Done(result) => (None, result),
-				ReleaseEnd::Owed(error) => (Some(ReleasePhase::Owed), Err(error)),
-				ReleaseEnd::SyncOwed(error) => (Some(ReleasePhase::SyncOwed), Err(error)),
-			};
-			match phase {
-				Some(phase) => {
-					if let Some(file) = files.get_mut(&slab_id) {
-						file.phase = phase;
-					}
-				}
-				None => {
-					files.remove(&slab_id);
+/// ADR 0131 D4: the release settler. Inside its admitted operation it unlinks
+/// the released file only while the path still names it, then syncs the
+/// directory; a `sync_only` settler (the unlink already done) only syncs. Then,
+/// in one critical section, it settles the entry and publishes the outcome:
+/// the entry goes only when the release is done; a failed unlink leaves it
+/// owed, and a failed sync after an unlink leaves it `SyncOwed`. A mismatch or
+/// a missing name ends the release with a warning: the settler has no
+/// authority over another file. The body is the same at runtime and at close;
+/// only its backend and its operation's parent differ (ADR 0132 D2).
+async fn settle_released_slab_file(
+	ledger: Arc<LocalFileLedger>,
+	backend: ReleaseBackend,
+	slab_id: SlabId,
+	identity: (u64, u64),
+	route: ReleaseRoute,
+	sync_only: bool,
+	operation: Option<AdmittedOperation>,
+	settler: tokio::sync::watch::Sender<Option<rehydration_install::ReleaseOutcome>>,
+) {
+	let body = async {
+		let path = slab_path(ledger.dir(), slab_id);
+		let end = unlink_released_by_identity(&backend, &path, identity, route, sync_only).await;
+		let mut tables = ledger.lock();
+		let (phase, result) = match end {
+			ReleaseEnd::Done(result) => (None, result),
+			ReleaseEnd::Owed(error) => (Some(ReleasePhase::Owed), Err(error)),
+			ReleaseEnd::SyncOwed(error) => (Some(ReleasePhase::SyncOwed), Err(error)),
+		};
+		match phase {
+			Some(phase) => {
+				if let Some(file) = tables.released.get_mut(&slab_id) {
+					file.phase = phase;
 				}
 			}
-			settler.send_replace(Some(rehydration_install::release_outcome(&result)));
+			None => {
+				tables.released.remove(&slab_id);
+			}
+		}
+		settler.send_replace(Some(rehydration_install::release_outcome(&result)));
+	};
+	match operation {
+		Some(operation) => operation.run(body).await,
+		None => body.await,
+	}
+}
+
+/// The settler's step and where it leaves the release. A `stat` or an unlink
+/// that fails is tried afresh up to three times (ADR 0131 D5) before the
+/// release is owed again. After an unlink, only the directory sync is retried,
+/// on the same schedule, and never the unlink: a later occupant of the path is
+/// never touched.
+async fn unlink_released_by_identity(
+	backend: &ReleaseBackend,
+	path: &Path,
+	identity: (u64, u64),
+	route: ReleaseRoute,
+	sync_only: bool,
+) -> ReleaseEnd {
+	let file_ops = backend.file_ops();
+	if !sync_only {
+		let mut delays = rehydration_install::CLEANUP_RETRY_DELAYS.into_iter();
+		let found = loop {
+			match unlink_if_released_file(file_ops, path, identity).await {
+				Ok(found) => break found,
+				// The file may still be there, so the release stays owed.
+				Err(error) => match delays.next() {
+					Some(delay) => tokio::time::sleep(delay).await,
+					None => return ReleaseEnd::Owed(error),
+				},
+			}
 		};
-		match operation {
-			Some(operation) => operation.run(body).await,
-			None => body.await,
+		match found {
+			ReleasedPath::Unlinked => {}
+			// The file is gone: nothing can have been installed in its place.
+			ReleasedPath::Missing if route == ReleaseRoute::Release => {
+				return ReleaseEnd::Done(Ok(()));
+			}
+			ReleasedPath::Missing => {
+				return ReleaseEnd::Done(Err(Error::new(
+					ErrorKind::NotFound,
+					"GC slab file disappeared before unlink",
+				)));
+			}
+			ReleasedPath::Other => {
+				tracing::warn!(
+					path = %path.display(),
+					"a released slab path no longer names the released file; it is left alone"
+				);
+				return ReleaseEnd::Done(match route {
+					ReleaseRoute::Release => Ok(()),
+					ReleaseRoute::Gc => Err(Error::new(
+						ErrorKind::InvalidData,
+						"GC slab path changed before unlink",
+					)),
+				});
+			}
+		}
+		#[cfg(test)]
+		{
+			if route == ReleaseRoute::Gc
+				&& let Some(holds) = backend.test_holds()
+			{
+				pass_test_hold(&holds.gc_after_unlink_hold).await;
+			}
 		}
 	}
-
-	/// The settler's step and where it leaves the release. A `stat` or an
-	/// unlink that fails is tried afresh up to three times (ADR 0131 D5)
-	/// before the release is owed again. After an unlink, only the directory
-	/// sync is retried, on the same schedule, and never the unlink: a later
-	/// occupant of the path is never touched.
-	async fn unlink_released_by_identity(
-		&self,
-		path: &Path,
-		identity: (u64, u64),
-		route: ReleaseRoute,
-		sync_only: bool,
-	) -> ReleaseEnd {
-		if !sync_only {
-			let mut delays = rehydration_install::CLEANUP_RETRY_DELAYS.into_iter();
-			let found = loop {
-				match self.unlink_if_released_file(path, identity).await {
-					Ok(found) => break found,
-					// The file may still be there, so the release stays owed.
-					Err(error) => match delays.next() {
-						Some(delay) => tokio::time::sleep(delay).await,
-						None => return ReleaseEnd::Owed(error),
-					},
-				}
-			};
-			match found {
-				ReleasedPath::Unlinked => {}
-				// The file is gone: nothing can have been installed in its place.
-				ReleasedPath::Missing if route == ReleaseRoute::Release => {
-					return ReleaseEnd::Done(Ok(()));
-				}
-				ReleasedPath::Missing => {
-					return ReleaseEnd::Done(Err(Error::new(
-						ErrorKind::NotFound,
-						"GC slab file disappeared before unlink",
-					)));
-				}
-				ReleasedPath::Other => {
-					tracing::warn!(
-						path = %path.display(),
-						"a released slab path no longer names the released file; it is left alone"
-					);
-					return ReleaseEnd::Done(match route {
-						ReleaseRoute::Release => Ok(()),
-						ReleaseRoute::Gc => Err(Error::new(
-							ErrorKind::InvalidData,
-							"GC slab path changed before unlink",
-						)),
-					});
-				}
-			}
+	let synced =
+		rehydration_install::with_cleanup_retries(move || fsync_parent_dir(file_ops, path)).await;
+	match synced {
+		// The unlink stands; its sync stays owed, so a later release retries it.
+		Err(error) => ReleaseEnd::SyncOwed(error),
+		Ok(()) => {
 			#[cfg(test)]
 			{
-				if route == ReleaseRoute::Gc {
-					pass_test_hold(&self.continuity_test_holds.gc_after_unlink_hold).await;
-				}
-			}
-		}
-		let file_ops = self.file_ops.as_ref();
-		let synced =
-			rehydration_install::with_cleanup_retries(move || fsync_parent_dir(file_ops, path))
-				.await;
-		match synced {
-			// The unlink stands; its sync stays owed, so a later release retries it.
-			Err(error) => ReleaseEnd::SyncOwed(error),
-			Ok(()) => {
-				#[cfg(test)]
+				if route == ReleaseRoute::Gc
+					&& let Some(holds) = backend.test_holds()
 				{
-					if route == ReleaseRoute::Gc {
-						pass_test_hold(&self.continuity_test_holds.gc_after_fsync_hold).await;
-					}
+					pass_test_hold(&holds.gc_after_fsync_hold).await;
 				}
-				ReleaseEnd::Done(Ok(()))
 			}
+			ReleaseEnd::Done(Ok(()))
 		}
 	}
+}
 
-	/// One try of the settler's step: `stat` the path, and unlink it only if
-	/// it still names the released file.
-	async fn unlink_if_released_file(
-		&self,
-		path: &Path,
-		identity: (u64, u64),
-	) -> std::io::Result<ReleasedPath> {
-		match self.file_ops.path_identity(path).await? {
-			None => Ok(ReleasedPath::Missing),
-			Some(found) if found != identity => Ok(ReleasedPath::Other),
-			Some(_) => match self.file_ops.unlink(path).await {
-				Ok(()) => Ok(ReleasedPath::Unlinked),
-				Err(error) if error.kind() == ErrorKind::NotFound => Ok(ReleasedPath::Missing),
-				Err(error) => Err(error),
-			},
-		}
+/// One try of the settler's step: `stat` the path, and unlink it only if it
+/// still names the released file.
+async fn unlink_if_released_file(
+	file_ops: &dyn AsyncFileOps,
+	path: &Path,
+	identity: (u64, u64),
+) -> std::io::Result<ReleasedPath> {
+	match file_ops.path_identity(path).await? {
+		None => Ok(ReleasedPath::Missing),
+		Some(found) if found != identity => Ok(ReleasedPath::Other),
+		Some(_) => match file_ops.unlink(path).await {
+			Ok(()) => Ok(ReleasedPath::Unlinked),
+			Err(error) if error.kind() == ErrorKind::NotFound => Ok(ReleasedPath::Missing),
+			Err(error) => Err(error),
+		},
 	}
 }
 
