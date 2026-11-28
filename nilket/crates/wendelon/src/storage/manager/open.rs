@@ -1089,7 +1089,7 @@ impl SlabManager {
 				tiered,
 				rehydrated,
 				hot_read_counts: HashMap::new(),
-				rehydrating: HashSet::new(),
+				rehydrating: HashMap::new(),
 				next_slab_id,
 				durable_slab_id_bound,
 				reservation_in_flight_bound: SlabId::new(0),

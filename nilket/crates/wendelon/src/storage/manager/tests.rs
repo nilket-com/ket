@@ -68945,7 +68945,8 @@ async fn a_rehydrated_based_object_reads_through_its_layout_and_serves_only_its_
 		assert!(location.offset >= plaintext.layout.base());
 		expected.insert(key, (location, value.to_vec()));
 	}
-	mgr.rehydrate_tiered_slab(published.clone(), plaintext)
+	let attempt = mgr.admit_rehydration_for_test(pointer.slab_id).await;
+	mgr.rehydrate_tiered_slab(published.clone(), attempt, plaintext)
 		.await
 		.unwrap();
 	assert!(
@@ -73536,4 +73537,530 @@ async fn a_retarget_is_applied_or_replayed_only_against_its_own_durable_edge() {
 		manager_cleanup_records(&mgr, slab).await.get(&old.l2_uri),
 		Some(&made)
 	);
+}
+
+// ------------------------------------------------------------------
+// DC-304: an encrypted tiered slab is read with range reads only, so its
+// promotion at the threshold read makes a separate whole-object fetch. A
+// failed fetch ends that attempt's admission: a later read retries the
+// promotion and installs the copy.
+// ------------------------------------------------------------------
+
+/// Counters and a one-shot whole-object fault shared by a
+/// `PromotionFetchFaultStore` and its test.
+#[derive(Default)]
+struct PromotionFetchControl {
+	get_bytes_calls: std::sync::atomic::AtomicUsize,
+	get_range_calls: std::sync::atomic::AtomicUsize,
+	fail_next_get_bytes: AtomicBool,
+}
+
+impl PromotionFetchControl {
+	fn get_bytes_calls(&self) -> usize {
+		self.get_bytes_calls.load(Ordering::SeqCst)
+	}
+
+	fn get_range_calls(&self) -> usize {
+		self.get_range_calls.load(Ordering::SeqCst)
+	}
+
+	fn note_get_bytes(&self) {
+		self.get_bytes_calls.fetch_add(1, Ordering::SeqCst);
+	}
+
+	fn note_get_range(&self) {
+		self.get_range_calls.fetch_add(1, Ordering::SeqCst);
+	}
+
+	/// Fails the next whole-object fetch.
+	fn arm(&self) {
+		self.fail_next_get_bytes.store(true, Ordering::SeqCst);
+	}
+
+	fn armed(&self) -> bool {
+		self.fail_next_get_bytes.load(Ordering::SeqCst)
+	}
+
+	fn take_fault(&self) -> bool {
+		self.fail_next_get_bytes.swap(false, Ordering::SeqCst)
+	}
+}
+
+/// An L2 store that counts whole-object and range fetches and, once armed,
+/// fails exactly the next whole-object fetch; every other call passes through.
+struct PromotionFetchFaultStore {
+	inner: Arc<dyn ObjectStore>,
+	control: Arc<PromotionFetchControl>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for PromotionFetchFaultStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.inner.head(uri).await
+	}
+
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.control.note_get_range();
+		self.inner.get_range(uri, range).await
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		self.control.note_get_bytes();
+		if self.control.take_fault() {
+			return Err(Error::new(
+				ErrorKind::ConnectionReset,
+				"one-shot whole-object fetch failure (test)",
+			));
+		}
+		self.inner.get_bytes(uri).await
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+const PROMOTION_ROW: &[u8] = b"promotion-row";
+
+/// One row in an encrypted tiered slab, on a manager whose L2 store `wrap` built.
+struct PromotionSlab {
+	_dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	pointer: TieredSlabPointer,
+	location: RecordLocation,
+	/// The reads that admit a promotion (`promote_after_l2_reads`).
+	threshold: usize,
+}
+
+async fn promotion_slab(
+	tag: &str,
+	wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+) -> PromotionSlab {
+	let (dirs, mgr, l2) = fresh_manager_with_wrapped_l2(tag, wrap).await;
+	let key = id(0x3040_0001);
+	mgr.append(tenant(), key, hlc(10), PROMOTION_ROW)
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}.wnd")).await;
+	assert!(
+		pointer.is_encrypted,
+		"premise: the committed pointer is encrypted"
+	);
+	let threshold = mgr.config.rehydration.promote_after_l2_reads as usize;
+	assert!(threshold >= 1, "premise: promotion is enabled");
+	let location = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("premise: the row is indexed");
+	assert_eq!(
+		location.slab_id, pointer.slab_id,
+		"premise: the row lives in the tiered slab"
+	);
+	assert!(
+		!mgr.is_rehydrated(pointer.slab_id).await,
+		"premise: no local copy before the reads"
+	);
+	PromotionSlab {
+		_dirs: dirs,
+		mgr,
+		pointer,
+		location,
+		threshold,
+	}
+}
+
+/// One ordinary read of the row, which must return it; returns the
+/// whole-object and the range fetches `calls` counted during the read.
+async fn read_promotion_row(
+	f: &PromotionSlab,
+	calls: &PromotionFetchControl,
+	step: &str,
+) -> (usize, usize) {
+	let bytes_before = calls.get_bytes_calls();
+	let ranges_before = calls.get_range_calls();
+	let row = match f.mgr.read(f.location).await {
+		Ok(row) => row,
+		Err(error) => panic!("{step}: the ordinary read failed: {error}"),
+	};
+	assert_eq!(row, PROMOTION_ROW, "{step}: the read's row");
+	let bytes = calls.get_bytes_calls() - bytes_before;
+	let ranges = calls.get_range_calls() - ranges_before;
+	(bytes, ranges)
+}
+
+/// The copy is installed at the slab's path, and three more reads of the row
+/// are served by it with no L2 fetch of any kind.
+async fn assert_promotion_copy_serves_reads(f: &PromotionSlab, calls: &PromotionFetchControl) {
+	let slab = f.pointer.slab_id;
+	assert!(f.mgr.is_rehydrated(slab).await, "the copy is installed");
+	assert!(
+		slab_path(&f.mgr.config.dir, slab).exists(),
+		"the copy's file is at the slab's path"
+	);
+	for n in 1..=3 {
+		let fetched = read_promotion_row(f, calls, &format!("local read {n}")).await;
+		assert_eq!(fetched, (0, 0), "local read {n} fetches nothing from L2");
+	}
+}
+
+/// `promotion_slab` behind a `PromotionFetchFaultStore`.
+async fn promotion_fault_slab(tag: &str) -> (PromotionSlab, Arc<PromotionFetchControl>) {
+	let control = Arc::new(PromotionFetchControl::default());
+	let wrap = {
+		let control = control.clone();
+		move |inner: Arc<dyn ObjectStore>| -> Arc<dyn ObjectStore> {
+			Arc::new(PromotionFetchFaultStore { inner, control })
+		}
+	};
+	(promotion_slab(tag, wrap).await, control)
+}
+
+/// DC-304: with nothing failing, the threshold read promotes the slab with one
+/// whole-object fetch, and later reads are local.
+#[tokio::test]
+async fn a_healthy_encrypted_promotion_installs_the_copy_at_the_threshold() {
+	let (f, calls) = promotion_fault_slab("promotion-healthy").await;
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, &calls, &format!("read {n}")).await;
+		assert_eq!(bytes, 0, "read {n} below the threshold reads ranges only");
+	}
+	let (bytes, _) = read_promotion_row(&f, &calls, "threshold read").await;
+	assert_eq!(
+		bytes, 1,
+		"the threshold read fetches the whole object once for its promotion"
+	);
+	assert_promotion_copy_serves_reads(&f, &calls).await;
+}
+
+/// DC-304: the threshold read's whole-object promotion fetch fails once. The
+/// failed attempt gives up its admission and leaves the slab one read below
+/// the threshold, so the very next read retries the promotion and installs
+/// the copy; reads after it are local.
+#[tokio::test]
+async fn a_failed_encrypted_promotion_fetch_is_retried_and_installs_the_copy() {
+	let (f, calls) = promotion_fault_slab("promotion-retry").await;
+	let slab = f.pointer.slab_id;
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, &calls, &format!("read {n}")).await;
+		assert_eq!(
+			bytes, 0,
+			"premise: read {n} below the threshold reads ranges only"
+		);
+	}
+	calls.arm();
+	let (bytes, _) = read_promotion_row(&f, &calls, "threshold read").await;
+	assert!(
+		!calls.armed(),
+		"premise: the threshold read's promotion fetch consumed the fault"
+	);
+	assert_eq!(
+		bytes, 1,
+		"premise: the threshold read made exactly its promotion fetch"
+	);
+	assert!(
+		!f.mgr.is_rehydrated(slab).await,
+		"premise: the failed fetch installed no copy"
+	);
+
+	// The very next read is the eligible one: the failed attempt left the slab
+	// one read below the threshold.
+	let (bytes, _) = read_promotion_row(&f, &calls, "the read after the failure").await;
+	assert_eq!(
+		bytes, 1,
+		"the read after the failed fetch retries the promotion with exactly one whole-object fetch"
+	);
+	assert!(
+		f.mgr.is_rehydrated(slab).await,
+		"the retry on the read after the failure installs the copy"
+	);
+	assert_promotion_copy_serves_reads(&f, &calls).await;
+}
+
+// ------------------------------------------------------------------
+// DC-304: a stale promotion attempt. Its admission was ended by a publication
+// of the slab while its whole-object fetch was held, and a newer attempt holds
+// the slab when it completes: the stale completion changes neither the newer
+// attempt's admission nor the slab's counted reads.
+// ------------------------------------------------------------------
+
+/// How a held whole-object fetch is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldFetchRelease {
+	/// The fetch passes through to the inner store.
+	Pass,
+	/// The fetch fails.
+	Fail,
+}
+
+/// The store's half of one held whole-object fetch.
+struct HeldFetchSlot {
+	reached: tokio::sync::oneshot::Sender<String>,
+	release: tokio::sync::oneshot::Receiver<HeldFetchRelease>,
+}
+
+/// The test's half of one held whole-object fetch.
+struct HeldFetch {
+	/// Answers the URI the held fetch asked for, once it is reached.
+	reached: tokio::sync::oneshot::Receiver<String>,
+	release: tokio::sync::oneshot::Sender<HeldFetchRelease>,
+}
+
+#[derive(Default)]
+struct HeldFetchControl {
+	calls: PromotionFetchControl,
+	next_hold: std::sync::Mutex<Option<HeldFetchSlot>>,
+}
+
+impl HeldFetchControl {
+	/// Holds the next whole-object fetch until the returned half releases it.
+	fn hold_next_get_bytes(&self) -> HeldFetch {
+		let (reached_tx, reached) = tokio::sync::oneshot::channel();
+		let (release, release_rx) = tokio::sync::oneshot::channel();
+		let slot = HeldFetchSlot {
+			reached: reached_tx,
+			release: release_rx,
+		};
+		let previous = self.next_hold.lock().unwrap().replace(slot);
+		assert!(previous.is_none(), "premise: one hold is armed at a time");
+		HeldFetch { reached, release }
+	}
+
+	fn take_hold(&self) -> Option<HeldFetchSlot> {
+		self.next_hold.lock().unwrap().take()
+	}
+}
+
+/// An L2 store that counts whole-object and range fetches and holds the next
+/// whole-object fetch once asked to; every other call passes through.
+struct HeldFetchStore {
+	inner: Arc<dyn ObjectStore>,
+	control: Arc<HeldFetchControl>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for HeldFetchStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.inner.head(uri).await
+	}
+
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.control.calls.note_get_range();
+		self.inner.get_range(uri, range).await
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		self.control.calls.note_get_bytes();
+		let Some(hold) = self.control.take_hold() else {
+			return self.inner.get_bytes(uri).await;
+		};
+		let _ = hold.reached.send(uri.to_owned());
+		match hold.release.await {
+			Ok(HeldFetchRelease::Pass) => self.inner.get_bytes(uri).await,
+			Ok(HeldFetchRelease::Fail) | Err(_) => Err(Error::new(
+				ErrorKind::ConnectionReset,
+				"held whole-object fetch failed (test)",
+			)),
+		}
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+/// An ordinary read of the row on its own task, armed to hold its whole-object
+/// fetch; returns once that fetch is reached, with the task and the release.
+async fn spawn_held_promotion_read(
+	f: &PromotionSlab,
+	control: &HeldFetchControl,
+	attempt: &str,
+) -> (
+	tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+	tokio::sync::oneshot::Sender<HeldFetchRelease>,
+) {
+	let HeldFetch { reached, release } = control.hold_next_get_bytes();
+	let bytes_before = control.calls.get_bytes_calls();
+	let task = {
+		let mgr = f.mgr.clone();
+		let location = f.location;
+		tokio::spawn(async move { mgr.read(location).await })
+	};
+	let uri = match tokio::time::timeout(Duration::from_secs(10), reached).await {
+		Ok(Ok(uri)) => uri,
+		Ok(Err(_)) => panic!("BLOCKER: attempt {attempt}: the hold was dropped unreached"),
+		Err(_) => panic!("BLOCKER: attempt {attempt}: no whole-object fetch was reached"),
+	};
+	assert_eq!(
+		uri, f.pointer.l2_uri,
+		"premise: attempt {attempt} holds a fetch of the slab's object"
+	);
+	assert_eq!(
+		control.calls.get_bytes_calls() - bytes_before,
+		1,
+		"premise: attempt {attempt}'s read made only its promotion fetch"
+	);
+	(task, release)
+}
+
+/// The row a released read returned.
+async fn released_promotion_read(
+	task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+	attempt: &str,
+) -> Vec<u8> {
+	match tokio::time::timeout(Duration::from_secs(10), task).await {
+		Ok(Ok(Ok(row))) => row,
+		Ok(Ok(Err(error))) => panic!("attempt {attempt}: the read failed: {error}"),
+		Ok(Err(error)) => panic!("attempt {attempt}: the read task failed: {error}"),
+		Err(_) => panic!("attempt {attempt}: the read did not complete once released"),
+	}
+}
+
+/// Attempt A reaches its promotion fetch and is held. A replay of the same
+/// pointer publishes the slab again and ends A's admission; reads up to the
+/// threshold then admit attempt B, held at its own promotion fetch. A is
+/// released with `stale` and completes first; then B passes.
+async fn stale_promotion_attempt_after_republication(tag: &str, stale: HeldFetchRelease) {
+	let control = Arc::new(HeldFetchControl::default());
+	let wrap = {
+		let control = control.clone();
+		move |inner: Arc<dyn ObjectStore>| -> Arc<dyn ObjectStore> {
+			Arc::new(HeldFetchStore { inner, control })
+		}
+	};
+	let f = promotion_slab(tag, wrap).await;
+	let calls = &control.calls;
+	let slab = f.pointer.slab_id;
+
+	// Attempt A.
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, calls, &format!("A read {n}")).await;
+		assert_eq!(bytes, 0, "premise: A read {n} reads ranges only");
+	}
+	let (a, release_a) = spawn_held_promotion_read(&f, &control, "A").await;
+	assert!(
+		f.mgr.rehydrating_for_test(slab).await,
+		"premise: A holds the slab's admission"
+	);
+
+	// The same pointer, applied again, reaches the publication that ends every
+	// admission of the slab.
+	let replay = tokio::time::timeout(
+		Duration::from_secs(10),
+		f.mgr.apply_tier_slab(f.pointer.clone()),
+	)
+	.await;
+	match replay {
+		Ok(Ok(())) => {}
+		Ok(Err(error)) => panic!("BLOCKER: the same-pointer replay failed: {error}"),
+		Err(_) => panic!("BLOCKER: the same-pointer replay waited on A's held fetch"),
+	}
+	if f.mgr.rehydrating_for_test(slab).await {
+		panic!("BLOCKER: the same-pointer replay did not end A's admission");
+	}
+	assert_eq!(
+		f.mgr.tier_pointer(slab).await.as_ref(),
+		Some(&f.pointer),
+		"premise: the published pointer is unchanged"
+	);
+	assert_eq!(
+		f.mgr.hot_read_count_for_test(slab).await,
+		None,
+		"premise: the publication reset the slab's counted reads"
+	);
+	assert!(!a.is_finished(), "premise: A is still held");
+
+	// Attempt B, on the republished pointer.
+	for n in 1..f.threshold {
+		let (bytes, _) = read_promotion_row(&f, calls, &format!("B read {n}")).await;
+		assert_eq!(bytes, 0, "premise: B read {n} reads ranges only");
+	}
+	let (b, release_b) = spawn_held_promotion_read(&f, &control, "B").await;
+	assert!(
+		f.mgr.rehydrating_for_test(slab).await,
+		"premise: B holds the slab's admission"
+	);
+	let b_counted = f.mgr.hot_read_count_for_test(slab).await;
+	assert_eq!(
+		b_counted,
+		Some(f.threshold as u32),
+		"premise: B was admitted at the threshold"
+	);
+
+	// The stale attempt A completes first.
+	release_a
+		.send(stale)
+		.expect("premise: A's held fetch awaits its release");
+	assert_eq!(
+		released_promotion_read(a, "A").await,
+		PROMOTION_ROW,
+		"A's read returns its row ({stale:?})"
+	);
+	assert!(
+		f.mgr.rehydrating_for_test(slab).await,
+		"A's completion ({stale:?}) never ends B's admission"
+	);
+	if stale == HeldFetchRelease::Fail {
+		assert_eq!(
+			f.mgr.hot_read_count_for_test(slab).await,
+			b_counted,
+			"A's failure never sets the retry floor over B's admission"
+		);
+	}
+	assert!(!b.is_finished(), "premise: B is still held");
+
+	// B completes.
+	release_b
+		.send(HeldFetchRelease::Pass)
+		.expect("premise: B's held fetch awaits its release");
+	assert_eq!(
+		released_promotion_read(b, "B").await,
+		PROMOTION_ROW,
+		"B's read returns its row ({stale:?})"
+	);
+	assert!(
+		!f.mgr.rehydrating_for_test(slab).await,
+		"no admission is left once B completes ({stale:?})"
+	);
+	assert_promotion_copy_serves_reads(&f, calls).await;
+}
+
+/// DC-304: the stale attempt's fetch fails after a newer attempt was admitted:
+/// it leaves B's admission and the counted reads alone, and B installs the copy.
+#[tokio::test]
+async fn a_stale_promotion_attempt_never_disturbs_a_newer_attempt_after_republication() {
+	stale_promotion_attempt_after_republication("stale-promotion-fail", HeldFetchRelease::Fail)
+		.await;
+}
+
+/// DC-304: the stale attempt's fetch passes after a newer attempt was admitted.
+/// The replay kept the generation, so A's copy may install; B's admission is
+/// still B's until B completes, and exactly one copy serves the reads.
+#[tokio::test]
+async fn a_stale_successful_promotion_attempt_never_disturbs_a_newer_attempt() {
+	stale_promotion_attempt_after_republication("stale-promotion-pass", HeldFetchRelease::Pass)
+		.await;
 }

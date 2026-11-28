@@ -261,7 +261,7 @@ use tiered_io::build_tiered_object_metadata;
 #[cfg(test)]
 use tiered_io::single_tenant_id_from_plain_slab;
 use tiered_io::{
-	RehydratedCopy, SlabBacking, TierObjectEvidence, decode_tiered_blob,
+	RehydratedCopy, RehydrationAttempt, SlabBacking, TierObjectEvidence, decode_tiered_blob,
 	descriptor_matches_tiered_row, extract_record_from_blob, fetch_tiered_ciphertext_runs,
 	validate_tiered_blob, validate_tiered_record_header_tenant,
 };
@@ -994,9 +994,9 @@ struct ManagerState {
 	rehydrated: DashMap<SlabId, RehydratedCopy>,
 	/// Consecutive reads that had to fetch a slab from L2.
 	hot_read_counts: HashMap<SlabId, u32>,
-	/// Slabs currently being restored from L2 to L1. Guards the
-	/// hot-read path against duplicate local installs.
-	rehydrating: HashSet<SlabId>,
+	/// Slabs being restored from L2 to L1, each with its one admitted attempt.
+	/// Guards the hot-read path against duplicate local installs.
+	rehydrating: HashMap<SlabId, RehydrationAttempt>,
 	next_slab_id: SlabId,
 	/// The committed slab id high-water: no id at or above it has been
 	/// issued. `next_slab_id` never passes it.
